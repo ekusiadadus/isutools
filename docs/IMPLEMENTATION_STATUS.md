@@ -62,14 +62,31 @@ with snapshots, JSON, and CPU profiles archived per run:
 | + write-through placement fix | 111,756 | httpstats: app-served images collapse |
 | + db pool / GOMAXPROCS / nginx keepalive | **299,668** | cpuTotal 11.6% busy vs per-process caps (server 84%/1core); 502 storm diagnosed from bench fails |
 
-## Known hardening gaps (tracked for v1.0 — see DESIGN.md §10.5)
+## v1.0.0 release gate: ABBA overhead measurement
 
-1. httpstats path-normalization rule injection (`/@user` cardinality)
-2. snapshot diff view (prev generation stored, no UI comparison yet)
-3. generic counter/gauge API
-4. WebSocket/SSE connection separation (designed in §5.2.1, not implemented)
-5. `collect`/`save` resource caps (review P0-6 residual)
-6. formalized on/off ABBA overhead gate as the release criterion
-7. cross-collector shared generation gate: SQL and HTTP swap independently,
-   so benchmark automation must wait for `POST /reset` to return before load
-   starts (the reference bench.sh does)
+Ran on private-isu (2026-08-04, same binary, same host, off→on→on→off):
+
+```text
+mode=off score=361203
+mode=on  score=364162
+mode=on  score=361929
+mode=off score=360734
+off avg: 360968 / on avg: 363045
+ABBA overhead: -0.58% (gate: < 2%) -> PASS
+```
+
+Measurement enabled is indistinguishable from disabled at ~360k score
+(the -0.58% delta is run-to-run noise). The gate script is
+`examples/abba.sh`.
+
+## Resolved in v1.0.0 (previously "known hardening gaps") (tracked for v1.0 — see DESIGN.md §10.5)
+
+1. ~~path-normalization rules~~ → `ISUTOOLS_PATH_RULES` (v0.7.0)
+2. ~~snapshot diff view~~ → `GET /diff?a=&b=` (v1.0.0)
+3. ~~counter/gauge API~~ → `isutools.Count`/`AddCount` (v0.7.0)
+4. ~~WS/SSE separation~~ → connection stats + active gauge (v0.7.0)
+5. ~~save caps~~ → serialized saves (v1.0.0); collect was already bounded
+6. ~~ABBA gate~~ → `examples/abba.sh`, passed at -0.58% (above)
+7. cross-collector shared generation gate — still open (1.x): benchmark
+   automation must wait for `POST /reset` to return before load starts
+   (the reference bench.sh does)
