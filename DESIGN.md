@@ -46,7 +46,8 @@ ISUCON 本番に「`go get` + 数行」で持ち込めることをゴールと�
 | HTTP/1.1, HTTP/2 | `http.Handler` ミドルウェア(net/http が両対応。`r.Proto` をラベル化) |
 | HTTP/3 / QUIC | 同じミドルウェアを `quic-go/http3.Server{Handler: ...}` に渡すだけ |
 | GraphQL | gqlgen extension(operation 単位)+ 汎用 body-sniff ミドルウェア |
-| nginx | ltsv / combined(+`$request_time`)パーサ + alp 相当の集計 |
+| WebSocket | 接続レベル計測(httpstats が Upgrade を判別)+ フレームレベルは opt-in ラッパー(5.2.1) |
+| nginx | ltsv / combined(+`$request_time`)パーサ + alp 相当の集計(バイト数・キャッシュ・upstream 分離。5.4) |
 | Apache | combined + `%D` パーサ(設定スニペット同梱) |
 | git コミットハッシュ | `debug.ReadBuildInfo()` の vcs.revision / vcs.modified(dirty)表示 |
 | プロセス CPU/メモリ | `/proc` 直読みで CPU% / RSS 上位 N プロセスを表示 |
@@ -110,6 +111,24 @@ r.Mount("/debug/isutools", isutools.Handler())  // ③ UI
 - HTTP/3/QUIC: `http3.Server{Handler: isutools.HTTP(mux)}` に渡すだけ。
   QUIC は HTTP/3 のトランスポートとして自動的にカバーされる
 
+### 5.2.1 WebSocket / 長寿命コネクション(SSE 含む)
+
+**素朴に計測するとレイテンシ統計が壊れる**(接続が数分生きるため、通常リクエストの
+p95/avg に巨大な外れ値として混入する)。そのため httpstats は以下の扱いにする:
+
+- リクエストの `Upgrade: websocket` ヘッダ / レスポンス 101 を検知したら、
+  **通常のレイテンシテーブルから除外**し、専用の「Connections」セクションで集計:
+  - 累計接続数 / **現在のアクティブ接続数(ゲージ)** / 接続持続時間の分布
+  - SSE(`Content-Type: text/event-stream`)も同じ扱い(mazrean 氏の SSE 化・
+    worker_connections 枯渇の事例に対応。当初 Phase 2 だった接続数ゲージを
+    Phase 1 に昇格)
+- フレーム/メッセージレベルの計測はライブラリ依存になるため **opt-in の1行ラッパー**
+  で提供: `conn = isutools.WrapWSConn(conn)`(gorilla/websocket 等の
+  `net.Conn` / `io.ReadWriter` を包み、送受フレーム数・バイト数を集計)。
+  ハンドラ内の処理時間を測りたい場合は汎用カウンタ(Phase 2)を使う
+- 制約: WebSocket over HTTP/2 (RFC 8441) / HTTP/3 (RFC 9220) は Go 標準の
+  サーバ側サポートが限定的なため v1 は HTTP/1.1 Upgrade を対象とする(明記)
+
 ### 5.3 gqlstats
 
 - HTTP レベルでは `POST /graphql` に潰れてしまうため operation 単位で集計する
@@ -122,10 +141,46 @@ r.Mount("/debug/isutools", isutools.Handler())  // ③ UI
 - **pull 型**: アプリのホットパスには一切関与せず、レポート表示時(または
   `POST /collect`)にログファイルを差分読みして集計する。オフセットと inode を
   記憶し、ローテーションを検知したら先頭から読み直す
-- フォーマット: ltsv(推奨・nginx スニペット同梱)、combined+`$request_time`、
+- フォーマット: ltsv(推奨・下記スニペット)、combined+`$request_time`、
   Apache combined+`%D`。自動判別
-- 集計軸: メソッド × 正規化パス → count / sum / avg / p95 / max / status 分布
 - Docker 構成ではログの volume 共有が必要(compose 例を同梱。5.8 参照)
+
+#### 5.4.1 nginx ltsv フォーマット仕様(同梱スニペット)
+
+画像配信チューニング(ISUCON 頻出: DB 内画像 → 静的配信 + キャッシュ)の
+効果測定に必要なフィールドまで含めて確定する:
+
+```nginx
+log_format isutools ltsv escape=json
+  "time:$time_iso8601"
+  "\tmethod:$request_method"
+  "\turi:$request_uri"
+  "\tstatus:$status"
+  "\treqtime:$request_time"          # クライアント視点の総時間
+  "\tupstime:$upstream_response_time" # アプリ処理時間("-" = nginx が直接応答)
+  "\tbytes:$body_bytes_sent"          # 転送バイト数(画像サイズ分析の主役)
+  "\tcache:$upstream_cache_status"    # proxy_cache の HIT/MISS/BYPASS
+  "\tctype:$sent_http_content_type";  # MIME 別集計用
+```
+
+#### 5.4.2 集計軸
+
+| 軸 | 分かること |
+|---|---|
+| count / sum / avg / p95 / max(reqtime) | alp 相当の基本レイテンシ分析 |
+| **bytes: パス別 合計/平均転送量・上位パス** | どの画像・静的パスが帯域を食っているか(合計時間だけでは見えない) |
+| **reqtime − upstime の乖離** | nginx 側の滞留(worker/バッファ/帯域)とアプリの遅さを切り分け |
+| **upstime = "-" の比率(nginx 直接応答率)** | 静的化オフロードがどれだけ効いたか |
+| **status 304 比率** | Conditional GET / ETag・expires 設定の効き目 |
+| **cache HIT/MISS 率** | proxy_cache 導入の効き目 |
+| ctype 別集計 | 画像/CSS/JS/HTML の帯域内訳 |
+| status 101 / 499 / 5xx | WebSocket 接続はレイテンシ集計から分離、499・reset は警告表示(接続枯渇の兆候) |
+
+- Apache 側は `%D`(µs)+ `%B` で reqtime / bytes を同等に取る
+  (upstream 分離・キャッシュ状態は nginx のみの対応と明記)
+- WebSocket(101)はアクセスログ上も接続クローズ時に長大な reqtime で
+  記録されるため、パーサが status=101 をレイテンシ集計から自動除外する
+  (5.2.1 と整合)
 
 ### 5.5 procstats
 
@@ -266,8 +321,8 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 
 ### 中優先
 
-5. **アクティブ接続数ゲージ**(mazrean: SSE 化・worker_connections 枯渇)
-   httpstats に進行中リクエスト数・プロトコル別接続数を追加
+5. ~~アクティブ接続数ゲージ~~ → **Phase 1 に昇格済み**(5.2.1 の WebSocket/SSE
+   接続計測に統合)
 6. **異常検知の警告表示**(mazrean: `connection reset` で fail)
    accesslog の status 499 / 5xx 急増・reset をレポート上部に警告として出す
 7. **ログローテ追随の堅牢化**(takonomura: ローテ自動化)— accesslog の
