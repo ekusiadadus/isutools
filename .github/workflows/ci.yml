@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: vet
+        run: go vet ./...
+      - name: test (race)
+        run: go test -race -coverprofile=cover.out ./...
+      - name: coverage gate (80%)
+        run: |
+          total=$(go tool cover -func=cover.out | awk '/^total:/ {sub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { exit (t < 80) }'
+      # Informational only: shared runners are too noisy for a hard latency
+      # gate. The real overhead gate is the on/off benchmark comparison on
+      # the target host before tagging a release (DESIGN.md §7).
+      - name: benchmarks (informational)
+        run: go test -run '^$' -bench . -benchmem ./internal/agg/

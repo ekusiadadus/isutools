@@ -2,7 +2,7 @@
 
 `github.com/ekusiadadus/isutools` — ISUCON 向けオールインワン計測モジュール
 
-- Status: Draft v1 (2026-08-03)
+- Status: Revised Draft v2 (2026-08-03、設計レビュー反映・M1 実装中)
 - Author: ekusiadadus (with Claude)
 
 ---
@@ -11,7 +11,8 @@
 
 private-isu のチューニングで `hirosuzuki/go-sql-logger` を評価した結果、
 「環境変数トグル + ドライバプロキシ」という組み込みパターンは優秀だが、
-以下が不足していると判断した(詳細は分析ログ参照):
+以下が不足していると判断した(リリース前に比較対象・検証日・再現手順を
+`docs/` 配下の分析ログとしてリンクする):
 
 - 集計・ソート済みのブラウザ表示がない(生 TSV のみ)
 - SQL 以外(HTTP・アクセスログ・プロセスリソース)を扱えない
@@ -22,42 +23,45 @@ ISUCON 本番に「`go get` + 数行」で持ち込めることをゴールと�
 
 ## 2. 設計原則
 
-1. **最小組み込み** — アプリ側の変更は最大3行。それ以上要求する機能は作らない
-2. **低オーバーヘッド** — 計測オンでもスコア影響 < 1〜2%。ホットパスは
-   「時刻取得2回 + マップ加算」以外に何もしない。計測オフ時はゼロコスト(素通し)
+1. **最小組み込み** — SQL + UI の基本導入は2行、HTTP計測を含めても3行を目標とする。
+   accesslog・procstats 等のインフラ設定は行数に含めず、追加作業を機能別に明記する
+2. **低オーバーヘッド** — 計測オンでも実アプリのスコア影響 < 1〜2% を目標とする。
+   ホットパスの処理(時刻取得、正規化済みキー取得、集計加算、ResponseWriterラップ)は
+   個別ベンチと実環境の両方で測る。計測オフ時は起動時に素のドライバ/Handlerを選び、
+   リクエスト・クエリ単位の追加処理を行わない
 3. **依存最小・自己完結** — UI は html/template + 埋め込みCSSのみ。
-   Prometheus/Grafana 等の外部サービス不要。外部依存は
-   `shogo82148/go-sql-proxy`(MIT)と `quic-go`(HTTP/3、optional)程度に留める
-4. **安定性最優先** — 計測層の panic はすべて recover しアプリに波及させない。
+   Prometheus/Grafana 等の外部サービス不要。core の実行時依存は
+   `shogo82148/go-sql-proxy`(MIT、バージョン固定)に留め、gqlgen・quic-go は
+   アダプタ/統合テスト側だけの optional dependency とする
+4. **安定性最優先** — isutools 自身の正規化・集計・描画処理の panic だけを recover し、
+   アプリHandler、DBドライバ、resolverのpanicは握り潰さない。
    メモリは上限付き(集計キー数上限)。ログファイル肥大なし(メモリ内集計)
 5. **TDD** — 全パッケージ RED→GREEN→REFACTOR。カバレッジ 80% 以上。
-   オーバーヘッド予算はベンチマークテストで CI 検証する
+   機能CIと性能ゲートを分離し、性能は固定環境と実アプリABBA比較で検証する
 6. **シンプルさ > 機能** — takonomura 氏の言う「自分が全部理解できて、
    その場で書き換えられる道具」であること。柔軟性のために機能を削る
+7. **安全・観測可能な縮退** — 計測失敗はアプリを止めないが、黙って欠損させない。
+   snapshot に collector health / dropped count / partial を残し、デバッグEndpointは
+   既定で外部公開しない
 
 ## 3. スコープ
 
-### Phase 1(最重要・必須)
+### v1 対象(マイルストーン単位で段階リリース)
 
-| 対象 | 手段 |
-|---|---|
-| MySQL / MariaDB | `database/sql` ドライバプロキシ(両者同一プロトコル・同一ドライバ) |
-| PostgreSQL | 同上(`pgx stdlib` / `lib/pq` — ドライバ非依存実装のため自動対応) |
-| HTTP/1.1, HTTP/2 | `http.Handler` ミドルウェア(net/http が両対応。`r.Proto` をラベル化) |
-| HTTP/3 / QUIC | 同じミドルウェアを `quic-go/http3.Server{Handler: ...}` に渡すだけ |
-| GraphQL | gqlgen extension(operation 単位)+ 汎用 body-sniff ミドルウェア |
-| WebSocket | 接続レベル計測(httpstats が Upgrade を判別)+ フレームレベルは opt-in ラッパー(5.2.1) |
-| nginx | ltsv / combined(+`$request_time`)パーサ + alp 相当の集計(バイト数・キャッシュ・upstream 分離。5.4) |
-| Apache | combined + `%D` パーサ(設定スニペット同梱) |
-| git コミットハッシュ | `debug.ReadBuildInfo()` の vcs.revision / vcs.modified(dirty)表示 |
-| プロセス CPU/メモリ | `/proc` 直読みで CPU% / RSS 上位 N プロセスを表示 |
-| ブラウザ表示 | 単一ハンドラがサーバ側ソート済み HTML を返す(初期表示から降順) |
+| Milestone | 対象 | 手段 |
+|---|---|---|
+| M1 / v0.1 | MySQL / MariaDB / PostgreSQL(database/sql) | 登録済み `driver.Driver` をプロキシ化。pgx native API は対象外 |
+| M1 / v0.1 | buildinfo + Snapshot + HTML/JSON | schema version付きSnapshotから全rendererを生成 |
+| M2 / v0.2 | HTTP/1.1, HTTP/2 + nginx + procstats | Handler middleware、差分ログ、ベンチ区間の `/proc` 差分 |
+| M3 / v0.3 | Apache + gqlgen | Apache明示format、gqlgen operation adapter |
+| M4 / v1.0 | WebSocket/SSE接続 + HTTP/3互換性 | 接続レベル計測とoptional統合テスト。フレーム計測は除外 |
 
 ### 非スコープ(v1)
 
 - 生 QUIC ストリーム(HTTP/3 以外の QUIC 利用)— quic-go の qlog/Tracer 統合は Phase 2 候補
 - pgx ネイティブ API(`pgxpool` 直接利用)— `database/sql` 経由のみ対応。制約として明記
 - 分散トレーシング・時系列保存・外部ストレージ
+- WebSocket のフレーム/メッセージ数—ライブラリ別アダプタが必要なため Phase 2
 
 ## 4. アーキテクチャ
 
@@ -66,40 +70,65 @@ isutools/
 ├── isutools.go      // ファサード: RegisterSQL() / HTTP() / Handler()
 ├── sqlstats/        // SQL: ドライバプロキシ + メモリ内集計
 ├── httpstats/       // HTTP in: ミドルウェア集計 (h1/h2/h3, パス正規化)
-├── gqlstats/        // GraphQL: operation 単位集計
+├── gqlstats/        // GraphQL: 共通operation集計
+│   └── gqlgen/      // optional: gqlgen HandlerExtension adapter
 ├── accesslog/       // nginx/Apache ログの pull 型集計 (alp 相当)
 ├── procstats/       // /proc スキャン: プロセス別 CPU/RSS top-N
 ├── buildinfo/       // git hash + dirty 検出
-├── internal/agg/    // 共通集計コア (sharded map, log2 バケットヒストグラム)
+├── internal/agg/    // 共通集計コア (bounded map, log2 バケットヒストグラム)
+├── internal/health/ // collectorの失敗・drop・partial状態
 └── web/             // レポート UI + POST /reset + GET /json
 ```
 
-### 組み込み例(private-isu の場合、計3行)
+### 組み込み例(private-isu の場合、基本1行・HTTP込み2行)
 
 ```go
 import "github.com/ekusiadadus/isutools"
 
-isutools.RegisterSQL("mysql")            // ① "mysql:isutools" ドライバを登録
-db, _ = sqlx.Open("mysql"+os.Getenv("ISUTOOLS_SQL_POSTFIX"), dsn) // ②(既存行の書き換え)
-r.Mount("/debug/isutools", isutools.Handler())  // ③ UI
-// HTTP 集計もするなら: http.ListenAndServe(":8080", isutools.HTTP(r))
+db, _ = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // ①(既存行の書き換えのみ)
+// HTTP 集計もするなら(M2): http.ListenAndServe(":8080", isutools.HTTP(r))
 ```
 
-- `ISUTOOLS_SQL_POSTFIX=:isutools` で SQL 計測オン、未設定なら素のドライバ(ゼロコスト)
-- `ISUTOOLS=off` で全機能を素通し化
+**管理サーバ方式**: snapshot-first ではブラウザ閲覧はダウンロードしたファイルで
+行うため、アプリのルーターにレポート UI を載せる必要はない。ただし
+「ベンチ前 reset」「スナップショット取得」の**制御チャネル**は必要なので、
+`SQLDriverName()` が成功時に**別ポートの管理サーバ**を1度だけ起動する
+(既定 `127.0.0.1:19191`、`ISUTOOLS_ADDR` で変更、`ISUTOOLS_ADDR=off` で無効)。
+アプリのルーター・nginx を経由しないため外部に露出しない(P0-6 の安全境界に合致)。
+Docker では compose の env + ports で到達性を制御する。`Handler()` も公開して
+おり、アプリと同一ポートに載せたい場合は従来どおり任意のルーターに Mount できる。
+
+**on/off 契約**(レビュー P0-1 反映): 有効判定は `SQLDriverName()` の1箇所に集約する。
+`ISUTOOLS=off` ならラップせず素のドライバ名を返す(ゼロコスト)。登録失敗時も
+素の名前を返す **fail-open** で、計測がアプリの起動を壊すことは決してない。
+判定は起動時に1回で、動的切替はしない。旧案の `ISUTOOLS_SQL_POSTFIX` 環境変数は
+「off なのにプロキシ名で接続して起動失敗する」矛盾があったため廃止した。
+
+- fail-openした場合は collector health に警告を残し、HTML/JSONの `partial` をtrueにする
+- 厳格に失敗させたいCI/運用では `RegisterSQL` のerrorを確認する
+- 元ドライバは呼び出し前にblank import等で `database/sql` へ登録済みでなければならない
+- `ISUTOOLS=off` は起動時の不変設定とし、実行中の環境変数変更は保証しない
 
 ## 5. コンポーネント設計
 
 ### 5.1 sqlstats
 
-- `shogo82148/go-sql-proxy`(最新版・MIT)で `driver.Driver` をラップし
+- `shogo82148/go-sql-proxy`(MIT、v0.7.3に固定)で `driver.Driver` をラップし
   `<name>:isutools` として登録。**ドライバ非依存**なので MySQL / MariaDB
   (go-sql-driver/mysql)、PostgreSQL(pgx stdlib, lib/pq)すべて同一コード
-- 集計: 正規化クエリ(空白圧縮・1000字切詰・`/* tag */` 抽出)をキーに
-  `count / total / max / log2バケットヒストグラム(≒p95)` を加算
-- ホットパス最適化: 同一クエリ文字列ポインタ→正規化済みキーの `sync.Map`
-  キャッシュ(prepared statement は同一文字列なので実質1回だけ正規化が走る)
-- オーバーヘッド予算: **1クエリあたり追加 500ns 未満**(Benchmark で CI 検証)
+- 登録は `sql.Open(name, "").Driver()` で元driverを取得し、重複登録はno-op、
+  未登録名はerrorとする
+- 集計時間はExec/Query開始からdriverが結果/`driver.Rows`を返すまで。
+  `Rows.Next`〜`Rows.Close`の読み切り時間は含まないため、UIにも
+  `query dispatch duration` と明記する
+- 集計キーはSQLリテラル/コメント由来の機密値を残さない正規化を行い、空白圧縮、
+  placeholder化、1000字切詰、許可文字だけの `/* tag */` を適用する。引数値は保存しない
+- prepared statementはPrepare時に正規化する。非prepared query用キャッシュを置く場合は
+  文字列ポインタに依存せず、集計キー上限とは別の明示上限を持たせる
+- `count / error_count / total / max / log2 bucket` を加算し、p95は
+  **該当bucket上限値**であることをUI/JSONに明記する
+- microbenchmarkの目標は **1クエリあたり追加 500ns未満**。共有CIのhard gateにはせず、
+  固定runnerとprivate-isu ABBA比較でリリース判定する
 
 ### 5.2 httpstats
 
@@ -107,42 +136,58 @@ r.Mount("/debug/isutools", isutools.Handler())  // ③ UI
   正規化パス、`r.Proto`(HTTP/1.1・HTTP/2.0・HTTP/3.0)、status、時間、bytes
 - パス正規化: デフォルトで数値・UUID・拡張子前の ID セグメントを `*` に置換
   (`/image/123.jpg` → `/image/*.jpg`)。`WithPathRules([]Rule)` で上書き可能
+- 集計キーには `r.URL.Path` を使い、query stringは保存しない
+- ResponseWriter wrapper はstatus/bytesを記録しつつ、`Unwrap`、`Flusher`、
+  `Hijacker`、`io.ReaderFrom` 等の元writerの能力を壊さない。アプリHandlerのpanicは再panicする
 - HTTP/2: net/http 標準(TLS)/ h2c どちらも同一ミドルウェアで計測可能
 - HTTP/3/QUIC: `http3.Server{Handler: isutools.HTTP(mux)}` に渡すだけ。
-  QUIC は HTTP/3 のトランスポートとして自動的にカバーされる
+  core はquic-goをimportせず、HTTP/3互換性はbuild tag付き統合テストで保証する
 
 ### 5.2.1 WebSocket / 長寿命コネクション(SSE 含む)
 
 **素朴に計測するとレイテンシ統計が壊れる**(接続が数分生きるため、通常リクエストの
 p95/avg に巨大な外れ値として混入する)。そのため httpstats は以下の扱いにする:
 
-- リクエストの `Upgrade: websocket` ヘッダ / レスポンス 101 を検知したら、
-  **通常のレイテンシテーブルから除外**し、専用の「Connections」セクションで集計:
+- HTTP/1.1の `Upgrade: websocket` を検知し、middlewareの `Hijack()` が返す
+  `net.Conn` をClose追跡付きで包む。Closeは一度だけ計上し、
+  **通常のレイテンシテーブルから除外**して専用の「Connections」セクションで集計:
   - 累計接続数 / **現在のアクティブ接続数(ゲージ)** / 接続持続時間の分布
   - SSE(`Content-Type: text/event-stream`)も同じ扱い(mazrean 氏の SSE 化・
     worker_connections 枯渇の事例に対応。当初 Phase 2 だった接続数ゲージを
     Phase 1 に昇格)
-- フレーム/メッセージレベルの計測はライブラリ依存になるため **opt-in の1行ラッパー**
-  で提供: `conn = isutools.WrapWSConn(conn)`(gorilla/websocket 等の
-  `net.Conn` / `io.ReadWriter` を包み、送受フレーム数・バイト数を集計)。
-  ハンドラ内の処理時間を測りたい場合は汎用カウンタ(Phase 2)を使う
+- フレーム/メッセージ数の計測はレビュー P0-2 を受けて **Phase 2 のライブラリ別
+  アダプタに後送**する(`*websocket.Conn` は `net.Conn` ではなく、基底コネクションの
+  直接読み書きは接続を壊すため、汎用ラッパーは成立しない)。Phase 1 は
+  接続数・アクティブゲージ・持続時間・**wire バイト数**(Hijack 後の `net.Conn` を
+  Close 追跡付きで包んで計測)までとする
+- ResponseWriter ラッパーは `Hijacker` / `Flusher` / `ReaderFrom` / `Unwrap` を
+  必ず透過する(消すと WebSocket/SSE 自体が壊れる)
+- SSEは`Content-Type: text/event-stream`確定時からHandler終了/Context cancelまでを
+  activeとして扱い、接続時間は通常HTTPレイテンシへ混ぜない
 - 制約: WebSocket over HTTP/2 (RFC 8441) / HTTP/3 (RFC 9220) は Go 標準の
   サーバ側サポートが限定的なため v1 は HTTP/1.1 Upgrade を対象とする(明記)
 
 ### 5.3 gqlstats
 
 - HTTP レベルでは `POST /graphql` に潰れてしまうため operation 単位で集計する
-- gqlgen 利用時: `graphql.HandlerExtension`(InterceptResponse)を提供 — 1行
-- 非 gqlgen: リクエストボディ先頭を覗いて `operationName` を抽出する
-  opt-in ミドルウェア(ボディコピーのコストがあるため明示指定時のみ)
+- gqlgen 利用時: optionalな `gqlstats/gqlgen` パッケージから
+  `graphql.HandlerExtension`(`InterceptOperation`)を提供 — 1行。
+  responseが複数回発生するsubscriptionでもoperation countを重複計上しない
+- 非 gqlgen: GET / JSON POSTの`operationName`だけを対象にしたopt-in middlewareとし、
+  Bodyサイズ上限、読み取り後のBody復元、匿名operationの安定hashを必須とする。
+  batch/APQ/multipart/WebSocketを未対応のまま推測集計せず、healthにunsupportedを出す
 
 ### 5.4 accesslog(nginx / Apache)
 
-- **pull 型**: アプリのホットパスには一切関与せず、レポート表示時(または
-  `POST /collect`)にログファイルを差分読みして集計する。オフセットと inode を
-  記憶し、ローテーションを検知したら先頭から読み直す
+- **pull 型**: アプリのホットパスには一切関与しない。`POST /reset` で現在の
+  inode・offsetを世代の開始点として記録し、snapshot/`POST /collect` で
+  その世代の差分だけを読み込む
+- ローテーションは inode 変更前の旧ファイル末尾を可能な限りdrainしてから新ファイルへ
+  移り、copytruncate(同じinodeでsize < offset)はoffset=0へ戻す。欠損・重複の可能性は
+  collector healthへ表示する
 - フォーマット: ltsv(推奨・下記スニペット)、combined+`$request_time`、
-  Apache combined+`%D`。自動判別
+  Apache combined+`%D`。設定でformatを明示する方式を第一選択とし、自動判別は
+  失敗時に黙って誤読しないbest-effort fallbackとする
 - Docker 構成ではログの volume 共有が必要(compose 例を同梱。5.8 参照)
 
 #### 5.4.1 nginx ltsv フォーマット仕様(同梱スニペット)
@@ -154,10 +199,10 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
 log_format isutools ltsv escape=json
   "time:$time_iso8601"
   "\tmethod:$request_method"
-  "\turi:$request_uri"
+  "\turi:$uri"                       # query stringを保存しない
   "\tstatus:$status"
   "\treqtime:$request_time"          # クライアント視点の総時間
-  "\tupstime:$upstream_response_time" # アプリ処理時間("-" = nginx が直接応答)
+  "\tupstime:$upstream_response_time" # upstream時間。retry時は複数値、"-"は計測値なし
   "\tbytes:$body_bytes_sent"          # 転送バイト数(画像サイズ分析の主役)
   "\tcache:$upstream_cache_status"    # proxy_cache の HIT/MISS/BYPASS
   "\tctype:$sent_http_content_type";  # MIME 別集計用
@@ -169,36 +214,56 @@ log_format isutools ltsv escape=json
 |---|---|
 | count / sum / avg / p95 / max(reqtime) | alp 相当の基本レイテンシ分析 |
 | **bytes: パス別 合計/平均転送量・上位パス** | どの画像・静的パスが帯域を食っているか(合計時間だけでは見えない) |
-| **reqtime − upstime の乖離** | nginx 側の滞留(worker/バッファ/帯域)とアプリの遅さを切り分け |
-| **upstime = "-" の比率(nginx 直接応答率)** | 静的化オフロードがどれだけ効いたか |
+| **reqtime − upstream合計の残差** | client upload・nginx処理・buffer・downstream等を含む非upstream時間の手掛かり |
+| **upstime = "-" の比率(no-upstream-timing率)** | upstream計測値がない割合。静的配信成功とは断定しない |
 | **status 304 比率** | Conditional GET / ETag・expires 設定の効き目 |
 | **cache HIT/MISS 率** | proxy_cache 導入の効き目 |
 | ctype 別集計 | 画像/CSS/JS/HTML の帯域内訳 |
 | status 101 / 499 / 5xx | WebSocket 接続はレイテンシ集計から分離、499・reset は警告表示(接続枯渇の兆候) |
 
-- Apache 側は `%D`(µs)+ `%B` で reqtime / bytes を同等に取る
-  (upstream 分離・キャッシュ状態は nginx のみの対応と明記)
+- `$upstream_response_time` のカンマ/コロン区切り値は全試行をparseし、raw値、合計、
+  試行回数を保持する。parse不能なら残差を出さずpartial警告にする
+- Apache 側は `%D`(µs)でdurationを取る。`%B`はHTTP response body sizeであり
+  実ネットワーク送信量ではないため、実送信量が必要なら `mod_logio` の `%O` を使い、
+  UIでも `response_size` と `wire_bytes` を区別する
 - WebSocket(101)はアクセスログ上も接続クローズ時に長大な reqtime で
   記録されるため、パーサが status=101 をレイテンシ集計から自動除外する
   (5.2.1 と整合)
+- nginx/Apacheでbuffered logを使う場合はflush間隔を短く設定し、snapshot取得側は
+  設定した猶予時間だけ新規行をpollしてから世代を凍結する
 
 ### 5.5 procstats
 
-- `/proc/[pid]/stat`(utime+stime)を 500ms 間隔で2回サンプリングして CPU% を
-  算出、`/proc/[pid]/statm` から RSS。CPU / RSS それぞれ上位 N(既定10)を表示
+- **世代差分方式**(レビュー P0-3 反映): 表示時の瞬間サンプリングでは
+  「ベンチ終了後のアイドル状態」を測ってしまう。`POST /reset` 時に
+  `/proc/[pid]/stat`(utime+stime+starttime)と全体 jiffies のベースラインを
+  記録し、snapshot 取得時に**ベンチ区間全体の差分**として CPU 時間を算出する
+- PID 再利用は starttime の一致で検知。CPU% は「1コア=100%(top 互換)」と定義
+- RSS は snapshot 時点の値(`/proc/[pid]/statm`)。CPU / RSS 上位 N(既定10)
 - 外部依存なし(gopsutil 不使用)。Linux 専用で良い(ISUCON は Linux)
-- テスト容易性のため proc ルートは差し替え可能(`testdata/proc` фикスチャ)
+- テスト容易性のため proc ルートは差し替え可能(`testdata/proc` フィクスチャ)
+
+### 5.5.1 ホスト基本情報(sysinfo)
+
+すべてのレポート・スナップショットの meta に**必ず**表示する(どのハードで
+測った数字かを常に明示する):
+
+- CPU モデル名(`/proc/cpuinfo`、ARM は Hardware/Model フォールバック)
+- コア数(`runtime.NumCPU`)/ メモリ総量 GB(`/proc/meminfo`)/ OS・arch / hostname
+- 取得失敗時は "unknown" / "?" 表示(空欄にしない)。darwin は開発用ベストエフォート
 
 ### 5.6 buildinfo
 
 - 第一選択: `debug.ReadBuildInfo()` の `vcs.revision` / `vcs.modified`。
-  Go 1.18+ はビルド時に自動埋め込みされるため **コード・フラグ不要**
-- 表示例: `f4fdb31 (dirty)` / `f4fdb31`
+  Go 1.18+ でも、main package・main module・build directoryが同じVCS repositoryにあり、
+  `-buildvcs=false`でない等の条件を満たす場合にだけ自動埋め込みされる
+- 状態は `dirty / clean / unknown` の3値で保持し、情報欠落をclean扱いしない。
+  表示例: `f4fdb31 (dirty)` / `f4fdb31` / `unknown`
 - フォールバック(優先順): ① ldflags `-X` 注入(Makefile スニペット同梱)
   ② 環境変数 `ISUTOOLS_GIT_HASH` / `ISUTOOLS_GIT_DIRTY`
 - 制約: Docker ビルドのコンテキストに `.git` が無いと vcs 情報が取れない
-  (private-isu の golang/ コンテキストがまさにこれ)→ compose の build.args で
-  ハッシュを渡す例を同梱
+  (private-isu の golang/ コンテキストがまさにこれ)→ compose `build.args`、
+  Dockerfile `ARG`、`go build -ldflags '-X ...'` まで一続きの例を同梱する
 
 ### 5.7 web(レポート UI)— snapshot-first アーキテクチャ
 
@@ -207,7 +272,12 @@ log_format isutools ltsv escape=json
 完全に分離し、すべてのレンダラは同一のスナップショット構造体から描画する。
 
 ```
-collection core ──▶ Snapshot (構造体: meta + sql + http + gql + accesslog + proc)
+immutable startup config
+        │
+collectors ──▶ Generation N (resetでatomic swap、proc/logの開始点を保持)
+                    │
+                    └─▶ immutable Snapshot v1
+                          (meta + health + sql + http + gql + accesslog + proc)
                       ├─ GET /            … ライブ表示(現在のスナップショットを描画)
                       ├─ GET /snapshot.html … 自己完結 HTML エクスポート(主役)
                       ├─ GET /json          … 機械可読(差分・通知連携用)
@@ -217,9 +287,9 @@ collection core ──▶ Snapshot (構造体: meta + sql + http + gql + accessl
 - **`GET /snapshot.html`** — データ埋め込みの完全自己完結 HTML(外部リソース
   ゼロ・インライン CSS/最小限の JS)。ダウンロードして**ダブルクリックで開くだけ**
   で閲覧できる。初期表示は合計時間降順ソート済み、列クリックで再ソート
-- meta にはベンチ結果(score)・git hash・dirty・計測時刻を含め、ファイル名も
-  `20260803-2130_f4fdb31-dirty_score929.html` 形式で自動命名する
-  (buildinfo 要件がここで効く)
+- meta には `schema_version`、tool version、generation、計測開始/終了、
+  git hash、dirty state、host、各collector healthを含める。scoreはアプリから
+  知り得ないため、bench scriptが結果取得後にmetaへ付与するかファイル名だけに含める
 - ライブ表示(`GET /`)も同一コアの別レンダラとして残す(実装コストほぼゼロ)。
   チューニング中に SSH トンネル越しでさっと見る用途と使い分ける
 - **専用ローカルビューアアプリは作らない**(シンプルさ原則)。自己完結 HTML が
@@ -231,7 +301,19 @@ collection core ──▶ Snapshot (構造体: meta + sql + http + gql + accessl
 2. **本番でサーバーが消えても感想戦ができる** — ISUCON 本番は競技後に
    サーバーが破棄されるため、手元に全計測が残ることは決定的に重要
 3. **閲覧が計測対象に負荷をかけない** — ベンチ直後にエクスポート1回だけ
-4. アプリが落ちた後・コンテナ再起動後も直前の計測を失わない
+
+**永続性の正確な範囲**(レビュー P0-4 反映): 集計はメモリ内のみであり、
+残るのは**エクスポート済みのスナップショットだけ**。エクスポート前にプロセスが
+落ちればその世代は失われる(ベンチ後に必ず取得する運用が前提)。
+snapshot の meta には `schema_version` / `generation`(reset 毎に増加)/
+取得時刻 / git revision+dirty / ホスト情報(5.5.1)を含める。score は
+アプリからは知り得ないため、ベンチスクリプト側がファイル名に付与する。
+
+**generation境界**: `POST /reset` は新しい空generationへatomic swapし、その後に
+旧generationを不変Snapshotとして保存する。進行中の計測は開始時に取得したgenerationへ
+最後まで加算し、reset前後へ二重計上しない。Snapshot生成中のreset、同時reset、
+collector失敗をrace testで固定する。1世代前の保持はv1の基本機能とし、
+UI上の差分計算・複数世代履歴はPhase 2とする。
 
 ### 5.7.1 転送の自動化
 
@@ -239,11 +321,22 @@ takonomura 氏の「短いコマンド一発」原則に従い、手元 PC 側�
 コマンドを用意する(examples/ に同梱):
 
 ```
-ssh 対象 'bench.sh'                       # ベンチ実行(前段で POST /reset)
-curl … /snapshot.html+json → snapshots/   # リモート側で保存
+ssh 対象 'bench.sh'                       # reset → ベンチ → HTML/JSONを.tmpへ取得
+mv snapshots/<run>.tmp snapshots/<run>    # 取得成功後だけatomic rename
 rsync remote:snapshots/ ./snapshots/      # 手元へ回収
 open snapshots/<latest>.html              # ブラウザで自動オープン
 ```
+
+### 5.7.2 Web endpoint の安全境界
+
+- 既定ではloopbackからのアクセスだけを許可する。非loopbackで使う場合は
+  `ISUTOOLS_TOKEN` 等の明示tokenを要求し、token未設定の外部公開を拒否する
+- `GET /`、`GET /snapshot.html`、`GET /json`、`POST /collect`、`POST /reset` の
+  methodを固定する。collect対象のfile size、Body、実行時間、同時実行数に上限を設ける
+- SQL引数・query stringは保存しない。HTMLは `html/template` のcontextual escapingを使い、
+  inline JSON中の `<`、`>`、`&`、`</script>` を安全にescapeする
+- collector失敗はHTTP成功に見せかけず、Snapshotの `partial` とhealthへ残す。
+  ただし計測失敗を理由にアプリ本体の処理を失敗させない
 
 ### 5.8 インフラ側の設計課題と解決
 
@@ -253,17 +346,21 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 | Apache も同様 | 同上 |
 | Docker ビルドに `.git` が無い | build.args でハッシュ注入(5.6 フォールバック) |
 | コンテナ内 `/proc` は自コンテナの PID namespace のみ | 単一台構成なら `pid: "host"`(compose)で全プロセス可視化。Docker Desktop は VM 内プロセスになる旨を注記 |
-| 集計メモリの際限ない成長 | キー数上限(SQL 10k / HTTP 10k)。超過分は `(other)` に合算し、UI に警告表示(silent cap にしない) |
+| 集計メモリの際限ない成長 | 全collectorと正規化cacheに個別上限。SQL/HTTPは各10k、超過分は `(other)` に合算しUI/healthへ警告 |
+| debug endpoint の外部露出 | loopback既定、外部利用は明示token。collectにsize/time/concurrency上限 |
 
 ## 6. オーバーヘッドと安定性の設計
 
-- 計測オフ: ドライバ未登録・ミドルウェアは `next` をそのまま返す(ゼロコスト)
-- 計測オン: ホットパスは `time.Now()` 2回 + sharded map への加算のみ。
-  文字列処理はキャッシュ済み正規化キーで回避
-- すべての集計呼び出しは `defer recover()` でガードし、計測の失敗が
-  アプリの応答に影響しない
-- goroutine は起動しない(procstats のサンプリングもリクエスト駆動)。
-  常駐コスト・グレースフルシャットダウン考慮が不要になる
+- 計測オフ: `SQLDriverName` は元driver名を返し、HTTP middlewareは起動時に
+  `next` をそのまま返す。リクエスト/クエリ単位の追加分をゼロにする
+- 計測オン: 時刻取得、bounded正規化cache、集計、必要なResponseWriterラップを行う。
+  「時刻2回 + map加算だけ」とは過小表現せず、各コストをbenchmarkで個別表示する
+- sharded mapは初期実装として採用するが、hot key競合を並行benchmarkで測る。
+  予算を超えた場合だけ既存keyのatomic加算等へ変更する
+- recoverはisutools自身の処理だけに限定する。`next.ServeHTTP`、実driver、resolverの
+  panicは元のスタック/意味を保って透過する
+- 常駐goroutineは原則起動しない。procstatsはreset/snapshotの2点差分、accesslogは
+  collect要求駆動とし、必要なlog flush待ちは期限付きpollで行う
 
 ## 7. TDD・テスト戦略
 
@@ -346,16 +443,33 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 - 「終盤はネックが DB → アプリ CPU → GC/map へ移動する」(mazrean)
   → SQL だけでなく procstats / pprof を最初から同居させる本設計の妥当性を裏付け
 
+## 9.5 外部レビュー(2026-08-03)の反映
+
+GPT-5.6 による設計レビューの指摘と対応。上記各節に反映済みの P0 のほか:
+
+| 指摘 | 対応 |
+|---|---|
+| SQL 計測時間はクエリ発行〜応答開始まで(行読み取り除外) | 仕様として明記し、レポート脚注に表示。Rows 追跡は複雑化に見合わず v1 は採らない |
+| SQL 正規化が弱い(リテラル高カーディナリティ・PII 残留) | **採用**: 文字列リテラル('' / \' エスケープ対応)と数値リテラルを ? にマスク |
+| 正規化キャッシュの無制限成長 | 実装済み: 値キー・50,000 件上限・4KB 超は非キャッシュ |
+| p95 は log2 バケット近似(最大約2倍幅) | レポートに「p95*(近似・上限側)」と明示 |
+| `$upstream_response_time` はリトライ時カンマ区切り複数値 / Apache `%B` は実送信量でない(`%O` が必要)/ `upstime="-"` ≠ 静的配信成功 | M3 実装時の仕様に取り込み(5.4 注記) |
+| gqlgen は InterceptResponse でなく **InterceptOperation** が operation 計測の中心(subscription は response 複数回) | M4 実装時に反映 |
+| gqlgen / quic-go を本体依存にしない | アダプタは**ネストモジュール**(別 go.mod)として分離 |
+| CI の ns 単位ハードゲートは共有ランナーで不安定 | ベンチは informational とし、リリース前に対象ホストで on/off ABBA 比較を実施 |
+| recover の範囲がアプリの panic を握り潰す恐れ | 実装済み: recover は計測フック内部のみ。アプリ・ドライバの panic は透過 |
+| /debug エンドポイントの保護 | ISUCON 用途では bench が /debug を叩かない前提とし、v1 は「外部公開しない」運用注記 + 将来 `ISUTOOLS_TOKEN` オプション |
+
 ## 10. 決定事項ログ
 
 - 2026-08-03: 閲覧方式は **snapshot-first**(リモートで計測 → 自己完結 HTML を
   ダウンロード → 手元 PC で閲覧)に決定。ライブ表示は補助として残す(5.7)
+- 2026-08-03: リポジトリは **public + MIT** で確定(Docker ビルド内 `go get` 対応)
+- 2026-08-03: snapshot.html には**最小限の JS を許容**(列ソート切替のみ。
+  外部リソース読み込みは引き続き禁止、自己完結性は維持)
+- 2026-08-03: モジュール名は `isutools` で確定
 
 ## 11. 未決事項
 
-- [ ] リポジトリ公開設定: Docker ビルド内の `go get` を素直に通すには public + MIT が最善
-  (private のままなら vendoring か build secret で GOPRIVATE 認証が必要)
-- [ ] モジュール名の確定: `isutools` / `isuprof` など
 - [ ] パス正規化ルールの注入方法(コード / 環境変数 / 設定ファイル)
-- [ ] `(other)` 合算の上限値のデフォルト
-- [ ] snapshot.html の JS 許容範囲(ソート切替のみ最小限で入れるか、完全 JS なしか)
+- [ ] `(other)` 合算の上限値のデフォルト(暫定: SQL/HTTP 各 10,000 キー)
