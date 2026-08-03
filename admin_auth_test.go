@@ -19,16 +19,21 @@ func TestIsLoopbackAdminAddr(t *testing.T) {
 	}
 }
 
-func TestProtectAdminRequiresTokenOnlyForNonLoopback(t *testing.T) {
+func TestProtectAdminKeepsLoopbackTokenFreeAndRequiresExplicitContainerOptIn(t *testing.T) {
 	next := &authTestHandler{}
-	if got, err := protectAdmin("127.0.0.1:19191", "", next); err != nil || got != next {
+	if got, err := protectAdmin("127.0.0.1:19191", "", false, next); err != nil || got != next {
 		t.Fatalf("loopback protect = (%T, %v), want unchanged", got, err)
 	}
-	if _, err := protectAdmin("0.0.0.0:19191", "", next); err == nil {
-		t.Fatal("non-loopback without token must fail closed")
+	// Docker commonly binds 0.0.0.0 inside the container while compose
+	// publishes only host 127.0.0.1. Require an explicit security opt-in.
+	if _, err := protectAdmin("0.0.0.0:19191", "", false, next); err == nil {
+		t.Fatal("tokenless non-loopback bind without explicit opt-in must fail closed")
+	}
+	if got, err := protectAdmin("0.0.0.0:19191", "", true, next); err != nil || got != next {
+		t.Fatalf("explicit tokenless container bind = (%T, %v), want unchanged", got, err)
 	}
 
-	protected, err := protectAdmin("0.0.0.0:19191", "correct horse", next)
+	protected, err := protectAdmin("0.0.0.0:19191", "correct horse", false, next)
 	if err != nil {
 		t.Fatalf("protect: %v", err)
 	}
@@ -55,7 +60,7 @@ func TestProtectAdminRequiresTokenOnlyForNonLoopback(t *testing.T) {
 }
 
 func TestProtectAdminAcceptsQueryTokenAndSetsCookie(t *testing.T) {
-	protected, err := protectAdmin("0.0.0.0:19191", "correct horse", &authTestHandler{})
+	protected, err := protectAdmin("0.0.0.0:19191", "correct horse", false, &authTestHandler{})
 	if err != nil {
 		t.Fatalf("protect: %v", err)
 	}

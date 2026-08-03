@@ -33,9 +33,14 @@ http.ListenAndServe(":8080", isutools.HTTP(handler))
 - `ISUTOOLS_ADDR=off` で管理serverだけ無効(SQL集計は継続)
 
 既定の管理serverはアプリのrouter・nginxを経由せず、loopback以外へbindしない。
-`ISUTOOLS_ADDR=0.0.0.0:19191` のような非loopback bindは
-`ISUTOOLS_TOKEN` が必須で、全endpointを `Authorization: Bearer <token>` で保護する。
-tokenなしの非loopback指定はfail-closedで管理serverを起動しない。
+`http://localhost:19191/` はtokenなしでそのまま開ける。Docker内で
+`ISUTOOLS_ADDR=0.0.0.0:19191` とし、composeのhost側を
+`127.0.0.1:19191:19191` に限定する構成では、明示的に
+`ISUTOOLS_ALLOW_UNAUTHENTICATED=1` を設定すればtokenなしで利用できる。
+本当に外部へ公開する場合だけ `ISUTOOLS_TOKEN` を設定し、全endpointを
+`Authorization: Bearer <token>`（ブラウザは初回 `/?token=<token>`）で保護する。
+非loopbackでtokenも明示opt-inもない場合はfail-closed、明示opt-in時は
+warningとhealth degradedを表示する。
 同一ポートに載せる場合は `isutools.Handler()` を任意routerへmountできるが、
 アクセス制御は呼び出し側の責任になる。
 

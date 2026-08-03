@@ -9,7 +9,8 @@ Updated: 2026-08-03 (Asia/Tokyo)
 - Dashboard extension: MySQL/MariaDB schema capture, atomic HTML/JSON persistence,
   saved snapshot listing
 - M0 gates: collector health/partial, generation-scoped SQL store, serialized reset,
-  fixed endpoint methods, non-loopback Bearer authentication
+  fixed endpoint methods, non-loopback Bearer authentication and an explicit
+  Docker host-loopback unauthenticated opt-in
 - M2: HTTP middleware, nginx LTSV delta tailer, Linux reset-to-snapshot procstats,
   snapshot schema v3 and HTML sections for all three collectors
 
@@ -51,7 +52,7 @@ clean at `01a5b62`, and `webapp/golang/go.mod` still pins `isutools v0.1.0`. Tha
 verified the one-line SQL wrapper, loopback compose exposure, build metadata injection,
 snapshot save/download, SQL top-five output, Discord notification, and literal masking.
 That run identified the existing bottlenecks but did not exercise this worktree's M2 HTTP,
-nginx access-log, procstats, schema-v3 health, or Bearer authentication changes.
+nginx access-log, procstats, schema-v3 health, or optional Bearer authentication changes.
 
 Therefore the v0.2 code is a local candidate, not a remotely or physically verified release.
 Before tagging, update private-isu to this revision and run same-binary, same-host ABBA

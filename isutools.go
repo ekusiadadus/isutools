@@ -95,11 +95,18 @@ func startAdmin() {
 			return
 		}
 		token := os.Getenv("ISUTOOLS_TOKEN")
-		if !isLoopbackAdminAddr(addr) && token == "" {
-			err := errors.New("non-loopback admin bind requires ISUTOOLS_TOKEN")
+		allowUnauthenticated := os.Getenv("ISUTOOLS_ALLOW_UNAUTHENTICATED") == "1"
+		if !isLoopbackAdminAddr(addr) && token == "" && !allowUnauthenticated {
+			err := errors.New("non-loopback admin bind requires ISUTOOLS_TOKEN or explicit ISUTOOLS_ALLOW_UNAUTHENTICATED=1")
 			collectorHealth.Set("admin", health.StatusFailed, err.Error())
 			log.Printf("isutools: admin server disabled: %v", err)
 			return
+		}
+		unprotectedNonLoopback := !isLoopbackAdminAddr(addr) && allowUnauthenticated
+		if unprotectedNonLoopback {
+			message := "unauthenticated non-loopback admin bind explicitly enabled; restrict host publishing to 127.0.0.1"
+			collectorHealth.Set("admin", health.StatusDegraded, message)
+			log.Printf("isutools: warning: %s", message)
 		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -107,12 +114,14 @@ func startAdmin() {
 			log.Printf("isutools: admin listen on %s failed: %v", addr, err)
 			return
 		}
-		collectorHealth.Set("admin", health.StatusOK, "")
+		if !unprotectedNonLoopback {
+			collectorHealth.Set("admin", health.StatusOK, "")
+		}
 		adminMu.Lock()
 		adminBind = ln.Addr().String()
 		adminMu.Unlock()
 		log.Printf("isutools: admin server on http://%s", ln.Addr())
-		handler, err := protectAdmin(addr, token, Handler())
+		handler, err := protectAdmin(addr, token, allowUnauthenticated, Handler())
 		if err != nil {
 			_ = ln.Close()
 			collectorHealth.Set("admin", health.StatusFailed, err.Error())
@@ -147,12 +156,12 @@ func isLoopbackAdminAddr(addr string) bool {
 // adminCookieName carries browser sessions authenticated once via ?token=.
 const adminCookieName = "isutools_token"
 
-func protectAdmin(addr, token string, next http.Handler) (http.Handler, error) {
-	if isLoopbackAdminAddr(addr) {
+func protectAdmin(addr, token string, allowUnauthenticated bool, next http.Handler) (http.Handler, error) {
+	if isLoopbackAdminAddr(addr) || allowUnauthenticated {
 		return next, nil
 	}
 	if token == "" {
-		return nil, errors.New("non-loopback admin bind requires ISUTOOLS_TOKEN")
+		return nil, errors.New("non-loopback admin bind requires authentication or explicit unauthenticated opt-in")
 	}
 	want := sha256.Sum256([]byte("Bearer " + token))
 	matches := func(bearer string) bool {

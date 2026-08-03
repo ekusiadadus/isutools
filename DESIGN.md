@@ -97,8 +97,10 @@ db, _ = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // ①(既存行の書�
 `SQLDriverName()` が成功時に**別ポートの管理サーバ**を1度だけ起動する
 (既定 `127.0.0.1:19191`、`ISUTOOLS_ADDR` で変更、`ISUTOOLS_ADDR=off` で無効)。
 既定値ではアプリのルーター・nginx を経由せず外部にもbindしない(P0-6 の安全境界に合致)。
-非loopback指定では `ISUTOOLS_TOKEN` を必須とし、Bearer認証を全endpointへ適用する。
-tokenなしの非loopback指定は管理serverを起動しない(fail-closed)。
+loopbackはtokenなしで即閲覧できる。Docker内の `0.0.0.0` bind + host側
+`127.0.0.1` publishでは `ISUTOOLS_ALLOW_UNAUTHENTICATED=1` を明示した場合だけ
+tokenなしを許可する。`ISUTOOLS_TOKEN` は外部公開時の保護であり、設定時は
+Bearer認証を全endpointへ適用する。
 Docker ではhost側も `127.0.0.1` に限定したport mappingで到達性を制御する。`Handler()` も公開して
 おり、アプリと同一ポートに載せたい場合は従来どおり任意のルーターに Mount できる。
 
@@ -341,9 +343,12 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 
 - 自動管理serverは既定で `127.0.0.1:19191` にbindし、アプリrouter/reverse proxyから
   分離する。SSH tunnelまたは対象host上のbench scriptから利用する
-- `ISUTOOLS_ADDR` で非loopbackへbindする場合は `ISUTOOLS_TOKEN` 必須。
-  `Authorization: Bearer <token>` をSHA-256後に定数時間比較し、欠落・不一致は401、
-  token未設定はlisten前にfail-closedとする。loopbackは従来どおりtoken不要
+- loopbackはtoken不要。Docker内で非loopback bindしてもhost側port mappingを
+  `127.0.0.1` に限定し、`ISUTOOLS_ALLOW_UNAUTHENTICATED=1` を明示した場合はtokenなしでよい。
+  この明示opt-in時はwarningとhealth degradedで外部露出リスクを表示する。
+  tokenもopt-inもない非loopback bindはlisten前にfail-closedとする
+- `ISUTOOLS_TOKEN` 設定時は `Authorization: Bearer <token>` をSHA-256後に定数時間比較。
+  ブラウザ向けには初回 `/?token=<token>` でHttpOnly cookieを発行し、以後は通常URLで閲覧できる
 - `GET /`、`GET /snapshot.html`、`GET /json`、`POST /collect`、`POST /reset` の
   methodを固定する。collect対象のfile size、Body、実行時間、同時実行数に上限を設ける
 - SQL引数・query stringは保存しない。HTMLは `html/template` のcontextual escapingを使い、
@@ -360,7 +365,7 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 | Docker ビルドに `.git` が無い | build.args でハッシュ注入(5.6 フォールバック) |
 | コンテナ内 `/proc` は自コンテナの PID namespace のみ | 単一台構成なら `pid: "host"`(compose)で全プロセス可視化。Docker Desktop は VM 内プロセスになる旨を注記 |
 | 集計メモリの際限ない成長 | 全collectorと正規化cacheに個別上限。SQL/HTTPは各10k、超過分は `(other)` に合算しUI/healthへ警告 |
-| debug endpoint の外部露出 | 独立loopback admin server。非loopbackはBearer token必須。collectにsize/time/concurrency上限 |
+| debug endpoint の外部露出 | 独立loopback admin server。外部公開時はBearer token、Docker host-loopbackは明示的なunauthenticated opt-in。collectにsize/time/concurrency上限 |
 
 ## 6. オーバーヘッドと安定性の設計
 
@@ -401,7 +406,7 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 ## 8. マイルストーンと受け入れ条件
 
 0. **M0(設計契約・release gate、local core実装済み)**: on/off、health、generation、
-   Snapshot schema v3、method固定、nonloopback Bearer securityをcontract testで固定。
+   Snapshot schema v3、method固定、nonloopback Bearer/明示unauthenticated opt-inをcontract testで固定。
    collector横断barrierとremote性能gateは未完
 1. **M1(v0.1.0、実装・private-isu基本統合済み)**: internal/agg + sqlstats + web +
    buildinfo + sysinfo + loopback admin server。private-isu ABBA比較を残す
@@ -491,7 +496,7 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 | optional dependency | gqlgen/quic-goをcoreから分離 | package/module境界は実装前に確定 |
 | 共有CIのns hard gate | informational + 固定host ABBA | 手順反映、remote検証未実施 |
 | recoverがアプリpanicを隠す | isutools内部だけrecover | SQL hookとHTTP再panicを実装・test済み |
-| debug endpoint露出 | 独立loopback admin、非loopbackはBearer認証 | token/method固定を実装済み、collect resource上限は未完 |
+| debug endpoint露出 | 独立loopback admin、外部公開時はBearer認証 | localhost無認証、Docker明示opt-in、token/header/query-cookie、method固定を実装済み。collect resource上限は未完 |
 
 ## 11. 決定事項ログ
 
@@ -509,8 +514,8 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 - 2026-08-03: procstatsはreset/snapshot区間差分。表示時500ms sample案は廃止
 - 2026-08-03: SQL/HTTPの既定キー上限は各10,000、正規化cacheは50,000。
   超過・欠損はhealthへ表示する
-- 2026-08-03: 非loopback adminは `ISUTOOLS_TOKEN` + Bearer認証を必須とし、
-  tokenなしではlistenしない。loopbackはtoken不要
+- 2026-08-03: localhostは設定なしで閲覧可能。Docker host-loopback publishのtoken省略は
+  `ISUTOOLS_ALLOW_UNAUTHENTICATED=1` の明示opt-inを要求し、health warningを出す
 - 2026-08-03: DB schema/health/M2 collectorsを加えたSnapshotをschema v3とする。
   SQL/HTTP単体のgeneration swapは実装済み、collector横断barrierは別gateとして残す
 
@@ -521,7 +526,7 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 - **Context**: suffix環境変数とglobal offが競合し、アプリ起動失敗または意図しないproxy利用が起きる
 - **Decision**: `SQLDriverName`が起動時にraw/proxyを選び、成功時だけ独立loopback adminを起動する
 - **Consequences**: 基本導入は1行。fail-openはアプリを守る一方、health実装なしでは計測欠損を見逃す
-- **Status**: Implemented。health表示とnon-loopback Bearer認証をschema v3で検証済み
+- **Status**: Implemented。localhost無認証、Docker明示opt-in、non-loopback Bearer、health表示を検証済み
 
 ### ADR-002: GenerationベースSnapshot
 
@@ -541,7 +546,8 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 
 - **Context**: 計測器がアプリを止めてはならないが、silent failureと外部公開も危険
 - **Decision**: isutools内部だけrecoverし、欠損はhealth/partialへ出す。adminはloopbackを既定とする
-- **Consequences**: 非loopback利用にはtokenまたは外部認証が必要。collectorの失敗契約を全packageで統一する
+- **Consequences**: 外部公開にはtokenまたは外部認証を推奨。Docker host-loopback publishは
+  明示opt-inによりtokenなしで使える。opt-inなしの非loopbackはfail-closedとなる
 - **Status**: Implemented for core/admin。accesslog/proc固有healthもsnapshotへ保持
 
 ## 13. 未決事項
