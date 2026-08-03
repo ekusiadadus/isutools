@@ -17,12 +17,25 @@
 package isutools
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/dbinspect"
+	"github.com/ekusiadadus/isutools/httpstats"
+	"github.com/ekusiadadus/isutools/internal/agg"
+	"github.com/ekusiadadus/isutools/internal/health"
+	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/sqlstats"
 	"github.com/ekusiadadus/isutools/web"
 )
@@ -32,9 +45,10 @@ import (
 const defaultAdminAddr = "127.0.0.1:19191"
 
 var (
-	adminOnce sync.Once
-	adminMu   sync.Mutex
-	adminBind string
+	adminOnce       sync.Once
+	adminMu         sync.Mutex
+	adminBind       string
+	collectorHealth = health.NewRegistry()
 )
 
 // Off reports whether measurement is globally disabled via ISUTOOLS=off.
@@ -50,8 +64,11 @@ func SQLDriverName(name string) string {
 		return name
 	}
 	if err := sqlstats.Register(name); err != nil {
+		collectorHealth.Set("sql", health.StatusFailed, err.Error())
+		log.Printf("isutools: sql registration failed: %v", err)
 		return name
 	}
+	collectorHealth.Set("sql", health.StatusOK, "")
 	startAdmin()
 	return name + sqlstats.DriverSuffix
 }
@@ -74,19 +91,35 @@ func startAdmin() {
 	adminOnce.Do(func() {
 		addr := resolveAdminAddr(os.Getenv)
 		if addr == "" {
+			collectorHealth.Set("admin", health.StatusDisabled, "disabled by ISUTOOLS_ADDR")
+			return
+		}
+		token := os.Getenv("ISUTOOLS_TOKEN")
+		if !isLoopbackAdminAddr(addr) && token == "" {
+			err := errors.New("non-loopback admin bind requires ISUTOOLS_TOKEN")
+			collectorHealth.Set("admin", health.StatusFailed, err.Error())
+			log.Printf("isutools: admin server disabled: %v", err)
 			return
 		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
+			collectorHealth.Set("admin", health.StatusFailed, err.Error())
 			log.Printf("isutools: admin listen on %s failed: %v", addr, err)
 			return
 		}
+		collectorHealth.Set("admin", health.StatusOK, "")
 		adminMu.Lock()
 		adminBind = ln.Addr().String()
 		adminMu.Unlock()
 		log.Printf("isutools: admin server on http://%s", ln.Addr())
+		handler, err := protectAdmin(addr, token, Handler())
+		if err != nil {
+			_ = ln.Close()
+			collectorHealth.Set("admin", health.StatusFailed, err.Error())
+			return
+		}
 		go func() {
-			_ = http.Serve(ln, Handler())
+			_ = http.Serve(ln, handler)
 		}()
 	})
 }
@@ -99,6 +132,59 @@ func adminAddr() string {
 	return adminBind
 }
 
+func isLoopbackAdminAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// adminCookieName carries browser sessions authenticated once via ?token=.
+const adminCookieName = "isutools_token"
+
+func protectAdmin(addr, token string, next http.Handler) (http.Handler, error) {
+	if isLoopbackAdminAddr(addr) {
+		return next, nil
+	}
+	if token == "" {
+		return nil, errors.New("non-loopback admin bind requires ISUTOOLS_TOKEN")
+	}
+	want := sha256.Sum256([]byte("Bearer " + token))
+	matches := func(bearer string) bool {
+		got := sha256.Sum256([]byte(bearer))
+		return subtle.ConstantTimeCompare(got[:], want[:]) == 1
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorized := matches(r.Header.Get("Authorization"))
+		// Browsers cannot send Authorization headers to a plain URL, so a
+		// one-time ?token= grants an HttpOnly session cookie for the UI.
+		if !authorized {
+			if q := r.URL.Query().Get("token"); q != "" && matches("Bearer "+q) {
+				authorized = true
+				http.SetCookie(w, &http.Cookie{
+					Name: adminCookieName, Value: q, Path: "/", HttpOnly: true,
+				})
+			}
+		}
+		if !authorized {
+			if c, err := r.Cookie(adminCookieName); err == nil && matches("Bearer "+c.Value) {
+				authorized = true
+			}
+		}
+		if !authorized {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="isutools"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	}), nil
+}
+
 // RegisterSQL wraps the named drivers ("mysql", "pgx", ...) and registers
 // measuring variants under "<name>:isutools". Prefer SQLDriverName, which
 // also resolves the on/off decision. No-op when disabled.
@@ -106,11 +192,75 @@ func RegisterSQL(names ...string) error {
 	if Off() {
 		return nil
 	}
-	return sqlstats.Register(names...)
+	err := sqlstats.Register(names...)
+	if err != nil {
+		collectorHealth.Set("sql", health.StatusFailed, err.Error())
+		return err
+	}
+	collectorHealth.Set("sql", health.StatusOK, "")
+	return nil
 }
 
-// Handler serves the report UI: GET / (live), GET /snapshot.html (download),
-// GET /json, POST /reset.
+// HTTP instruments inbound HTTP requests. When ISUTOOLS=off it returns next
+// unchanged, avoiding request-path overhead.
+func HTTP(next http.Handler) http.Handler {
+	if Off() {
+		return next
+	}
+	return httpstats.Middleware(next)
+}
+
+// Handler serves the report UI: GET / (dashboard with snapshot history),
+// GET /snapshot.html (download), GET /json, GET /files/<name>,
+// POST /reset, POST /collect, POST /save. Snapshot history persists to ISUTOOLS_DATA_DIR
+// when set. The DB schema is inspected through the first DSN the
+// application opened, using the raw driver so inspection queries never
+// appear in the SQL statistics.
 func Handler() http.Handler {
-	return web.NewHandler(web.Provider{SQL: sqlstats.Default})
+	provider := web.Provider{
+		SQL:           sqlstats.Default,
+		SQLGeneration: sqlstats.Default.CurrentGeneration,
+		RotateSQL: func() (int64, []agg.Entry) {
+			frozen := sqlstats.Default.Rotate()
+			return frozen.Generation, frozen.Entries
+		},
+		Health:  collectorHealth,
+		HTTP:    httpstats.Default,
+		DataDir: os.Getenv("ISUTOOLS_DATA_DIR"),
+		DB: func(ctx context.Context) *dbinspect.Schema {
+			name, dsn, ok := sqlstats.FirstConn()
+			if !ok {
+				return nil
+			}
+			return dbinspect.Collect(ctx, name, dsn)
+		},
+	}
+	collectorHealth.Set("http", health.StatusOK, "")
+	if path := os.Getenv("ISUTOOLS_NGINX_LOG"); path != "" {
+		collector := accesslog.New(path)
+		provider.AccessLog = collector
+		provider.AccessLogQuiet = 100 * time.Millisecond
+		provider.AccessLogPoll = 25 * time.Millisecond
+		provider.CollectTimeout = 2 * time.Second
+		state := collector.Health()
+		if state.Status == accesslog.StatusOK {
+			collectorHealth.Set("accesslog", health.StatusOK, "")
+		} else {
+			collectorHealth.Set("accesslog", health.StatusDegraded, state.Message)
+		}
+	} else {
+		collectorHealth.Set("accesslog", health.StatusDisabled, "ISUTOOLS_NGINX_LOG is not configured")
+	}
+	if runtime.GOOS == "linux" {
+		collector := procstats.New()
+		provider.Proc = collector
+		if err := collector.Reset(); err != nil {
+			collectorHealth.Set("proc", health.StatusDegraded, err.Error())
+		} else {
+			collectorHealth.Set("proc", health.StatusOK, "")
+		}
+	} else {
+		collectorHealth.Set("proc", health.StatusDisabled, "procfs is only available on Linux")
+	}
+	return web.NewHandler(provider)
 }

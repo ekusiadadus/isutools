@@ -85,6 +85,34 @@ func TestRegisterAndObserveQueries(t *testing.T) {
 	}
 }
 
+func TestFirstConnCapturesDSN(t *testing.T) {
+	t.Cleanup(Default.Reset)
+	connMu.Lock()
+	firstName, firstDSN = "", ""
+	connMu.Unlock()
+	if err := Register("isutoolsfake"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	db, err := sql.Open("isutoolsfake"+DriverSuffix, "user:pass@tcp(db:3306)/isuconp")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	name, dsn, ok := FirstConn()
+	if !ok {
+		t.Fatal("FirstConn: no connection captured")
+	}
+	if name != "isutoolsfake" {
+		t.Errorf("driver = %q, want base name isutoolsfake", name)
+	}
+	if dsn != "user:pass@tcp(db:3306)/isuconp" {
+		t.Errorf("dsn = %q", dsn)
+	}
+}
+
 func TestRegisterIsIdempotent(t *testing.T) {
 	if err := Register("isutoolsfake"); err != nil {
 		t.Fatalf("first: %v", err)

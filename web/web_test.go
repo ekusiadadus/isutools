@@ -1,13 +1,17 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/internal/agg"
 )
 
@@ -54,8 +58,8 @@ func TestJSONSortedByTotal(t *testing.T) {
 	if got.Meta.Revision == "" {
 		t.Error("meta.revision must always be present")
 	}
-	if got.Meta.SchemaVersion != 1 {
-		t.Errorf("schema_version = %d, want 1", got.Meta.SchemaVersion)
+	if got.Meta.SchemaVersion != 3 {
+		t.Errorf("schema_version = %d, want 3 (v3 added health/generations)", got.Meta.SchemaVersion)
 	}
 	if got.Meta.Generation < 1 {
 		t.Errorf("generation = %d, want >= 1", got.Meta.Generation)
@@ -163,5 +167,90 @@ func TestUnknownPathIs404(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func newPersistentHandler(t *testing.T) (http.Handler, string) {
+	t.Helper()
+	dir := t.TempDir()
+	tbl := agg.NewTable(agg.DefaultMaxKeys)
+	tbl.Observe("SELECT persisted", 5*time.Millisecond)
+	h := NewHandler(Provider{
+		SQL:     tbl,
+		DataDir: dir,
+		DB: func(context.Context) *dbinspect.Schema {
+			return &dbinspect.Schema{
+				Flavor: "mysql",
+				Tables: []dbinspect.Table{{
+					Name: "comments", Engine: "InnoDB", Rows: 100000,
+					Indexes: []dbinspect.Index{{Name: "PRIMARY", Columns: "id", Unique: true}},
+				}},
+			}
+		},
+	})
+	return h, dir
+}
+
+func TestDashboardShowsDBSchemaAndSections(t *testing.T) {
+	h, _ := newPersistentHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{"DB Schema", "comments", "PRIMARY", "SQL", "Snapshots"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dashboard missing %q", want)
+		}
+	}
+}
+
+func TestSavePersistsAndDashboardLists(t *testing.T) {
+	h, dir := newPersistentHandler(t)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save?score=929", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !strings.Contains(saved.File, "score929") {
+		t.Errorf("file = %q, want score in name", saved.File)
+	}
+	if _, err := os.Stat(filepath.Join(dir, saved.File)); err != nil {
+		t.Fatalf("saved html missing: %v", err)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !strings.Contains(rec.Body.String(), saved.File) {
+		t.Error("dashboard must list saved snapshots")
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/"+saved.File, nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("files status = %d", rec.Code)
+	}
+}
+
+func TestSaveWithoutDataDirFails(t *testing.T) {
+	h, _ := newTestHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 when no data dir", rec.Code)
+	}
+}
+
+func TestFilesRejectsTraversal(t *testing.T) {
+	h, _ := newPersistentHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/..%2Fsecret.html", nil))
+	if rec.Code == http.StatusOK {
+		t.Error("path traversal must be rejected")
 	}
 }

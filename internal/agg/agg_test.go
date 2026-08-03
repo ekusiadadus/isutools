@@ -34,6 +34,16 @@ func TestObserveAccumulates(t *testing.T) {
 	}
 }
 
+func TestObserveResultCountsErrors(t *testing.T) {
+	tbl := NewTable(DefaultMaxKeys)
+	tbl.ObserveResult("q1", time.Millisecond, false)
+	tbl.ObserveResult("q1", 2*time.Millisecond, true)
+	e := tbl.Snapshot()[0]
+	if e.Count != 2 || e.ErrorCount != 1 {
+		t.Fatalf("entry = %#v, want count 2 and error_count 1", e)
+	}
+}
+
 func TestSnapshotSortedByTotalDesc(t *testing.T) {
 	tbl := NewTable(DefaultMaxKeys)
 	tbl.Observe("small", 1*time.Millisecond)
@@ -134,6 +144,29 @@ func TestConcurrentObserve(t *testing.T) {
 	}
 	if total != workers*perWorker {
 		t.Errorf("total count = %d, want %d", total, workers*perWorker)
+	}
+}
+
+func TestConcurrentDistinctKeysRespectHardCap(t *testing.T) {
+	const maxKeys = 10
+	tbl := NewTable(maxKeys)
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			tbl.Observe(fmt.Sprintf("key-%d", i), time.Microsecond)
+		}(i)
+	}
+	wg.Wait()
+	normal := 0
+	for _, entry := range tbl.Snapshot() {
+		if entry.Key != OverflowKey {
+			normal++
+		}
+	}
+	if normal != maxKeys {
+		t.Fatalf("normal keys = %d, want hard cap %d", normal, maxKeys)
 	}
 }
 

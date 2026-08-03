@@ -23,10 +23,11 @@ const (
 )
 
 type stat struct {
-	count   int64
-	total   int64 // nanoseconds
-	max     int64
-	buckets [numBuckets]int64
+	count      int64
+	errorCount int64
+	total      int64 // nanoseconds
+	max        int64
+	buckets    [numBuckets]int64
 }
 
 type shard struct {
@@ -44,12 +45,13 @@ type Table struct {
 // Entry is one aggregated row of a Snapshot. Duration fields marshal to
 // JSON as integer nanoseconds.
 type Entry struct {
-	Key   string        `json:"key"`
-	Count int64         `json:"count"`
-	Total time.Duration `json:"total_ns"`
-	Avg   time.Duration `json:"avg_ns"`
-	Max   time.Duration `json:"max_ns"`
-	P95   time.Duration `json:"p95_ns"`
+	Key        string        `json:"key"`
+	Count      int64         `json:"count"`
+	ErrorCount int64         `json:"error_count"`
+	Total      time.Duration `json:"total_ns"`
+	Avg        time.Duration `json:"avg_ns"`
+	Max        time.Duration `json:"max_ns"`
+	P95        time.Duration `json:"p95_ns"`
 }
 
 // NewTable returns a Table holding at most maxKeys distinct keys.
@@ -61,10 +63,14 @@ func NewTable(maxKeys int) *Table {
 	return t
 }
 
-// Observe records one duration for key. The key cap check is approximate
-// under concurrency (may briefly exceed maxKeys by a few keys), which is an
-// accepted trade-off to keep the hot path to one shard lock.
+// Observe records one duration for key. New keys are reserved atomically so
+// concurrent observations cannot exceed the configured normal-key budget.
 func (t *Table) Observe(key string, d time.Duration) {
+	t.ObserveResult(key, d, false)
+}
+
+// ObserveResult records one duration and whether the operation failed.
+func (t *Table) ObserveResult(key string, d time.Duration, failed bool) {
 	ns := d.Nanoseconds()
 	if ns < 0 {
 		ns = 0
@@ -73,22 +79,36 @@ func (t *Table) Observe(key string, d time.Duration) {
 	sh.mu.Lock()
 	s, ok := sh.stats[key]
 	if !ok {
-		if key != OverflowKey && t.keys.Load() >= t.maxKeys {
+		if key != OverflowKey && !t.reserveKey() {
 			sh.mu.Unlock()
-			t.Observe(OverflowKey, d)
+			t.ObserveResult(OverflowKey, d, failed)
 			return
 		}
 		s = &stat{}
 		sh.stats[key] = s
-		t.keys.Add(1)
 	}
 	s.count++
+	if failed {
+		s.errorCount++
+	}
 	s.total += ns
 	if ns > s.max {
 		s.max = ns
 	}
 	s.buckets[bucketFor(ns)]++
 	sh.mu.Unlock()
+}
+
+func (t *Table) reserveKey() bool {
+	for {
+		used := t.keys.Load()
+		if used >= t.maxKeys {
+			return false
+		}
+		if t.keys.CompareAndSwap(used, used+1) {
+			return true
+		}
+	}
 }
 
 // Snapshot returns all entries sorted by total time descending
@@ -100,12 +120,13 @@ func (t *Table) Snapshot() []Entry {
 		sh.mu.Lock()
 		for k, s := range sh.stats {
 			entries = append(entries, Entry{
-				Key:   k,
-				Count: s.count,
-				Total: time.Duration(s.total),
-				Avg:   time.Duration(s.total / s.count),
-				Max:   time.Duration(s.max),
-				P95:   time.Duration(p95(s)),
+				Key:        k,
+				Count:      s.count,
+				ErrorCount: s.errorCount,
+				Total:      time.Duration(s.total),
+				Avg:        time.Duration(s.total / s.count),
+				Max:        time.Duration(s.max),
+				P95:        time.Duration(p95(s)),
 			})
 		}
 		sh.mu.Unlock()

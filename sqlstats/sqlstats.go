@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"sync"
 	"time"
 
 	proxy "github.com/shogo82148/go-sql-proxy"
@@ -19,8 +20,39 @@ import (
 // Register("mysql") makes "mysql:isutools" available.
 const DriverSuffix = ":isutools"
 
-// Default is the table all proxied drivers report into.
-var Default = agg.NewTable(agg.DefaultMaxKeys)
+// Default is the generation-scoped store all proxied drivers report into.
+var Default = NewStore(agg.DefaultMaxKeys)
+
+var (
+	connMu    sync.Mutex
+	firstName string
+	firstDSN  string
+)
+
+// FirstConn returns the base driver name and DSN of the first connection
+// opened through a wrapped driver. dbinspect uses it to open its own raw
+// connection for schema inspection without any extra integration code.
+func FirstConn() (driverName, dsn string, ok bool) {
+	connMu.Lock()
+	defer connMu.Unlock()
+	return firstName, firstDSN, firstName != ""
+}
+
+// dsnCapturingDriver records the first DSN opened, then delegates to the
+// measuring proxy driver.
+type dsnCapturingDriver struct {
+	driver.Driver
+	base string
+}
+
+func (d dsnCapturingDriver) Open(dsn string) (driver.Conn, error) {
+	connMu.Lock()
+	if firstName == "" {
+		firstName, firstDSN = d.base, dsn
+	}
+	connMu.Unlock()
+	return d.Driver.Open(dsn)
+}
 
 // Register wraps each named, already-registered driver and registers the
 // measuring variant under name+DriverSuffix. Calling it again for the same
@@ -49,25 +81,30 @@ func register(name string) error {
 	if cerr := db.Close(); cerr != nil {
 		return fmt.Errorf("isutools: close probe for %q: %w", name, cerr)
 	}
-	sql.Register(wrapped, proxy.NewProxyContext(drv, hooks()))
+	sql.Register(wrapped, dsnCapturingDriver{
+		Driver: proxy.NewProxyContext(drv, hooks()),
+		base:   name,
+	})
 	return nil
 }
 
 func hooks() *proxy.HooksContext {
 	pre := func(_ context.Context, _ *proxy.Stmt, _ []driver.NamedValue) (interface{}, error) {
-		return time.Now(), nil
+		return hookMeasurement{started: time.Now(), measurement: Default.begin()}, nil
 	}
 	observe := func(ctx interface{}, stmt *proxy.Stmt, err error) {
 		// A panic in measurement must never break the application's query.
 		defer func() { _ = recover() }()
-		if err == driver.ErrSkip {
-			return
-		}
-		start, ok := ctx.(time.Time)
+		measurement, ok := ctx.(hookMeasurement)
 		if !ok {
 			return
 		}
-		Default.Observe(normalize(stmt.QueryString), time.Since(start))
+		// Ensure a normalization or aggregation failure cannot pin reset forever.
+		defer Default.discard(measurement.measurement)
+		if err == driver.ErrSkip {
+			return
+		}
+		Default.finish(measurement.measurement, normalize(stmt.QueryString), time.Since(measurement.started), err != nil)
 	}
 	return &proxy.HooksContext{
 		PreExec: pre,
@@ -81,4 +118,9 @@ func hooks() *proxy.HooksContext {
 			return nil
 		},
 	}
+}
+
+type hookMeasurement struct {
+	started     time.Time
+	measurement *measurement
 }
