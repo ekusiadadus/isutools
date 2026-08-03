@@ -17,12 +17,14 @@
 package isutools
 
 import (
+	"context"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"sync"
 
+	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/sqlstats"
 	"github.com/ekusiadadus/isutools/web"
 )
@@ -109,8 +111,22 @@ func RegisterSQL(names ...string) error {
 	return sqlstats.Register(names...)
 }
 
-// Handler serves the report UI: GET / (live), GET /snapshot.html (download),
-// GET /json, POST /reset.
+// Handler serves the report UI: GET / (dashboard with snapshot history),
+// GET /snapshot.html (download), GET /json, GET /files/<name>,
+// POST /reset, POST /save. Snapshot history persists to ISUTOOLS_DATA_DIR
+// when set. The DB schema is inspected through the first DSN the
+// application opened, using the raw driver so inspection queries never
+// appear in the SQL statistics.
 func Handler() http.Handler {
-	return web.NewHandler(web.Provider{SQL: sqlstats.Default})
+	return web.NewHandler(web.Provider{
+		SQL:     sqlstats.Default,
+		DataDir: os.Getenv("ISUTOOLS_DATA_DIR"),
+		DB: func(ctx context.Context) *dbinspect.Schema {
+			name, dsn, ok := sqlstats.FirstConn()
+			if !ok {
+				return nil
+			}
+			return dbinspect.Collect(ctx, name, dsn)
+		},
+	})
 }
