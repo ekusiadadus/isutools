@@ -61,9 +61,32 @@ type Snapshot struct {
 	EndedAt         time.Time `json:"endedAt"`
 	IntervalJiffies uint64    `json:"intervalJiffies"`
 	CPUs            int       `json:"cpus"`
+	CPUTotal        *CPUTotal `json:"cpuTotal,omitempty"`
 	TopCPU          []Process `json:"topCPU"`
 	TopRSS          []Process `json:"topRSS"`
 	Health          Health    `json:"health"`
+}
+
+// CPUTotal is the whole-machine utilization over the interval, following
+// top's %Cpu(s) convention where all cores together are 100%. It answers
+// "is the hardware actually saturated, or is capacity left idle?".
+type CPUTotal struct {
+	BusyPercent   float64 `json:"busyPercent"`
+	UserPercent   float64 `json:"userPercent"`
+	SystemPercent float64 `json:"systemPercent"`
+	IOWaitPercent float64 `json:"iowaitPercent"`
+	StealPercent  float64 `json:"stealPercent"`
+	IdlePercent   float64 `json:"idlePercent"`
+}
+
+// cpuTimes is the aggregate /proc/stat cpu line split into categories.
+type cpuTimes struct {
+	total  uint64
+	user   uint64 // user + nice
+	system uint64 // system + irq + softirq
+	idle   uint64
+	iowait uint64
+	steal  uint64
 }
 
 // Option configures a Collector.
@@ -144,6 +167,7 @@ type Collector struct {
 type sample struct {
 	at        time.Time
 	total     uint64
+	times     cpuTimes
 	cpus      int
 	processes map[int]procSample
 }
@@ -231,6 +255,7 @@ func (c *Collector) Snapshot() Snapshot {
 		return result
 	}
 	result.IntervalJiffies = current.total - c.baseline.total
+	result.CPUTotal = computeCPUTotal(c.baseline.times, current.times)
 	if current.cpus != c.baseline.cpus {
 		h.drop(fmt.Sprintf("logical CPU count changed from %d to %d", c.baseline.cpus, current.cpus))
 	}
@@ -318,7 +343,8 @@ func (c *Collector) readSample(readRSS bool) (sample, Health, error) {
 	if err != nil {
 		return result, h, fmt.Errorf("read proc stat: %w", err)
 	}
-	result.total, result.cpus, err = parseSystemStat(stat)
+	result.times, result.cpus, err = parseSystemStat(stat)
+	result.total = result.times.total
 	if err != nil {
 		return result, h, fmt.Errorf("parse proc stat: %w", err)
 	}
@@ -363,7 +389,8 @@ func (c *Collector) readSample(readRSS bool) (sample, Health, error) {
 	return result, h, nil
 }
 
-func parseSystemStat(data []byte) (uint64, int, error) {
+func parseSystemStat(data []byte) (cpuTimes, int, error) {
+	var times cpuTimes
 	var total uint64
 	cpus := 0
 	found := false
@@ -374,19 +401,31 @@ func parseSystemStat(data []byte) (uint64, int, error) {
 		}
 		if fields[0] == "cpu" {
 			if len(fields) < 2 {
-				return 0, 0, errors.New("aggregate cpu line has no counters")
+				return cpuTimes{}, 0, errors.New("aggregate cpu line has no counters")
 			}
 			// guest and guest_nice are already included in user and nice.
 			limit := len(fields)
 			if limit > 9 {
 				limit = 9
 			}
-			for _, field := range fields[1:limit] {
+			for i, field := range fields[1:limit] {
 				value, err := strconv.ParseUint(field, 10, 64)
 				if err != nil {
-					return 0, 0, fmt.Errorf("aggregate cpu counter %q: %w", field, err)
+					return cpuTimes{}, 0, fmt.Errorf("aggregate cpu counter %q: %w", field, err)
 				}
 				total += value
+				switch i {
+				case 0, 1: // user, nice
+					times.user += value
+				case 2, 5, 6: // system, irq, softirq
+					times.system += value
+				case 3:
+					times.idle += value
+				case 4:
+					times.iowait += value
+				case 7:
+					times.steal += value
+				}
 			}
 			found = true
 			continue
@@ -396,12 +435,40 @@ func parseSystemStat(data []byte) (uint64, int, error) {
 		}
 	}
 	if !found {
-		return 0, 0, errors.New("aggregate cpu line is missing")
+		return cpuTimes{}, 0, errors.New("aggregate cpu line is missing")
 	}
 	if cpus == 0 {
 		cpus = runtime.NumCPU()
 	}
-	return total, cpus, nil
+	times.total = total
+	return times, cpus, nil
+}
+
+// computeCPUTotal converts baseline/current cpuTimes into interval
+// percentages. Returns nil when the interval is empty or went backwards.
+func computeCPUTotal(start, end cpuTimes) *CPUTotal {
+	if end.total <= start.total {
+		return nil
+	}
+	total := float64(end.total - start.total)
+	delta := func(a, b uint64) float64 {
+		if b < a {
+			return 0
+		}
+		return float64(b-a) * 100 / total
+	}
+	result := &CPUTotal{
+		UserPercent:   delta(start.user, end.user),
+		SystemPercent: delta(start.system, end.system),
+		IOWaitPercent: delta(start.iowait, end.iowait),
+		StealPercent:  delta(start.steal, end.steal),
+		IdlePercent:   delta(start.idle, end.idle),
+	}
+	result.BusyPercent = 100 - result.IdlePercent - result.IOWaitPercent
+	if result.BusyPercent < 0 {
+		result.BusyPercent = 0
+	}
+	return result
 }
 
 func parseProcessStat(data []byte) (procSample, error) {

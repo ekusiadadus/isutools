@@ -193,6 +193,7 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 <h2>Processes</h2>
 {{if .Snapshot.Proc}}
 <p class="meta">status {{.Snapshot.Proc.Health.Status}} &middot; interval jiffies {{.Snapshot.Proc.IntervalJiffies}} &middot; {{.Snapshot.Proc.CPUs}} CPUs</p>
+{{with .Snapshot.Proc.CPUTotal}}<p class="meta"><strong>CPU total: {{f1 .BusyPercent}}% busy</strong> (user {{f1 .UserPercent}}% / sys {{f1 .SystemPercent}}% / iowait {{f1 .IOWaitPercent}}% / idle {{f1 .IdlePercent}}%) — idle が大きければ並列度・設定不足、busy 100% 近くなら CPU 飽和</p>{{end}}
 {{if .Snapshot.Proc.TopCPU}}<table>
 <thead><tr><th>CPU%</th><th>CPU(s)</th><th>RSS(MiB)</th><th>PID</th><th>command</th></tr></thead>
 <tbody>{{range .Snapshot.Proc.TopCPU}}<tr>

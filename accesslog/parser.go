@@ -4,6 +4,7 @@
 package accesslog
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -59,6 +60,65 @@ func ParseNginxLTSV(line string) (Record, error) {
 			return Record{}, fmt.Errorf("accesslog: required LTSV field %q is missing", name)
 		}
 	}
+	return recordFromFields(fields)
+}
+
+// ParseLine auto-detects the record syntax: JSON object lines (nginx
+// log_format with JSON output, isutools or alp-style keys) or isutools LTSV.
+func ParseLine(line string) (Record, error) {
+	if strings.HasPrefix(strings.TrimSpace(line), "{") {
+		return ParseNginxJSON(line)
+	}
+	return ParseNginxLTSV(line)
+}
+
+// jsonAliases maps alp's default JSON key names to isutools field names.
+var jsonAliases = map[string]string{
+	"body_bytes":    "bytes",
+	"response_time": "reqtime",
+	"upstream_time": "upstime",
+}
+
+// ParseNginxJSON parses one JSON-object access-log line. Both isutools key
+// names (method/uri/status/reqtime/upstime/bytes/cache/ctype) and alp's
+// defaults (body_bytes/response_time) are accepted. Missing optional fields
+// default: bytes 0, upstime "-", empty cache/ctype.
+func ParseNginxJSON(line string) (Record, error) {
+	raw := map[string]any{}
+	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		return Record{}, fmt.Errorf("accesslog: invalid JSON line: %w", err)
+	}
+	fields := make(map[string]string, len(raw))
+	for key, value := range raw {
+		if alias, ok := jsonAliases[key]; ok {
+			key = alias
+		}
+		switch v := value.(type) {
+		case string:
+			fields[key] = v
+		case float64:
+			fields[key] = strconv.FormatFloat(v, 'f', -1, 64)
+		case bool:
+			fields[key] = strconv.FormatBool(v)
+		}
+	}
+	for _, name := range []string{"method", "uri", "status", "reqtime"} {
+		if _, ok := fields[name]; !ok {
+			return Record{}, fmt.Errorf("accesslog: required JSON field %q is missing", name)
+		}
+	}
+	if _, ok := fields["bytes"]; !ok {
+		fields["bytes"] = "0"
+	}
+	if _, ok := fields["upstime"]; !ok {
+		fields["upstime"] = "-"
+	}
+	return recordFromFields(fields)
+}
+
+// recordFromFields builds a Record from normalized field values, shared by
+// the LTSV and JSON parsers.
+func recordFromFields(fields map[string]string) (Record, error) {
 	if fields["method"] == "" || fields["method"] == "-" {
 		return Record{}, fmt.Errorf("accesslog: invalid method %q", fields["method"])
 	}

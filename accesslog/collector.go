@@ -343,7 +343,7 @@ func (c *Collector) consumeLocked(data []byte) {
 		if b == '\n' {
 			line := string(c.pending)
 			c.pending = c.pending[:0]
-			rec, err := ParseNginxLTSV(line)
+			rec, err := ParseLine(line)
 			if err != nil {
 				c.health.Dropped++
 				c.health.LastError = err.Error()
