@@ -58,8 +58,8 @@ func TestJSONSortedByTotal(t *testing.T) {
 	if got.Meta.Revision == "" {
 		t.Error("meta.revision must always be present")
 	}
-	if got.Meta.SchemaVersion != 2 {
-		t.Errorf("schema_version = %d, want 2 (v2 added db/files)", got.Meta.SchemaVersion)
+	if got.Meta.SchemaVersion != 3 {
+		t.Errorf("schema_version = %d, want 3 (v3 added health/generations)", got.Meta.SchemaVersion)
 	}
 	if got.Meta.Generation < 1 {
 		t.Errorf("generation = %d, want >= 1", got.Meta.Generation)

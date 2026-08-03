@@ -1,31 +1,46 @@
 # isutools
 
-ISUCON 向けオールインワン計測モジュール。`go get` + 2行でアプリに組み込み、
-SQL / HTTP / GraphQL / アクセスログ / プロセスリソースをブラウザでソート済み表示する。
+ISUCON 向けオールインワン計測モジュール。SQL計測とloopback管理UIを
+`go get` + 1行で組み込み、ベンチ結果を自己完結HTML/JSONとして回収する。
 
 - 設計書: [DESIGN.md](./DESIGN.md)
-- Status: M1 実装済み(SQL 計測 + snapshot UI + buildinfo + host 情報)
+- License: MIT
+- Runtime: Go 1.24+
+- Status: M1 core v0.1.0実装済み(SQL計測 + snapshot UI + buildinfo + host情報)。
+  collector health、原子的generation reset、private-isu ABBA検証は未完
 
 ## 使い方(組み込みは1行)
 
 ```go
-db, _ = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // 既存の sqlx.Open を書き換えるだけ
+db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // 既存行を書き換えるだけ
 ```
 
-これだけで管理サーバが `127.0.0.1:19191` に起動する(`ISUTOOLS_ADDR` で変更・`off` で無効):
+対象driverはこの呼び出しより前にblank import等で `database/sql` へ登録しておく。
+登録成功時は管理serverが `127.0.0.1:19191` に一度だけ起動する。
 
-- `GET :19191/` — ライブレポート(合計時間降順ソート済み)
-- `GET :19191/snapshot.html` — 自己完結 HTML をダウンロード(手元の PC でダブルクリックで閲覧)
-- `GET :19191/json` — 機械可読出力(前回世代との比較用に `prev` 付き)
-- `POST :19191/reset` — 集計リセット(ベンチ前に叩く。世代番号が進む)
-- `ISUTOOLS=off` で全機能無効(素のドライバ名を返すため、オーバーヘッドゼロ)
+- `GET http://127.0.0.1:19191/` — ライブレポート(合計時間降順ソート済み)
+- `GET http://127.0.0.1:19191/snapshot.html` — 自己完結HTMLをダウンロード
+- `GET http://127.0.0.1:19191/json` — 機械可読出力(`prev`付き)
+- `POST http://127.0.0.1:19191/reset` — ベンチ前の集計reset
+- `ISUTOOLS=off` で全機能無効(素のdriverを使い、query pathの追加処理はゼロ)
+- `ISUTOOLS_ADDR=off` で管理serverだけ無効(SQL集計は継続)
 
-管理サーバはアプリのルーター・nginx を経由しないため外部に露出しない。
-同一ポートに載せたい場合は `isutools.Handler()` を任意のルーターに Mount してもよい。
+既定の管理serverはアプリのrouter・nginxを経由せず、loopback以外へbindしない。
+認証機能が入るまで、`ISUTOOLS_ADDR` を非loopback addressへ変更する運用はrelease対象外。
+同一ポートに載せる場合は `isutools.Handler()` を任意routerへmountできるが、
+アクセス制御は呼び出し側の責任になる。
 
-レポートには git revision(+dirty)・ホスト情報(CPU モデル / コア数 / メモリ GB / OS)が常に表示される。
+`SQLDriverName` は計測登録に失敗しても元driver名へfail-openする。アプリ起動は守る一方、
+計測欠損を表示するhealth/partial契約はM1の残作業である。
 
-## 対応対象(Phase 1)
+## ロードマップ
 
-MySQL / MariaDB / PostgreSQL / nginx / Apache / GraphQL /
-HTTP 1.1 / HTTP/2 / HTTP/3 (QUIC) / git hash (+dirty) / プロセス CPU・メモリ
+| Version | 対象 | 状態 |
+|---|---|---|
+| v0.1.0 / M1 | database/sql、Snapshot HTML/JSON、buildinfo、host情報 | core実装済み、review gate未完 |
+| v0.2 / M2 | HTTP/1.1・2、nginx、ベンチ区間procstats | 未実装 |
+| v0.3 / M3 | Apache、gqlgen operation adapter | 未実装 |
+| v1.0 / M4 | WebSocket/SSE接続、HTTP/3互換性、全体ABBA gate | 未実装 |
+
+pgx native API、分散trace、外部storage、genericなWebSocket frame計測はv1対象外。
+詳細な契約・受け入れ条件・未決事項は [DESIGN.md](./DESIGN.md) を参照。

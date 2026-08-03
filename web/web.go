@@ -18,15 +18,26 @@ import (
 	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/internal/agg"
+	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/internal/sysinfo"
 )
 
 // schemaVersion identifies the Snapshot JSON layout for downstream tooling.
-const schemaVersion = 2
+const schemaVersion = 3
+
+type sqlSnapshotter interface {
+	Snapshot() []agg.Entry
+}
 
 // Provider supplies the collectors to render. Nil fields are skipped.
 type Provider struct {
-	SQL *agg.Table
+	SQL sqlSnapshotter
+	// SQLGeneration and RotateSQL opt into atomic generation boundaries. They
+	// are separate callbacks so simple aggregation tables remain usable in
+	// tests and custom integrations.
+	SQLGeneration func() int64
+	RotateSQL     func() (generation int64, entries []agg.Entry)
+	Health        *health.Registry
 	// DB captures the database schema (tables/indexes). Called at handler
 	// startup and on every reset so each generation records the pre-run state.
 	DB func(context.Context) *dbinspect.Schema
@@ -37,12 +48,14 @@ type Provider struct {
 // Meta identifies when, on which host, and from which revision a snapshot
 // was taken. Generation increments on every reset so runs are comparable.
 type Meta struct {
-	SchemaVersion int          `json:"schema_version"`
-	Time          string       `json:"time"`
-	Generation    int64        `json:"generation"`
-	Revision      string       `json:"revision"`
-	Dirty         bool         `json:"dirty"`
-	Host          sysinfo.Info `json:"host"`
+	SchemaVersion int            `json:"schema_version"`
+	Time          string         `json:"time"`
+	Generation    int64          `json:"generation"`
+	Revision      string         `json:"revision"`
+	Dirty         bool           `json:"dirty"`
+	Host          sysinfo.Info   `json:"host"`
+	Partial       bool           `json:"partial"`
+	Health        []health.Entry `json:"health,omitempty"`
 }
 
 // Snapshot is the complete state of all measurements at one point in time.
@@ -58,11 +71,12 @@ type jsonPayload struct {
 }
 
 type handler struct {
-	p     Provider
-	gen   atomic.Int64
-	mu    sync.Mutex
-	prev  *Snapshot
-	curDB *dbinspect.Schema
+	p       Provider
+	gen     atomic.Int64
+	mu      sync.Mutex
+	resetMu sync.Mutex
+	prev    *Snapshot
+	curDB   *dbinspect.Schema
 }
 
 // NewHandler returns the report handler. Routes are relative:
@@ -92,7 +106,7 @@ func (h *handler) captureDB() {
 	h.mu.Unlock()
 }
 
-func (h *handler) take() Snapshot {
+func (h *handler) currentDB() *dbinspect.Schema {
 	h.mu.Lock()
 	if h.curDB == nil {
 		h.mu.Unlock()
@@ -101,23 +115,45 @@ func (h *handler) take() Snapshot {
 	}
 	db := h.curDB
 	h.mu.Unlock()
+	return db
+}
+
+func (h *handler) currentGeneration() int64 {
+	if h.p.SQLGeneration != nil {
+		return h.p.SQLGeneration()
+	}
+	return h.gen.Load()
+}
+
+func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries []agg.Entry) Snapshot {
+	healthEntries, partial := []health.Entry(nil), false
+	if h.p.Health != nil {
+		healthEntries, partial = h.p.Health.Snapshot()
+	}
 
 	bi := buildinfo.Get()
-	snap := Snapshot{
+	return Snapshot{
 		Meta: Meta{
 			SchemaVersion: schemaVersion,
 			Time:          time.Now().Format(time.RFC3339),
-			Generation:    h.gen.Load(),
+			Generation:    generation,
 			Revision:      bi.Short(),
 			Dirty:         bi.Dirty,
 			Host:          sysinfo.Get(),
+			Partial:       partial,
+			Health:        healthEntries,
 		},
-		DB: db,
+		DB:  db,
+		SQL: entries,
 	}
+}
+
+func (h *handler) take() Snapshot {
+	var entries []agg.Entry
 	if h.p.SQL != nil {
-		snap.SQL = h.p.SQL.Snapshot()
+		entries = h.p.SQL.Snapshot()
 	}
-	return snap
+	return h.makeSnapshot(h.currentGeneration(), h.currentDB(), entries)
 }
 
 func (h *handler) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -125,10 +161,16 @@ func (h *handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	h.render(w, page{Snapshot: h.take(), Sortable: true, Dashboard: true, Files: h.listFiles()})
 }
 
 func (h *handler) static(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	snap := h.take()
 	name := fmt.Sprintf("isutools_%s_%s.html",
 		time.Now().Format("20060102-150405"), fileSafeRevision(snap.Meta))
@@ -220,6 +262,9 @@ func (h *handler) writeSnapshot(snap Snapshot, base string) error {
 }
 
 func (h *handler) files(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	if h.p.DataDir == "" {
 		http.NotFound(w, r)
 		return
@@ -245,7 +290,10 @@ func sanitizeName(s string) string {
 	}, s)
 }
 
-func (h *handler) json(w http.ResponseWriter, _ *http.Request) {
+func (h *handler) json(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
 	h.mu.Lock()
 	prev := h.prev
 	h.mu.Unlock()
@@ -263,17 +311,38 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	snap := h.take()
+	h.resetMu.Lock()
+	defer h.resetMu.Unlock()
+
+	var snap Snapshot
+	if h.p.RotateSQL != nil {
+		generation, entries := h.p.RotateSQL()
+		snap = h.makeSnapshot(generation, h.currentDB(), entries)
+	} else {
+		snap = h.take()
+		if resetter, ok := h.p.SQL.(interface{ Reset() }); ok {
+			resetter.Reset()
+		}
+		h.gen.Add(1)
+	}
 	h.mu.Lock()
 	h.prev = &snap
 	h.mu.Unlock()
-	if h.p.SQL != nil {
-		h.p.SQL.Reset()
+	if h.p.Health != nil {
+		h.p.Health.ResetDropped()
 	}
-	h.gen.Add(1)
 	// Re-capture the schema so the new generation records its pre-run state.
 	h.captureDB()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method == method {
+		return true
+	}
+	w.Header().Set("Allow", method)
+	http.Error(w, method+" only", http.StatusMethodNotAllowed)
+	return false
 }
 
 // fileSafeRevision turns "f4fdb31 (dirty)" into "f4fdb31-dirty" for filenames.

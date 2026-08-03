@@ -12,7 +12,6 @@ import (
 	"time"
 
 	proxy "github.com/shogo82148/go-sql-proxy"
-
 )
 
 // DriverSuffix is appended to the original driver name on registration:
