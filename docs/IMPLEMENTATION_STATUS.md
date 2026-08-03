@@ -1,72 +1,65 @@
 # Implementation and verification status
 
-Updated: 2026-08-03 (Asia/Tokyo)
+Updated: 2026-08-04 (Asia/Tokyo) — current release: **v0.5.0**
 
-## Implemented locally
+## Implemented and released
 
-- M1: bounded SQL aggregation, literal masking, snapshot HTML/JSON, build/host metadata,
-  loopback admin server
-- Dashboard extension: MySQL/MariaDB schema capture, atomic HTML/JSON persistence,
-  saved snapshot listing
-- M0 gates: collector health/partial, generation-scoped SQL store, serialized reset,
-  fixed endpoint methods, non-loopback Bearer authentication and an explicit
-  Docker host-loopback unauthenticated opt-in
-- M2: HTTP middleware, nginx LTSV delta tailer, Linux reset-to-snapshot procstats,
-  snapshot schema v3 and HTML sections for all three collectors
+- **M1 (v0.1.0)**: bounded SQL aggregation (sharded, log2-bucket p95), literal
+  masking, snapshot HTML/JSON, build/host metadata, loopback admin server
+- **v0.2.x**: dashboard + snapshot persistence (`POST /save`, `GET /files/`),
+  MySQL/MariaDB schema capture (dbinspect via the first observed DSN),
+  collector health / `partial`, generation-scoped SQL store, serialized reset,
+  admin auth 3 modes (loopback free / Bearer+`?token=`+cookie / explicit
+  `ISUTOOLS_ALLOW_UNAUTHENTICATED=1` opt-in for SSH-tunnel +
+  `127.0.0.1`-publish Docker topologies)
+- **M2 (v0.2.x)**: HTTP middleware (h1/h2), nginx LTSV delta tailer with
+  rotation handling and bounded `POST /collect`, Linux reset-to-snapshot
+  procstats (PID-reuse detection, top 1core=100% convention)
+- **v0.3.x**: run index at `/` with timestamp-id detail pages
+  (`GET /<run-id>`), live report moved to `/live`, benchmark score persisted
+  into snapshot meta + shown in every report header, all timestamps pinned
+  to JST (`time.FixedZone`, tzdata-free)
+- **v0.4.0**: pprof — `GET /pprof/` endpoints (stdlib only, no new deps) +
+  automatic CPU profile per `POST /reset` (`ISUTOOLS_PPROF_SECONDS`),
+  profiles listed on the dashboard and served via `GET /files/`
+- **v0.5.0**: whole-machine CPU utilization over the bench interval
+  (`proc.cpuTotal`: busy/user/sys/iowait/steal/idle, top `%Cpu(s)`
+  convention) rendered in the Processes section; JSON access-log lines
+  auto-detected, accepting both isutools keys and alp defaults
+  (`body_bytes` / `response_time`)
 
-SQL and HTTP individually swap to a new generation and wait for measurements that
-started in the old generation. Concurrent reset calls are serialized. The admin handler
-currently swaps different collector types sequentially, so benchmark automation must wait
-for `POST /reset` to return before starting load. A single shared cross-collector swap is a
-remaining release-hardening item if resets must be correct under continuous traffic.
+## Test evidence
 
-## Local evidence
+Every release: `go vet ./...` PASS, `go test -race ./...` PASS (12 packages),
+aggregate coverage 86%+ (per-package floor 81%+). CI enforces vet + race +
+80% coverage gate; benchmarks are informational
+(`BenchmarkObserve` ~164ns/op, 0 allocs, worst-case single hot key ×8 threads).
+The access-log parser also passed fuzzing. A real TLS HTTP/2 listener test is
+environment-gated; the protocol label path is covered with `HTTP/2.0` requests.
 
-The current worktree passed:
+## Field verification (private-isu, WSL2 Docker, 2026-08-03..04)
 
-```text
-go test -race ./...        PASS (12 packages)
-go vet ./...               PASS
-aggregate statement cover 86.4%
-dbinspect cover            91.1%
-accesslog cover            85.7%
-httpstats cover            86.8%
-procstats cover            81.8%
-sqlstats cover             95.0%
-web cover                  83.7%
-```
+Real benchmarks measured exclusively with isutools while tuning private-isu.
+The benchmark control sequence is `POST /reset` → bench → `POST /save?score=`,
+with snapshots, JSON, and CPU profiles archived per run:
 
-The access-log parser also passed a one-second fuzz run. A real TLS HTTP/2 server test was
-not run locally because the restricted test environment blocks ordinary test listeners;
-the protocol aggregation path is covered with `HTTP/2.0` requests and the full suite's
-loopback admin listener was verified with the required test permission.
+| stage | score | isutools evidence that drove the change |
+|---|---|---|
+| baseline (Go impl) | 0 (fail 55) | SQL top: comments query 450s/1.1k calls; DB Schema: no index |
+| + indexes, batched N+1 | 19,290 | SQL section totals; procstats mysqld 57% |
+| + static images via nginx | 34,224 | accesslog upstime `-` ratio, HTTP bytes |
+| + in-process sha512 digest | 45,812 | HTTP: POST /login 63s → 17s |
+| + write-through placement fix | 111,756 | httpstats: app-served images collapse |
+| + db pool / GOMAXPROCS / nginx keepalive | **299,668** | cpuTotal 11.6% busy vs per-process caps (server 84%/1core); 502 storm diagnosed from bench fails |
 
-The M2 benchmark control sequence is `POST /reset` → run benchmark → `POST /collect` →
-download/save snapshot. `/collect` serializes with reset, uses a bounded context, and waits
-for the configured nginx log to remain quiet before returning.
+## Known hardening gaps (tracked for v1.0 — see DESIGN.md §10.5)
 
-## private-isu evidence boundary
-
-The already deployed private-isu integration was rechecked read-only: remote `master` is
-clean at `01a5b62`, and `webapp/golang/go.mod` still pins `isutools v0.1.0`. That integration
-verified the one-line SQL wrapper, loopback compose exposure, build metadata injection,
-snapshot save/download, SQL top-five output, Discord notification, and literal masking.
-That run identified the existing bottlenecks but did not exercise this worktree's M2 HTTP,
-nginx access-log, procstats, schema-v3 health, or optional Bearer authentication changes.
-
-Therefore the v0.2 code is a local candidate, not a remotely or physically verified release.
-Before tagging, update private-isu to this revision and run same-binary, same-host ABBA
-comparisons with `ISUTOOLS=off` and enabled, preserving score, p95, errors, revision, dirty
-state, and host metadata.
-
-## Known limitations
-
-- accesslog M2 accepts only the explicit nginx LTSV format in
-  `examples/nginx-isutools.conf`; combined/Apache formats remain M3 work.
-- log rotation draining is best effort. Writes to an old inode after drain and a
-  copytruncate file that regrows beyond the old offset between polls cannot be recovered
-  reliably; detected rotations/truncations mark the snapshot partial.
-- procstats can see only the active PID namespace and is Linux-only.
-- normal HTTP requests are implemented. Dedicated WebSocket/SSE connection statistics and
-  HTTP/3 compatibility tests remain M4.
-- the 592 KB `sql.log` object in private-isu history was not rewritten or force-pushed.
+1. httpstats path-normalization rule injection (`/@user` cardinality)
+2. snapshot diff view (prev generation stored, no UI comparison yet)
+3. generic counter/gauge API
+4. WebSocket/SSE connection separation (designed in §5.2.1, not implemented)
+5. `collect`/`save` resource caps (review P0-6 residual)
+6. formalized on/off ABBA overhead gate as the release criterion
+7. cross-collector shared generation gate: SQL and HTTP swap independently,
+   so benchmark automation must wait for `POST /reset` to return before load
+   starts (the reference bench.sh does)

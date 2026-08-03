@@ -547,6 +547,36 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 | recoverがアプリpanicを隠す | isutools内部だけrecover | SQL hookとHTTP再panicを実装・test済み |
 | debug endpoint露出 | 独立loopback admin、外部公開時はBearer認証 | localhost無認証、Docker明示opt-in、token/header/query-cookie、method固定を実装済み。collect resource上限は未完 |
 
+## 10.5 v1.0 ギャップと優先順位(2026-08-04 整理)
+
+現況: v0.5.0。実装済み = SQL(3DB・リテラルマスク・世代ストア)/ HTTP(h1/h2)/
+nginx ログ(LTSV+JSON+alp キー・ローテ追随)/ procstats+CPU total / dbinspect(MySQL)/
+pprof(endpoint+ベンチ連動自動採取)/ snapshot-first UI(実行一覧・日時ID詳細・live)/
+JST / score-in-meta / health・generation / 管理サーバ認証3モード / CI(12pkg・cover 86%+)。
+private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)。
+
+### v1.0 必須(このギャップを埋めたら 1.0 を切る)
+
+| # | 項目 | 理由・内容 |
+|---|---|---|
+| 1 | **パス正規化ルール注入**(`ISUTOOLS_PATH_RULES`) | httpstats で `/@user` が個別集計される実害が出ている。nginx map 相当の regex→置換を env/Option で注入 |
+| 2 | **スナップショット差分ビュー** | prev はデータとして保持済みで UI 未実装。「改善が効いたか・ボトルネックが移動しただけか」の比較こそチューニングループの核(takonomura 原則) |
+| 3 | **汎用カウンタ/ゲージ API** | 次の定石=オンメモリキャッシュ導入時に hit/miss 計測が必須になる(`isutools.Count("x")` 1行) |
+| 4 | **WebSocket/SSE 接続分離**(5.2.1 実装) | 設計のみで未実装。WS を使う問題でレイテンシ統計が壊れるのを防ぐ+アクティブ接続ゲージ |
+| 5 | **collect/save の資源上限** | レビュー P0-6 残項目(size/time/concurrency 上限)。リリース硬化 |
+| 6 | **on/off ABBA オーバーヘッド検証の定型化** | リリースゲート(§7)を手順化して 1.0 の根拠にする(現状: 個別ベンチのみ) |
+
+### v1.0 に入れない(1.x 以降)
+
+- pprof top 関数のレポート内表示(現状のファイル DL + `go tool pprof -http` で実用十分)
+- JSON→Markdown フォーマッタ(Discord/GitHub 連携強化)
+- Apache ログ(`%D`/`%O`)対応・gqlstats(必要になった時点で)
+- HTTP/3 統合テスト(quic-go 環境依存)
+- クロスコレクター共有 generation gate(IMPLEMENTATION_STATUS 記載の硬化項目。
+  ベンチ自動化が「reset 完了後に負荷開始」を守る限り実害なし)
+- マルチホスト対応(トポロジ未決定・「将来的な実装予定」節を参照)
+- isutools-agent 単体バイナリ(マルチホストとセット)
+
 ## 11. 決定事項ログ
 
 - 2026-08-03 (v0.2.1): **管理サーバの無認証モードを明示 opt-in で追加**
