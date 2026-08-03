@@ -486,21 +486,22 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 6. **異常検知の警告表示**(mazrean: `connection reset` で fail)
    accesslog の status 499 / 5xx 急増・reset をレポート上部に警告として出す
 
-### マルチホスト対応(2026-08-03 追記: 将来3台以上の構成を想定)
+### マルチホスト対応【将来的な実装予定・未着手】
 
-前提: ISUCON 本番は複数台(典型3台: nginx+app / app / DB)に分けるため、
-計測も複数ホストにまたがる。設計方針:
+**status: 未実装。分割するかどうか・どう分割するか(役割別か、DB だけ
+別出しか等)は現時点で未決定**であり、どのトポロジになっても成立するよう
+方針だけを固めておく。実装はサーバー分割の方針が決まった時点で行う。
 
-1. **各 app ホストが自分の admin server を持つ**(現行のまま増やすだけ)。
-   snapshot の `meta.host.hostname` で既に区別できる
+1. **ホスト単位で自己完結**(トポロジ非依存の基本原則): 計測プロセスが
+   動くホストごとに admin server を1つ持ち、snapshot は `meta.host.hostname`
+   で自己記述する(これは実装済みの性質であり、分割しても壊れない)
 2. **bench スクリプトが全ホストへ fan-out**: `/reset` を全台 → ベンチ →
    `/save?score=` を全台。ファイル名にホスト名を含める(`_host<name>`)
-3. **DB 専用ホスト**: dbinspect は DSN 経由なのでアプリホストから
-   リモート MySQL をそのまま検査できる(変更不要)。procstats は各ホストで
-   `pid: host` / 直接実行。app の載らない DB ホストには軽量な
-   `isutools-agent`(procstats + admin だけの単体バイナリ)を Phase 3 で用意
-4. **nginx 専用ホスト**: accesslog はログのあるホストの agent が集計
-5. **閲覧**: まずは「ホスト毎の snapshot を並べて見る」で開始(実装ゼロ)。
+3. **アプリの載らないホスト**(DB 専用・nginx 専用などになった場合):
+   procstats + accesslog + admin だけの軽量単体バイナリ `isutools-agent` を
+   用意する。なお dbinspect は DSN 経由なので、DB がどのホストにあっても
+   アプリ側からリモート検査でき変更不要
+4. **閲覧**: まずは「ホスト毎の snapshot を並べて見る」で開始(実装ゼロ)。
    その後 run index がホスト別ファイルを同一実行としてグルーピング表示 →
    最終的に merged view(SQL は全台合算・HTTP はホスト別列)を検討
 
