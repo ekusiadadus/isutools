@@ -35,6 +35,7 @@ import (
 
 	"github.com/ekusiadadus/isutools/accesslog"
 	"github.com/ekusiadadus/isutools/advisor"
+	"github.com/ekusiadadus/isutools/counters"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -228,12 +229,40 @@ func RegisterSQL(names ...string) error {
 }
 
 // HTTP instruments inbound HTTP requests. When ISUTOOLS=off it returns next
-// unchanged, avoiding request-path overhead.
+// unchanged, avoiding request-path overhead. Path normalization rules can be
+// injected via ISUTOOLS_PATH_RULES ("regex=replacement;..." — split on the
+// last '=' of each pair).
 func HTTP(next http.Handler) http.Handler {
 	if Off() {
 		return next
 	}
+	pathRulesOnce.Do(func() {
+		spec := os.Getenv("ISUTOOLS_PATH_RULES")
+		if spec == "" {
+			return
+		}
+		rules, err := httpstats.ParseRules(spec)
+		if err != nil {
+			log.Printf("isutools: ISUTOOLS_PATH_RULES ignored: %v", err)
+			return
+		}
+		httpstats.Default.SetRules(rules)
+	})
 	return httpstats.Middleware(next)
+}
+
+var pathRulesOnce sync.Once
+
+// Count increments a named user counter by 1 (e.g. cache hit/miss). Shown
+// in the report's Counters section, reset per generation. No-op when off.
+func Count(name string) { AddCount(name, 1) }
+
+// AddCount increments a named user counter by delta. No-op when off.
+func AddCount(name string, delta int64) {
+	if Off() {
+		return
+	}
+	counters.Default.Add(name, delta)
 }
 
 // Handler serves the report UI: GET / (dashboard with snapshot history),
@@ -261,7 +290,8 @@ func Handler() http.Handler {
 			}
 			return dbinspect.Collect(ctx, name, dsn)
 		},
-		Advisor: collectAdvice,
+		Advisor:  collectAdvice,
+		Counters: counters.Default,
 	}
 	collectorHealth.Set("http", health.StatusOK, "")
 	if path := os.Getenv("ISUTOOLS_NGINX_LOG"); path != "" {

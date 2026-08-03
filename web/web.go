@@ -19,6 +19,7 @@ import (
 	"github.com/ekusiadadus/isutools/accesslog"
 	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/buildinfo"
+	"github.com/ekusiadadus/isutools/counters"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -79,6 +80,12 @@ type Provider struct {
 	// Advisor reports well-known settings that are not configured. Captured
 	// alongside the DB schema at startup and on every reset.
 	Advisor func(context.Context) []advisor.Check
+	// Counters exposes user-defined counters (isutools.Count). Reset per
+	// generation.
+	Counters interface {
+		Snapshot() []counters.Entry
+		Reset()
+	}
 	// DataDir persists snapshots for the dashboard history ("" = disabled).
 	DataDir string
 	// PprofDuration > 0 captures a CPU profile for that long after every
@@ -104,13 +111,15 @@ type Meta struct {
 
 // Snapshot is the complete state of all measurements at one point in time.
 type Snapshot struct {
-	Meta      Meta                `json:"meta"`
-	DB        *dbinspect.Schema   `json:"db,omitempty"`
-	Advisor   []advisor.Check     `json:"advisor,omitempty"`
-	SQL       []agg.Entry         `json:"sql"`
-	HTTP      httpstats.Snapshot  `json:"http,omitempty"`
-	AccessLog *accesslog.Snapshot `json:"accesslog,omitempty"`
-	Proc      *procstats.Snapshot `json:"proc,omitempty"`
+	Meta        Meta                    `json:"meta"`
+	DB          *dbinspect.Schema       `json:"db,omitempty"`
+	Advisor     []advisor.Check         `json:"advisor,omitempty"`
+	Counters    []counters.Entry        `json:"counters,omitempty"`
+	Connections *httpstats.ConnSnapshot `json:"connections,omitempty"`
+	SQL         []agg.Entry             `json:"sql"`
+	HTTP        httpstats.Snapshot      `json:"http,omitempty"`
+	AccessLog   *accesslog.Snapshot     `json:"accesslog,omitempty"`
+	Proc        *procstats.Snapshot     `json:"proc,omitempty"`
 }
 
 type jsonPayload struct {
@@ -204,7 +213,7 @@ func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries [
 	}
 
 	bi := buildinfo.Get()
-	return Snapshot{
+	snap := Snapshot{
 		Meta: Meta{
 			SchemaVersion: schemaVersion,
 			Time:          time.Now().In(reportTZ).Format(time.RFC3339),
@@ -219,6 +228,14 @@ func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries [
 		Advisor: h.currentAdvisor(),
 		SQL:     entries,
 	}
+	if h.p.Counters != nil {
+		snap.Counters = h.p.Counters.Snapshot()
+	}
+	if hc, ok := h.p.HTTP.(interface{ Connections() httpstats.ConnSnapshot }); ok && h.p.HTTP != nil {
+		conns := hc.Connections()
+		snap.Connections = &conns
+	}
+	return snap
 }
 
 func (h *handler) take() Snapshot {
@@ -518,6 +535,9 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 	if h.p.Health != nil {
 		h.p.Health.ResetDropped()
+	}
+	if h.p.Counters != nil {
+		h.p.Counters.Reset()
 	}
 	// Re-capture the schema so the new generation records its pre-run state.
 	h.captureDB()

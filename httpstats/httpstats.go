@@ -4,6 +4,7 @@ package httpstats
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"math/bits"
 	"net"
@@ -81,6 +82,17 @@ type Entry struct {
 // Snapshot is a point-in-time copy sorted by total duration descending.
 type Snapshot []Entry
 
+// ConnSnapshot summarizes long-lived connections (WebSocket upgrades and
+// text/event-stream responses) which are excluded from the latency table so
+// they cannot distort p95/avg. Active spans generations; the rest reset
+// with the generation.
+type ConnSnapshot struct {
+	Total      int64   `json:"total"`
+	Active     int64   `json:"active"`
+	AvgSeconds float64 `json:"avg_seconds"`
+	MaxSeconds float64 `json:"max_seconds"`
+}
+
 type identity struct {
 	method   string
 	path     string
@@ -122,6 +134,12 @@ type Collector struct {
 	current *generation
 	maxKeys int
 	rules   []Rule
+
+	connMu     sync.Mutex
+	connTotal  int64
+	connActive int64
+	connDurSum time.Duration
+	connDurMax time.Duration
 }
 
 // Default is used by the package-level Middleware helper.
@@ -144,6 +162,37 @@ func New(opts ...Option) *Collector {
 	return c
 }
 
+// ParseRules parses an ISUTOOLS_PATH_RULES spec: semicolon-separated
+// "regex=replacement" pairs, split on the LAST '=' so regexes may contain
+// '='. Example: "^/@[^/]+$=/@*;^/posts/[0-9]+$=/posts/*".
+func ParseRules(spec string) ([]Rule, error) {
+	rules := []Rule{}
+	for _, part := range strings.Split(spec, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		eq := strings.LastIndexByte(part, '=')
+		if eq <= 0 {
+			return nil, fmt.Errorf("httpstats: rule %q is not regex=replacement", part)
+		}
+		pattern, err := regexp.Compile(part[:eq])
+		if err != nil {
+			return nil, fmt.Errorf("httpstats: rule %q: %w", part, err)
+		}
+		rules = append(rules, Rule{Pattern: pattern, Replacement: part[eq+1:]})
+	}
+	return rules, nil
+}
+
+// SetRules replaces the collector's path rules at runtime (e.g. from the
+// ISUTOOLS_PATH_RULES environment variable).
+func (c *Collector) SetRules(rules []Rule) {
+	c.mu.Lock()
+	c.rules = rules
+	c.mu.Unlock()
+}
+
 // Middleware instruments next using Default.
 func Middleware(next http.Handler) http.Handler {
 	return Default.Middleware(next)
@@ -161,6 +210,11 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 		capture := &responseWriter{ResponseWriter: w}
 		wrapped := preserveOptionalInterfaces(capture)
 
+		wsRequested := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+		if wsRequested {
+			c.connStart()
+		}
+
 		defer func() {
 			panicked := recover()
 			if panicked != nil && capture.status == 0 {
@@ -169,13 +223,22 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 			if capture.status == 0 {
 				capture.status = http.StatusOK
 			}
-			id := identity{
-				method:   r.Method,
-				path:     c.pathFor(r),
-				protocol: r.Proto,
-				status:   capture.status,
+			// Long-lived connections (WebSocket / SSE) go to the connection
+			// stats instead of the latency table: their multi-second
+			// lifetimes would otherwise destroy p95/avg.
+			sse := strings.HasPrefix(capture.ResponseWriter.Header().Get("Content-Type"), "text/event-stream")
+			if wsRequested || capture.status == http.StatusSwitchingProtocols || sse {
+				c.connFinish(wsRequested, time.Since(start))
+				c.release(g)
+			} else {
+				id := identity{
+					method:   r.Method,
+					path:     c.pathFor(r),
+					protocol: r.Proto,
+					status:   capture.status,
+				}
+				c.finish(g, id, time.Since(start), capture.bytes)
 			}
-			c.finish(g, id, time.Since(start), capture.bytes)
 			if panicked != nil {
 				panic(panicked)
 			}
@@ -193,9 +256,43 @@ func (c *Collector) Snapshot() Snapshot {
 	return t.snapshot()
 }
 
+// Connections reports long-lived connection stats for the current generation.
+func (c *Collector) Connections() ConnSnapshot {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	snap := ConnSnapshot{Total: c.connTotal, Active: c.connActive}
+	if c.connTotal > 0 {
+		snap.AvgSeconds = c.connDurSum.Seconds() / float64(c.connTotal)
+	}
+	snap.MaxSeconds = c.connDurMax.Seconds()
+	return snap
+}
+
+func (c *Collector) connStart() {
+	c.connMu.Lock()
+	c.connActive++
+	c.connMu.Unlock()
+}
+
+func (c *Collector) connFinish(started bool, d time.Duration) {
+	c.connMu.Lock()
+	if started {
+		c.connActive--
+	}
+	c.connTotal++
+	c.connDurSum += d
+	if d > c.connDurMax {
+		c.connDurMax = d
+	}
+	c.connMu.Unlock()
+}
+
 // Reset atomically starts a new generation, waits for requests that started in
 // the old one to finish, and returns the completed old generation.
 func (c *Collector) Reset() Snapshot {
+	c.connMu.Lock()
+	c.connTotal, c.connDurSum, c.connDurMax = 0, 0, 0
+	c.connMu.Unlock()
 	c.resetMu.Lock()
 	defer c.resetMu.Unlock()
 	c.mu.Lock()
@@ -214,6 +311,16 @@ func (c *Collector) begin() *generation {
 	g.inFlight++
 	c.mu.Unlock()
 	return g
+}
+
+// release ends an in-flight request without recording a latency row.
+func (c *Collector) release(g *generation) {
+	c.mu.Lock()
+	g.inFlight--
+	if g.inFlight == 0 {
+		c.changed.Broadcast()
+	}
+	c.mu.Unlock()
 }
 
 func (c *Collector) finish(g *generation, id identity, duration time.Duration, responseBytes int64) {
@@ -366,8 +473,11 @@ func (c *Collector) pathFor(r *http.Request) string {
 		return pattern
 	}
 	path := r.URL.Path
-	if c.rules != nil {
-		for _, rule := range c.rules {
+	c.mu.Lock()
+	rules := c.rules
+	c.mu.Unlock()
+	if rules != nil {
+		for _, rule := range rules {
 			if rule.Pattern != nil {
 				path = rule.Pattern.ReplaceAllString(path, rule.Replacement)
 			}

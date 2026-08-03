@@ -190,6 +190,15 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </tr>{{end}}</tbody>
 </table>
 {{else}}<p class="empty">no HTTP observations (wrap the application handler with isutools.HTTP)</p>{{end}}
+{{with .Snapshot.Connections}}{{if .Total}}<p class="meta">long-lived connections (WS/SSE, latency 集計から分離): total {{.Total}} &middot; active {{.Active}} &middot; avg {{printf "%.1f" .AvgSeconds}}s &middot; max {{printf "%.1f" .MaxSeconds}}s</p>{{end}}{{end}}
+
+<h2>Counters <span class="meta">(isutools.Count によるアプリ内カウンタ)</span></h2>
+{{if .Snapshot.Counters}}
+<table>
+<thead><tr><th>count</th><th>name</th></tr></thead>
+<tbody>{{range .Snapshot.Counters}}<tr><td data-v="{{.Count}}">{{.Count}}</td><td class="l">{{.Name}}</td></tr>{{end}}</tbody>
+</table>
+{{else}}<p class="empty">no counters (アプリで isutools.Count("cache_hit") 等を呼ぶとここに出ます)</p>{{end}}
 
 <h2>nginx Access Log</h2>
 {{if .Snapshot.AccessLog}}
