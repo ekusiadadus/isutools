@@ -58,6 +58,13 @@ a { color: #0b57d0; }
 </tbody>
 </table>
 {{else}}<p class="empty">no saved runs yet — bench.sh (POST /save) がベンチ毎にここへ追加します</p>{{end}}
+
+<h2>CPU Profiles <span class="meta">(captured per benchmark; open with: go tool pprof -http :8081 &lt;file&gt;)</span></h2>
+{{if .Profiles}}
+<ul class="files">
+{{range .Profiles}}<li><a href="files/{{.}}">{{.}}</a></li>{{end}}
+</ul>
+{{else}}<p class="empty">no profiles yet (set ISUTOOLS_PPROF_SECONDS; captured automatically after POST /reset). Live profiling: <a href="pprof/">pprof/</a></p>{{end}}
 </body>
 </html>
 `))

@@ -77,6 +77,9 @@ type Provider struct {
 	DB func(context.Context) *dbinspect.Schema
 	// DataDir persists snapshots for the dashboard history ("" = disabled).
 	DataDir string
+	// PprofDuration > 0 captures a CPU profile for that long after every
+	// reset (i.e. covering the benchmark), stored in DataDir (0 = disabled).
+	PprofDuration time.Duration
 }
 
 // Meta identifies when, on which host, and from which revision a snapshot
@@ -129,6 +132,7 @@ func NewHandler(p Provider) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.root)
 	mux.HandleFunc("/live", h.live)
+	mux.HandleFunc("/pprof/", pprofHandler)
 	mux.HandleFunc("/snapshot.html", h.static)
 	mux.HandleFunc("/json", h.json)
 	mux.HandleFunc("/reset", h.reset)
@@ -244,7 +248,7 @@ func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) index(w http.ResponseWriter) {
-	data := indexPage{Snapshot: h.take(), Runs: h.listRuns()}
+	data := indexPage{Snapshot: h.take(), Runs: h.listRuns(), Profiles: h.listProfiles()}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := indexTmpl.Execute(w, data); err != nil {
 		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
@@ -273,6 +277,7 @@ type runEntry struct {
 type indexPage struct {
 	Snapshot Snapshot
 	Runs     []runEntry
+	Profiles []string
 }
 
 func (h *handler) listRuns() []runEntry {
@@ -405,7 +410,8 @@ func (h *handler) files(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimPrefix(r.URL.Path, "/files/")
 	if name != filepath.Base(name) || name == "" ||
-		!(strings.HasSuffix(name, ".html") || strings.HasSuffix(name, ".json")) {
+		!(strings.HasSuffix(name, ".html") || strings.HasSuffix(name, ".json") ||
+			strings.HasSuffix(name, ".pprof")) {
 		http.Error(w, "invalid file name", http.StatusBadRequest)
 		return
 	}
@@ -489,6 +495,8 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	}
 	// Re-capture the schema so the new generation records its pre-run state.
 	h.captureDB()
+	// Profile the fresh generation (i.e. the benchmark that follows).
+	h.captureCPUProfile(h.currentGeneration())
 	w.WriteHeader(http.StatusNoContent)
 }
 

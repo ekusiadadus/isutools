@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,6 +72,19 @@ func SQLDriverName(name string) string {
 	collectorHealth.Set("sql", health.StatusOK, "")
 	startAdmin()
 	return name + sqlstats.DriverSuffix
+}
+
+// pprofDuration parses ISUTOOLS_PPROF_SECONDS (0 or unset = disabled).
+func pprofDuration(getenv func(string) string) time.Duration {
+	v := getenv("ISUTOOLS_PPROF_SECONDS")
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
 }
 
 // resolveAdminAddr returns the bind address, or "" when disabled.
@@ -233,9 +247,10 @@ func Handler() http.Handler {
 			frozen := sqlstats.Default.Rotate()
 			return frozen.Generation, frozen.Entries
 		},
-		Health:  collectorHealth,
-		HTTP:    httpstats.Default,
-		DataDir: os.Getenv("ISUTOOLS_DATA_DIR"),
+		Health:        collectorHealth,
+		HTTP:          httpstats.Default,
+		DataDir:       os.Getenv("ISUTOOLS_DATA_DIR"),
+		PprofDuration: pprofDuration(os.Getenv),
 		DB: func(ctx context.Context) *dbinspect.Schema {
 			name, dsn, ok := sqlstats.FirstConn()
 			if !ok {
