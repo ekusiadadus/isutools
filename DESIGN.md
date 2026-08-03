@@ -145,17 +145,50 @@ r.Mount("/debug/isutools", isutools.Handler())  // ③ UI
   (private-isu の golang/ コンテキストがまさにこれ)→ compose の build.args で
   ハッシュを渡す例を同梱
 
-### 5.7 web(レポート UI)
+### 5.7 web(レポート UI)— snapshot-first アーキテクチャ
 
-- `isutools.Handler()` は `*http.ServeMux` を返す:
-  - `GET /` — レポート。**初期表示から合計時間降順でソート済み**
-    (サーバ側レンダリング)。`?sort=count|avg|max|total` で再ソート。JS 不使用
-  - `POST /reset` — 全集計リセット(bench.sh がベンチ前に叩く)
-  - `GET /json` — 機械可読出力(Discord/GitHub コメント連携・スナップショット用)
-- セクション構成: BuildInfo(hash+dirty)/ SQL / HTTP / GraphQL /
-  AccessLog / Processes
-- アプリ自身が返すため nginx はそのままプロキシし、既存の SSH トンネルで
-  `http://localhost:8080/debug/isutools` から閲覧できる
+**主ワークフローは「リモートで計測 → スナップショットファイルをダウンロード →
+手元の PC のブラウザで閲覧」とする。** 集計(コア)と閲覧(レンダラ)を
+完全に分離し、すべてのレンダラは同一のスナップショット構造体から描画する。
+
+```
+collection core ──▶ Snapshot (構造体: meta + sql + http + gql + accesslog + proc)
+                      ├─ GET /            … ライブ表示(現在のスナップショットを描画)
+                      ├─ GET /snapshot.html … 自己完結 HTML エクスポート(主役)
+                      ├─ GET /json          … 機械可読(差分・通知連携用)
+                      └─ POST /reset        … 集計リセット(1世代前を保存)
+```
+
+- **`GET /snapshot.html`** — データ埋め込みの完全自己完結 HTML(外部リソース
+  ゼロ・インライン CSS/最小限の JS)。ダウンロードして**ダブルクリックで開くだけ**
+  で閲覧できる。初期表示は合計時間降順ソート済み、列クリックで再ソート
+- meta にはベンチ結果(score)・git hash・dirty・計測時刻を含め、ファイル名も
+  `20260803-2130_f4fdb31-dirty_score929.html` 形式で自動命名する
+  (buildinfo 要件がここで効く)
+- ライブ表示(`GET /`)も同一コアの別レンダラとして残す(実装コストほぼゼロ)。
+  チューニング中に SSH トンネル越しでさっと見る用途と使い分ける
+- **専用ローカルビューアアプリは作らない**(シンプルさ原則)。自己完結 HTML が
+  ビューアそのものであり、履歴閲覧は snapshots/ ディレクトリとブラウザで足りる
+
+この方式の利点:
+1. **履歴が資産になる** — ベンチ毎のスナップショットが手元に蓄積し、
+   Phase 2 の「スナップショット差分」はローカルの JSON 2つの比較に単純化される
+2. **本番でサーバーが消えても感想戦ができる** — ISUCON 本番は競技後に
+   サーバーが破棄されるため、手元に全計測が残ることは決定的に重要
+3. **閲覧が計測対象に負荷をかけない** — ベンチ直後にエクスポート1回だけ
+4. アプリが落ちた後・コンテナ再起動後も直前の計測を失わない
+
+### 5.7.1 転送の自動化
+
+takonomura 氏の「短いコマンド一発」原則に従い、手元 PC 側に `bench` 一発
+コマンドを用意する(examples/ に同梱):
+
+```
+ssh 対象 'bench.sh'                       # ベンチ実行(前段で POST /reset)
+curl … /snapshot.html+json → snapshots/   # リモート側で保存
+rsync remote:snapshots/ ./snapshots/      # 手元へ回収
+open snapshots/<latest>.html              # ブラウザで自動オープン
+```
 
 ### 5.8 インフラ側の設計課題と解決
 
@@ -258,10 +291,16 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 - 「終盤はネックが DB → アプリ CPU → GC/map へ移動する」(mazrean)
   → SQL だけでなく procstats / pprof を最初から同居させる本設計の妥当性を裏付け
 
-## 10. 未決事項
+## 10. 決定事項ログ
+
+- 2026-08-03: 閲覧方式は **snapshot-first**(リモートで計測 → 自己完結 HTML を
+  ダウンロード → 手元 PC で閲覧)に決定。ライブ表示は補助として残す(5.7)
+
+## 11. 未決事項
 
 - [ ] リポジトリ公開設定: Docker ビルド内の `go get` を素直に通すには public + MIT が最善
   (private のままなら vendoring か build secret で GOPRIVATE 認証が必要)
 - [ ] モジュール名の確定: `isutools` / `isuprof` など
 - [ ] パス正規化ルールの注入方法(コード / 環境変数 / 設定ファイル)
 - [ ] `(other)` 合算の上限値のデフォルト
+- [ ] snapshot.html の JS 許容範囲(ソート切替のみ最小限で入れるか、完全 JS なしか)
