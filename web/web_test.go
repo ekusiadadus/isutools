@@ -300,3 +300,20 @@ func TestFilesRejectsTraversal(t *testing.T) {
 		t.Error("path traversal must be rejected")
 	}
 }
+
+func TestMetaTimeIsJST(t *testing.T) {
+	h, _ := newTestHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	var got struct {
+		Meta struct {
+			Time string `json:"time"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !strings.HasSuffix(got.Meta.Time, "+09:00") {
+		t.Errorf("meta.time = %q, must always be JST (+09:00)", got.Meta.Time)
+	}
+}

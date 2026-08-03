@@ -26,6 +26,10 @@ import (
 	"github.com/ekusiadadus/isutools/procstats"
 )
 
+// reportTZ pins every displayed/persisted timestamp to JST. FixedZone keeps
+// this working in containers without tzdata.
+var reportTZ = time.FixedZone("JST", 9*60*60)
+
 // schemaVersion identifies the Snapshot JSON layout for downstream tooling.
 const schemaVersion = 3
 
@@ -174,7 +178,7 @@ func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries [
 	return Snapshot{
 		Meta: Meta{
 			SchemaVersion: schemaVersion,
-			Time:          time.Now().Format(time.RFC3339),
+			Time:          time.Now().In(reportTZ).Format(time.RFC3339),
 			Generation:    generation,
 			Revision:      bi.Short(),
 			Dirty:         bi.Dirty,
@@ -304,7 +308,7 @@ func (h *handler) static(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := h.take()
 	name := fmt.Sprintf("isutools_%s_%s.html",
-		time.Now().Format("20060102-150405"), fileSafeRevision(snap.Meta))
+		time.Now().In(reportTZ).Format("20060102-150405"), fileSafeRevision(snap.Meta))
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	h.render(w, page{Snapshot: snap, Sortable: true})
 }
@@ -353,7 +357,7 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := h.take()
 	base := fmt.Sprintf("%s_gen%d_%s",
-		time.Now().Format("20060102-150405"), snap.Meta.Generation, fileSafeRevision(snap.Meta))
+		time.Now().In(reportTZ).Format("20060102-150405"), snap.Meta.Generation, fileSafeRevision(snap.Meta))
 	if score := r.URL.Query().Get("score"); score != "" {
 		snap.Meta.Score = sanitizeName(score)
 		base += "_score" + snap.Meta.Score
