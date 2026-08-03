@@ -53,7 +53,7 @@ a { color: #0b57d0; }
 <td>{{.Gen}}</td>
 <td class="l">{{.Rev}}</td>
 <td>{{if .Score}}{{.Score}}{{else}}-{{end}}</td>
-<td class="l"><a href="files/{{.File}}">html</a> <a href="files/{{.JSON}}">json</a></td>
+<td class="l"><a href="files/{{.File}}">html</a> <a href="files/{{.JSON}}">json</a>{{if .PrevID}} <a href="diff?a={{.PrevID}}&b={{.ID}}">diff</a>{{end}}</td>
 </tr>{{end}}
 </tbody>
 </table>
@@ -213,6 +213,16 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </tr>{{end}}</tbody>
 </table>{{else}}<p class="empty">no access-log observations in this generation</p>{{end}}
 {{else}}<p class="empty">not configured (set ISUTOOLS_NGINX_LOG)</p>{{end}}
+
+<h2>User Flow <span class="meta">(セッション毎のページ遷移 上位20。nginx ログの sess: フィールドが必要)</span></h2>
+{{if and .Snapshot.AccessLog .Snapshot.AccessLog.Flows}}
+<table>
+<thead><tr><th>count</th><th>from</th><th></th><th>to</th></tr></thead>
+<tbody>{{range .Snapshot.AccessLog.Flows}}<tr>
+<td data-v="{{.Count}}">{{.Count}}</td><td class="l">{{.From}}</td><td>&rarr;</td><td class="l">{{.To}}</td>
+</tr>{{end}}</tbody>
+</table>
+{{else}}<p class="empty">no flow data (nginx の log_format に sess: を追加すると「ユーザーがどうアプリを使っているか」が見えます)</p>{{end}}
 
 <h2>Processes</h2>
 {{if .Snapshot.Proc}}

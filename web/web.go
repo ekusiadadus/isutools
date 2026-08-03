@@ -133,6 +133,7 @@ type handler struct {
 	mu         sync.Mutex
 	resetMu    sync.Mutex
 	prev       *Snapshot
+	saveMu     sync.Mutex
 	curDB      *dbinspect.Schema
 	curAdvisor []advisor.Check
 }
@@ -147,6 +148,7 @@ func NewHandler(p Provider) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.root)
 	mux.HandleFunc("/live", h.live)
+	mux.HandleFunc("/diff", h.diff)
 	mux.HandleFunc("/pprof/", pprofHandler)
 	mux.HandleFunc("/snapshot.html", h.static)
 	mux.HandleFunc("/json", h.json)
@@ -308,13 +310,14 @@ func (h *handler) live(w http.ResponseWriter, r *http.Request) {
 // runEntry is one persisted run parsed from its snapshot filename
 // (<ts>_gen<G>_<rev>[_score<S>].html).
 type runEntry struct {
-	ID    string
-	Label string
-	Gen   string
-	Rev   string
-	Score string
-	File  string
-	JSON  string
+	ID     string
+	Label  string
+	Gen    string
+	Rev    string
+	Score  string
+	File   string
+	JSON   string
+	PrevID string
 }
 
 type indexPage struct {
@@ -346,6 +349,10 @@ func (h *handler) listRuns() []runEntry {
 			}
 		}
 		runs = append(runs, run)
+	}
+	// newest first; each run diffs against the chronologically previous one
+	for i := 0; i+1 < len(runs); i++ {
+		runs[i].PrevID = runs[i+1].ID
 	}
 	return runs
 }
@@ -403,6 +410,10 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ISUTOOLS_DATA_DIR is not configured", http.StatusBadRequest)
 		return
 	}
+	// Serialize saves: concurrent bench scripts must not interleave the
+	// html/json pair writes (release-hardening cap).
+	h.saveMu.Lock()
+	defer h.saveMu.Unlock()
 	snap := h.take()
 	base := fmt.Sprintf("%s_gen%d_%s",
 		time.Now().In(reportTZ).Format("20060102-150405"), snap.Meta.Generation, fileSafeRevision(snap.Meta))

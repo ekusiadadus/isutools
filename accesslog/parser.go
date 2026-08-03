@@ -30,6 +30,10 @@ type Record struct {
 	UpstreamComplete bool          `json:"upstream_complete"`
 	NoUpstreamTiming bool          `json:"no_upstream_timing"`
 
+	// Session is a pseudonymous session fragment (sess: field) used for
+	// user-flow aggregation. Never a full cookie value.
+	Session string `json:"session,omitempty"`
+
 	QueryStripped bool   `json:"query_stripped,omitempty"`
 	Partial       bool   `json:"partial,omitempty"`
 	Issue         string `json:"issue,omitempty"`
@@ -141,7 +145,12 @@ func recordFromFields(fields map[string]string) (Record, error) {
 
 	uri := fields["uri"]
 	cleanURI, _, stripped := strings.Cut(uri, "?")
+	sess := fields["sess"]
+	if sess == "-" {
+		sess = ""
+	}
 	rec := Record{
+		Session:       sess,
 		Method:        fields["method"],
 		URI:           cleanURI,
 		Status:        status,

@@ -60,3 +60,47 @@ func TestParseLineAutoDetects(t *testing.T) {
 		t.Fatalf("ltsv autodetect: %v %#v", err, ltsvRec)
 	}
 }
+
+func TestSessionFlowAggregation(t *testing.T) {
+	a := NewAggregator(0)
+	obs := func(sess, method, uri string) {
+		a.Observe(Record{Method: method, URI: uri, Status: 200, Session: sess})
+	}
+	obs("s1", "GET", "/login")
+	obs("s1", "GET", "/")
+	obs("s1", "GET", "/posts/*")
+	obs("s2", "GET", "/login")
+	obs("s2", "GET", "/")
+	obs("s3", "GET", "/")
+
+	snap := a.Snapshot()
+	if len(snap.Flows) == 0 {
+		t.Fatal("flows must be aggregated from session transitions")
+	}
+	top := snap.Flows[0]
+	if top.From != "GET /login" || top.To != "GET /" || top.Count != 2 {
+		t.Errorf("top flow = %+v, want GET /login -> GET / x2", top)
+	}
+
+	a.Reset()
+	if got := a.Snapshot(); len(got.Flows) != 0 {
+		t.Errorf("flows must reset with generation: %v", got.Flows)
+	}
+}
+
+func TestSessionFieldParsedFromLTSVAndJSON(t *testing.T) {
+	rec, err := ParseNginxLTSV("method:GET\turi:/\tstatus:200\treqtime:0.1\tupstime:-\tbytes:0\tcache:\tctype:\tsess:abc123")
+	if err != nil {
+		t.Fatalf("ltsv: %v", err)
+	}
+	if rec.Session != "abc123" {
+		t.Errorf("ltsv session = %q", rec.Session)
+	}
+	rec, err = ParseNginxJSON(`{"method":"GET","uri":"/","status":200,"reqtime":0.1,"sess":"xyz"}`)
+	if err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if rec.Session != "xyz" {
+		t.Errorf("json session = %q", rec.Session)
+	}
+}

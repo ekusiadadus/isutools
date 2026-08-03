@@ -1,6 +1,6 @@
 # Implementation and verification status
 
-Updated: 2026-08-04 (Asia/Tokyo) — current release: **v0.5.0**
+Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.0.0**
 
 ## Implemented and released
 
@@ -27,6 +27,16 @@ Updated: 2026-08-04 (Asia/Tokyo) — current release: **v0.5.0**
   convention) rendered in the Processes section; JSON access-log lines
   auto-detected, accepting both isutools keys and alp defaults
   (`body_bytes` / `response_time`)
+
+- **v0.6.0**: advisor — detects unconfigured ISUCON-critical settings
+  (DSN interpolateParams, MySQL sizing, nginx gzip/keepalive/etc via
+  ISUTOOLS_NGINX_CONF, kernel somaxconn/port-range/nofile, GOMAXPROCS vs
+  cgroup quota); field-verified (+16% score from its first three findings)
+- **v0.7.0**: ISUTOOLS_PATH_RULES path normalization, counters API
+  (isutools.Count), WebSocket/SSE connection separation with active gauge
+- **v1.0.0**: run diff view (GET /diff?a=&b= with per-run diff links),
+  session User Flow aggregation (sess: log field -> top transitions),
+  k6 scenario example, ABBA overhead gate script, save serialization
 
 ## Test evidence
 

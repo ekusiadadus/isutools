@@ -547,7 +547,13 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 | recoverがアプリpanicを隠す | isutools内部だけrecover | SQL hookとHTTP再panicを実装・test済み |
 | debug endpoint露出 | 独立loopback admin、外部公開時はBearer認証 | localhost無認証、Docker明示opt-in、token/header/query-cookie、method固定を実装済み。collect resource上限は未完 |
 
-## 10.5 v1.0 ギャップと優先順位(2026-08-04 整理)
+## 10.5 v1.0 ギャップと優先順位(2026-08-04 整理 → 同日 v1.0.0 で全消化)
+
+**v1.0.0 リリース時点の結果**: 必須6件 + 追加要望2件をすべて実装済み。
+#1 パス正規化(v0.7)・#2 差分ビュー `/diff`(v1.0)・#3 counters(v0.7)・
+#4 WS/SSE分離(v0.7)・#5 save直列化(v1.0)・#6 ABBA スクリプト
+`examples/abba.sh`(v1.0)・#7 advisor(v0.6)・#8 k6 例 + User Flow
+(`sess:` 遷移集計、v1.0)。以下は当時の計画として保存。
 
 現況: v0.5.0。実装済み = SQL(3DB・リテラルマスク・世代ストア)/ HTTP(h1/h2)/
 nginx ログ(LTSV+JSON+alp キー・ローテ追随)/ procstats+CPU total / dbinspect(MySQL)/

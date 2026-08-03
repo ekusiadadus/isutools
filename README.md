@@ -36,6 +36,7 @@ http.ListenAndServe(":8080", isutools.HTTP(handler))
 | `GET /snapshot.html` | 自己完結 HTML をダウンロード(手元でダブルクリック閲覧) |
 | `GET /json` | 機械可読スナップショット(`prev` = 前世代付き) |
 | `GET /pprof/` | net/http/pprof(アプリプロセスのプロファイル) |
+| `GET /diff?a=<id>&b=<id>` | **2つの実行の差分**(クエリ/パス毎の合計時間変化、改善/悪化を色分け) |
 | `POST /reset` | 世代リセット(ベンチ前に叩く)。CPU プロファイル自動採取も開始 |
 | `POST /collect` | buffered nginx log を期限付きで flush 待ち・回収 |
 | `POST /save?score=N` | 現世代を html+json で atomic 保存(score は meta とファイル名に記録) |
@@ -53,7 +54,13 @@ http.ListenAndServe(":8080", isutools.HTTP(handler))
 - **nginx Access Log**: alp 相当(reqtime/upstime 分離・bytes・cache・304 等)
 - **Processes**: ベンチ区間のプロセス別 CPU/RSS(top 互換 1core=100%)+
   **CPU total: N% busy(user/sys/iowait/idle)** — ハードを使い切れているかが一目で分かる
-- **Snapshots / CPU Profiles**: 過去実行・プロファイルの一覧(ダッシュボードから選択)
+- **User Flow**: セッション毎のページ遷移 上位20(nginx ログの `sess:` フィールドから。
+  「ユーザーがどうアプリを使っているか」の実測。k6 シナリオの検証にも)
+- **Counters**: `isutools.Count("cache_hit")` によるアプリ内カウンタ(世代毎リセット)
+- **Advisor**: ISUCON 定石で未設定のもの(プリペアドステートメント・gzip・buffer pool・
+  カーネルパラメータ・GOMAXPROCS など)
+- **Snapshots / CPU Profiles**: 過去実行・プロファイルの一覧(ダッシュボードから選択、
+  各行に前回実行との diff リンク)
 
 ## 環境変数
 
@@ -67,6 +74,8 @@ http.ListenAndServe(":8080", isutools.HTTP(handler))
 | `ISUTOOLS_NGINX_LOG` | — | nginx ログのパス。**LTSV / JSON 行を自動判別**(alp キー互換) |
 | `ISUTOOLS_PPROF_SECONDS` | 0 | reset 後に CPU プロファイルを N 秒自動採取(ベンチ区間を丸ごと採る) |
 | `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Docker ビルドで vcs 情報が埋まらない場合の rev 注入 |
+| `ISUTOOLS_PATH_RULES` | — | HTTP パス正規化ルール(`regex=replacement;...` 各ペアは最後の `=` で分割) |
+| `ISUTOOLS_NGINX_CONF` | — | advisor が検査する nginx conf(ファイル or ディレクトリ) |
 
 ## nginx 設定(アクセスログ計測)
 
@@ -93,6 +102,19 @@ token 必須(fail closed)、`ALLOW_UNAUTHENTICATED=1` は「プロセスの外�
 到達性が制限されている構成」だけの明示 opt-in。生の ISUCON サーバでは必ず
 `ISUTOOLS_TOKEN` を設定する。完全なマトリクスと根拠は DESIGN.md 4章。
 `isutools.Handler()` を自前 router に mount する場合のアクセス制御は呼び出し側の責任。
+
+## シナリオ負荷試験(k6)との連携
+
+負荷生成は [k6](https://k6.io) をそのまま使う(再実装しない)。
+[examples/k6-private-isu.js](./examples/k6-private-isu.js) にログイン →
+タイムライン → 投稿詳細 → 作者ページのシナリオ例がある。`POST /reset` →
+k6 実行 → `POST /save` で、サーバ側から見たシナリオの SQL/HTTP/User Flow が
+ダッシュボードに揃う。
+
+## オーバーヘッド検証(ABBA)
+
+[examples/abba.sh](./examples/abba.sh) が off→on→on→off の4連ベンチで
+計測オーバーヘッドを算出する(リリース基準 < 2%)。
 
 ## 対応状況と v1.0 ロードマップ
 

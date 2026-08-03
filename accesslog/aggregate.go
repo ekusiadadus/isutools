@@ -3,6 +3,7 @@ package accesslog
 import (
 	"math/bits"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,11 +56,24 @@ type Entry struct {
 
 // Snapshot is an immutable copy of one access-log generation.
 type Snapshot struct {
-	Entries      []Entry `json:"entries"`
-	Lines        int64   `json:"lines"`
-	PartialLines int64   `json:"partial_lines"`
-	Health       Health  `json:"health"`
+	Entries      []Entry     `json:"entries"`
+	Flows        []FlowEntry `json:"flows,omitempty"`
+	Lines        int64       `json:"lines"`
+	PartialLines int64       `json:"partial_lines"`
+	Health       Health      `json:"health"`
 }
+
+// FlowEntry is one observed session transition (previous request -> next).
+// Aggregated from the pseudonymous sess: log field, it shows how users
+// actually move through the application.
+type FlowEntry struct {
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Count int64  `json:"count"`
+}
+
+// maxFlowSessions bounds the per-generation session tracking map.
+const maxFlowSessions = 10000
 
 type aggregateStat struct {
 	method, uri string
@@ -88,6 +102,8 @@ type Aggregator struct {
 	stats        map[string]*aggregateStat
 	lines        int64
 	partialLines int64
+	lastBySess   map[string]string
+	flows        map[string]int64
 }
 
 // NewAggregator returns an empty table. A non-positive maxKeys selects the
@@ -96,7 +112,12 @@ func NewAggregator(maxKeys int) *Aggregator {
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
 	}
-	return &Aggregator{maxKeys: maxKeys, stats: make(map[string]*aggregateStat)}
+	return &Aggregator{
+		maxKeys:    maxKeys,
+		stats:      make(map[string]*aggregateStat),
+		lastBySess: make(map[string]string),
+		flows:      make(map[string]int64),
+	}
 }
 
 // Observe adds a parsed record.
@@ -106,6 +127,17 @@ func (a *Aggregator) Observe(rec Record) {
 	a.lines++
 	if rec.Partial {
 		a.partialLines++
+	}
+	if rec.Session != "" {
+		page := rec.Method + " " + rec.URI
+		if prev, ok := a.lastBySess[rec.Session]; ok && prev != page {
+			a.flows[prev+"\x00"+page]++
+		}
+		if len(a.lastBySess) < maxFlowSessions {
+			a.lastBySess[rec.Session] = page
+		} else if _, ok := a.lastBySess[rec.Session]; ok {
+			a.lastBySess[rec.Session] = page
+		}
 	}
 	key := rec.Method + "\x00" + rec.URI
 	st := a.stats[key]
@@ -165,6 +197,19 @@ func (a *Aggregator) Snapshot() Snapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	result := Snapshot{Lines: a.lines, PartialLines: a.partialLines, Entries: make([]Entry, 0, len(a.stats))}
+	for key, count := range a.flows {
+		from, to, _ := strings.Cut(key, "\x00")
+		result.Flows = append(result.Flows, FlowEntry{From: from, To: to, Count: count})
+	}
+	sort.Slice(result.Flows, func(i, j int) bool {
+		if result.Flows[i].Count != result.Flows[j].Count {
+			return result.Flows[i].Count > result.Flows[j].Count
+		}
+		return result.Flows[i].From+result.Flows[i].To < result.Flows[j].From+result.Flows[j].To
+	})
+	if len(result.Flows) > 20 {
+		result.Flows = result.Flows[:20]
+	}
 	for _, st := range a.stats {
 		e := Entry{
 			Method: st.method, URI: st.uri, Count: st.count, LatencyCount: st.latency,
@@ -201,6 +246,8 @@ func (a *Aggregator) Reset() {
 	a.stats = make(map[string]*aggregateStat)
 	a.lines = 0
 	a.partialLines = 0
+	a.lastBySess = make(map[string]string)
+	a.flows = make(map[string]int64)
 	a.mu.Unlock()
 }
 
