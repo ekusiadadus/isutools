@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -112,13 +113,15 @@ type handler struct {
 }
 
 // NewHandler returns the report handler. Routes are relative:
-// GET / (dashboard), GET /snapshot.html, GET /json, GET /files/<name>,
+// GET / (run index), GET /<run-id> (stored run detail), GET /live,
+// GET /snapshot.html, GET /json, GET /files/<name>,
 // POST /reset, POST /collect, POST /save.
 func NewHandler(p Provider) http.Handler {
 	h := &handler{p: p}
 	h.gen.Store(1)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", h.dashboard)
+	mux.HandleFunc("/", h.root)
+	mux.HandleFunc("/live", h.live)
 	mux.HandleFunc("/snapshot.html", h.static)
 	mux.HandleFunc("/json", h.json)
 	mux.HandleFunc("/reset", h.reset)
@@ -206,15 +209,90 @@ func (h *handler) take() Snapshot {
 	return snap
 }
 
-func (h *handler) dashboard(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
+// runIDPattern is the timestamp id embedded at the start of persisted
+// snapshot names (e.g. 20260803-140100).
+var runIDPattern = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}$`)
+
+// root serves the run index at "/" and stored run details at "/<run-id>".
+func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	h.render(w, page{Snapshot: h.take(), Sortable: true, Dashboard: true, Files: h.listFiles()})
+	if r.URL.Path == "/" {
+		h.index(w)
+		return
+	}
+	id := strings.Trim(r.URL.Path, "/")
+	if !runIDPattern.MatchString(id) {
+		http.NotFound(w, r)
+		return
+	}
+	for _, name := range h.listFiles() {
+		if strings.HasPrefix(name, id+"_") {
+			http.ServeFile(w, r, filepath.Join(h.p.DataDir, name))
+			return
+		}
+	}
+	http.NotFound(w, r)
+}
+
+func (h *handler) index(w http.ResponseWriter) {
+	data := indexPage{Snapshot: h.take(), Runs: h.listRuns()}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := indexTmpl.Execute(w, data); err != nil {
+		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
+	}
+}
+
+func (h *handler) live(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	h.render(w, page{Snapshot: h.take(), Sortable: true})
+}
+
+// runEntry is one persisted run parsed from its snapshot filename
+// (<ts>_gen<G>_<rev>[_score<S>].html).
+type runEntry struct {
+	ID    string
+	Label string
+	Gen   string
+	Rev   string
+	Score string
+	File  string
+	JSON  string
+}
+
+type indexPage struct {
+	Snapshot Snapshot
+	Runs     []runEntry
+}
+
+func (h *handler) listRuns() []runEntry {
+	runs := []runEntry{}
+	for _, name := range h.listFiles() {
+		base := strings.TrimSuffix(name, ".html")
+		parts := strings.Split(base, "_")
+		if len(parts) == 0 || !runIDPattern.MatchString(parts[0]) {
+			continue
+		}
+		run := runEntry{ID: parts[0], Label: parts[0], File: name, JSON: base + ".json"}
+		if ts, err := time.Parse("20060102-150405", parts[0]); err == nil {
+			run.Label = ts.Format("2006-01-02 15:04:05")
+		}
+		for _, part := range parts[1:] {
+			switch {
+			case strings.HasPrefix(part, "gen"):
+				run.Gen = strings.TrimPrefix(part, "gen")
+			case strings.HasPrefix(part, "score"):
+				run.Score = strings.TrimPrefix(part, "score")
+			default:
+				run.Rev = part
+			}
+		}
+		runs = append(runs, run)
+	}
+	return runs
 }
 
 func (h *handler) static(w http.ResponseWriter, r *http.Request) {
@@ -229,10 +307,8 @@ func (h *handler) static(w http.ResponseWriter, r *http.Request) {
 }
 
 type page struct {
-	Snapshot  Snapshot
-	Sortable  bool
-	Dashboard bool
-	Files     []string
+	Snapshot Snapshot
+	Sortable bool
 }
 
 func (h *handler) render(w http.ResponseWriter, data page) {

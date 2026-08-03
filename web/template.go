@@ -6,6 +6,62 @@ import (
 	"time"
 )
 
+// indexTmpl renders the home page: a list of persisted runs, newest first,
+// each linking to /<run-id>. The full live report lives at /live.
+var indexTmpl = template.Must(template.New("index").Funcs(template.FuncMap{
+	"gb": func(bytes uint64) string {
+		if bytes == 0 {
+			return "?"
+		}
+		return strconv.FormatFloat(float64(bytes)/(1<<30), 'f', 1, 64)
+	},
+}).Parse(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>isutools runs</title>
+<style>
+body { font-family: ui-monospace, monospace; margin: 1.5rem; background: #fff; color: #111; }
+h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; border-bottom: 2px solid #333; padding-bottom: .2rem; }
+.meta { color: #666; margin: 0 0 .4rem; font-size: .85rem; }
+.warn { color: #b45309; }
+table { border-collapse: collapse; width: 100%; font-size: .85rem; }
+th, td { border: 1px solid #ddd; padding: .35rem .6rem; text-align: right; white-space: nowrap; }
+th { background: #f5f5f5; }
+td.l { text-align: left; }
+tbody tr:nth-child(odd) { background: #fafafa; }
+.empty { color: #999; }
+a { color: #0b57d0; }
+</style>
+</head>
+<body>
+<h1>isutools</h1>
+<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} &middot; gen {{.Snapshot.Meta.Generation}}</p>
+<p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
+{{if .Snapshot.Meta.Partial}}<p class="meta warn">partial snapshot: one or more collectors reported incomplete data</p>{{end}}
+<p class="meta"><a href="live">live report</a> &middot; <a href="snapshot.html">download current</a> &middot; <a href="json">json</a></p>
+
+<h2>Runs <span class="meta">(newest first)</span></h2>
+{{if .Runs}}
+<table>
+<thead><tr><th>time</th><th>gen</th><th>rev</th><th>score</th><th>raw</th></tr></thead>
+<tbody>
+{{range .Runs}}<tr>
+<td class="l"><a href="{{.ID}}">{{.Label}}</a></td>
+<td>{{.Gen}}</td>
+<td class="l">{{.Rev}}</td>
+<td>{{if .Score}}{{.Score}}{{else}}-{{end}}</td>
+<td class="l"><a href="files/{{.File}}">html</a> <a href="files/{{.JSON}}">json</a></td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p class="empty">no saved runs yet — bench.sh (POST /save) がベンチ毎にここへ追加します</p>{{end}}
+</body>
+</html>
+`))
+
 var reportTmpl = template.Must(template.New("report").Funcs(template.FuncMap{
 	"ms": func(d time.Duration) string {
 		return strconv.FormatFloat(float64(d.Nanoseconds())/1e6, 'f', 1, 64)
@@ -47,7 +103,7 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </style>
 </head>
 <body>
-<h1>isutools{{if .Dashboard}} dashboard{{end}}</h1>
+<h1>isutools report</h1>
 <p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} &middot; gen {{.Snapshot.Meta.Generation}}</p>
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
@@ -138,15 +194,6 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </tr>{{end}}</tbody>
 </table>{{else}}<p class="empty">no process interval data (POST /reset before the benchmark)</p>{{end}}
 {{else}}<p class="empty">process collector unavailable on this platform</p>{{end}}
-
-{{if .Dashboard}}
-<h2>Snapshots <span class="meta">(past results)</span></h2>
-{{if .Files}}
-<ul class="files">
-{{range .Files}}<li><a href="files/{{.}}">{{.}}</a></li>{{end}}
-</ul>
-{{else}}<p class="empty">no saved snapshots yet (POST /save persists the current generation; set ISUTOOLS_DATA_DIR)</p>{{end}}
-{{end}}
 
 {{if .Sortable}}<script>
 document.querySelectorAll("th").forEach(function (th) {

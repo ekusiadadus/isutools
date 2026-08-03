@@ -109,7 +109,7 @@ func TestDashboardRendersM2SectionsAndHealth(t *testing.T) {
 		Proc:      &fakeProc{},
 	})
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/live", nil))
 	for _, want := range []string{
 		"<h2>Collector Health</h2>",
 		"<h2>HTTP</h2>",

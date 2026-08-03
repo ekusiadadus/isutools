@@ -85,7 +85,7 @@ func TestReportShowsHostInfo(t *testing.T) {
 func TestLiveReportSorted(t *testing.T) {
 	h, _ := newTestHandler(t)
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/live", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -191,15 +191,30 @@ func newPersistentHandler(t *testing.T) (http.Handler, string) {
 	return h, dir
 }
 
-func TestDashboardShowsDBSchemaAndSections(t *testing.T) {
+func TestLiveShowsDBSchemaAndSections(t *testing.T) {
+	h, _ := newPersistentHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/live", nil))
+	body := rec.Body.String()
+	for _, want := range []string{"DB Schema", "comments", "PRIMARY", "SQL"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("live report missing %q", want)
+		}
+	}
+}
+
+func TestIndexIsRunList(t *testing.T) {
 	h, _ := newPersistentHandler(t)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	body := rec.Body.String()
-	for _, want := range []string{"DB Schema", "comments", "PRIMARY", "SQL", "Snapshots"} {
+	for _, want := range []string{"Runs", `href="live"`} {
 		if !strings.Contains(body, want) {
-			t.Errorf("dashboard missing %q", want)
+			t.Errorf("index missing %q", want)
 		}
+	}
+	if strings.Contains(body, "DB Schema") {
+		t.Error("index must be a run list, not the full report")
 	}
 }
 
@@ -224,16 +239,36 @@ func TestSavePersistsAndDashboardLists(t *testing.T) {
 		t.Fatalf("saved html missing: %v", err)
 	}
 
+	runID := strings.SplitN(saved.File, "_", 2)[0]
+
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if !strings.Contains(rec.Body.String(), saved.File) {
-		t.Error("dashboard must list saved snapshots")
+	if !strings.Contains(rec.Body.String(), runID) {
+		t.Error("index must list the saved run by its timestamp id")
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+runID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run detail status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "SELECT persisted") {
+		t.Error("run detail must serve the stored snapshot content")
 	}
 
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/"+saved.File, nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("files status = %d", rec.Code)
+	}
+}
+
+func TestRunDetailUnknownIDIs404(t *testing.T) {
+	h, _ := newPersistentHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/20990101-000000", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown run id status = %d, want 404", rec.Code)
 	}
 }
 
