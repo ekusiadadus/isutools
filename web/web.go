@@ -78,14 +78,17 @@ type Provider struct {
 // Meta identifies when, on which host, and from which revision a snapshot
 // was taken. Generation increments on every reset so runs are comparable.
 type Meta struct {
-	SchemaVersion int            `json:"schema_version"`
-	Time          string         `json:"time"`
-	Generation    int64          `json:"generation"`
-	Revision      string         `json:"revision"`
-	Dirty         bool           `json:"dirty"`
-	Host          sysinfo.Info   `json:"host"`
-	Partial       bool           `json:"partial"`
-	Health        []health.Entry `json:"health,omitempty"`
+	SchemaVersion int    `json:"schema_version"`
+	Time          string `json:"time"`
+	Generation    int64  `json:"generation"`
+	Revision      string `json:"revision"`
+	Dirty         bool   `json:"dirty"`
+	// Score is the benchmark score supplied via POST /save?score=; persisted
+	// snapshots always carry it so every report is attributable to a result.
+	Score   string         `json:"score,omitempty"`
+	Host    sysinfo.Info   `json:"host"`
+	Partial bool           `json:"partial"`
+	Health  []health.Entry `json:"health,omitempty"`
 }
 
 // Snapshot is the complete state of all measurements at one point in time.
@@ -352,7 +355,8 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	base := fmt.Sprintf("%s_gen%d_%s",
 		time.Now().Format("20060102-150405"), snap.Meta.Generation, fileSafeRevision(snap.Meta))
 	if score := r.URL.Query().Get("score"); score != "" {
-		base += "_score" + sanitizeName(score)
+		snap.Meta.Score = sanitizeName(score)
+		base += "_score" + snap.Meta.Score
 	}
 	if err := h.writeSnapshot(snap, base); err != nil {
 		http.Error(w, "isutools: save failed: "+err.Error(), http.StatusInternalServerError)

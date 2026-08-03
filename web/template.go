@@ -103,8 +103,8 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </style>
 </head>
 <body>
-<h1>isutools report</h1>
-<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} &middot; gen {{.Snapshot.Meta.Generation}}</p>
+<h1>isutools report{{if .Snapshot.Meta.Score}} — score {{.Snapshot.Meta.Score}}{{end}}</h1>
+<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} &middot; gen {{.Snapshot.Meta.Generation}}{{if .Snapshot.Meta.Score}} &middot; score {{.Snapshot.Meta.Score}}{{end}}</p>
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
 

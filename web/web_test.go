@@ -235,8 +235,19 @@ func TestSavePersistsAndDashboardLists(t *testing.T) {
 	if !strings.Contains(saved.File, "score929") {
 		t.Errorf("file = %q, want score in name", saved.File)
 	}
-	if _, err := os.Stat(filepath.Join(dir, saved.File)); err != nil {
+	htmlBytes, err := os.ReadFile(filepath.Join(dir, saved.File))
+	if err != nil {
 		t.Fatalf("saved html missing: %v", err)
+	}
+	if !strings.Contains(string(htmlBytes), "score 929") {
+		t.Error("stored snapshot must always show the score in its header")
+	}
+	jsonBytes, err := os.ReadFile(filepath.Join(dir, strings.TrimSuffix(saved.File, ".html")+".json"))
+	if err != nil {
+		t.Fatalf("saved json missing: %v", err)
+	}
+	if !strings.Contains(string(jsonBytes), `"score": "929"`) {
+		t.Errorf("stored json meta must carry the score: %s", jsonBytes[:200])
 	}
 
 	runID := strings.SplitN(saved.File, "_", 2)[0]
