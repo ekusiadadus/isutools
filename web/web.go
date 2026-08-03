@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/httpstats"
@@ -75,6 +76,9 @@ type Provider struct {
 	// DB captures the database schema (tables/indexes). Called at handler
 	// startup and on every reset so each generation records the pre-run state.
 	DB func(context.Context) *dbinspect.Schema
+	// Advisor reports well-known settings that are not configured. Captured
+	// alongside the DB schema at startup and on every reset.
+	Advisor func(context.Context) []advisor.Check
 	// DataDir persists snapshots for the dashboard history ("" = disabled).
 	DataDir string
 	// PprofDuration > 0 captures a CPU profile for that long after every
@@ -102,6 +106,7 @@ type Meta struct {
 type Snapshot struct {
 	Meta      Meta                `json:"meta"`
 	DB        *dbinspect.Schema   `json:"db,omitempty"`
+	Advisor   []advisor.Check     `json:"advisor,omitempty"`
 	SQL       []agg.Entry         `json:"sql"`
 	HTTP      httpstats.Snapshot  `json:"http,omitempty"`
 	AccessLog *accesslog.Snapshot `json:"accesslog,omitempty"`
@@ -114,12 +119,13 @@ type jsonPayload struct {
 }
 
 type handler struct {
-	p       Provider
-	gen     atomic.Int64
-	mu      sync.Mutex
-	resetMu sync.Mutex
-	prev    *Snapshot
-	curDB   *dbinspect.Schema
+	p          Provider
+	gen        atomic.Int64
+	mu         sync.Mutex
+	resetMu    sync.Mutex
+	prev       *Snapshot
+	curDB      *dbinspect.Schema
+	curAdvisor []advisor.Check
 }
 
 // NewHandler returns the report handler. Routes are relative:
@@ -144,12 +150,24 @@ func NewHandler(p Provider) http.Handler {
 
 // captureDB refreshes the schema state for the current generation.
 func (h *handler) captureDB() {
-	if h.p.DB == nil {
+	var schema *dbinspect.Schema
+	var checks []advisor.Check
+	if h.p.DB != nil {
+		schema = h.p.DB(context.Background())
+	}
+	if h.p.Advisor != nil {
+		checks = h.p.Advisor(context.Background())
+	}
+	if schema == nil && checks == nil {
 		return
 	}
-	schema := h.p.DB(context.Background())
 	h.mu.Lock()
-	h.curDB = schema
+	if schema != nil {
+		h.curDB = schema
+	}
+	if checks != nil {
+		h.curAdvisor = checks
+	}
 	h.mu.Unlock()
 }
 
@@ -163,6 +181,13 @@ func (h *handler) currentDB() *dbinspect.Schema {
 	db := h.curDB
 	h.mu.Unlock()
 	return db
+}
+
+func (h *handler) currentAdvisor() []advisor.Check {
+	h.mu.Lock()
+	checks := h.curAdvisor
+	h.mu.Unlock()
+	return checks
 }
 
 func (h *handler) currentGeneration() int64 {
@@ -190,8 +215,9 @@ func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries [
 			Partial:       partial,
 			Health:        healthEntries,
 		},
-		DB:  db,
-		SQL: entries,
+		DB:      db,
+		Advisor: h.currentAdvisor(),
+		SQL:     entries,
 	}
 }
 

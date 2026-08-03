@@ -566,6 +566,13 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 | 5 | **collect/save の資源上限** | レビュー P0-6 残項目(size/time/concurrency 上限)。リリース硬化 |
 | 6 | **on/off ABBA オーバーヘッド検証の定型化** | リリースゲート(§7)を手順化して 1.0 の根拠にする(現状: 個別ベンチのみ) |
 
+### v1.0 追加要望(2026-08-04 ユーザー要望で追加)
+
+| # | 項目 | 設計方針 |
+|---|---|---|
+| 7 | **設定アドバイザ(advisor)** | 「ISUCON 必須級だが未設定」を検出してレポートに常時表示する新コレクター。検査対象: **DSN**(`interpolateParams` = プリペアドステートメント往復の削減)、**MySQL 変数**(`max_connections` / `innodb_buffer_pool_size` vs データ量 / `slow_query_log`)、**nginx conf**(gzip / upstream keepalive / worker_connections / sendfile / expires — `ISUTOOLS_NGINX_CONF` でconfを読み取り)、**OS**(`somaxconn` / `ip_local_port_range` / nofile 上限)、**Go**(GOMAXPROCS vs cgroup CPU クォータ)。各チェックは fail-open、ok/missing/warn/info の4値 |
+| 8 | **シナリオ負荷試験の可視化(k6 連携 + 行動フロー)** | 負荷生成は **k6 を外部ツールとして採用**(再実装しない。書籍4章の方針)。isutools 側は (a) private-isu 用のシナリオ例を examples/ に同梱、(b) **行動フロー可視化**: nginx ログにセッション識別子(セッション Cookie の短縮ハッシュ `sess:`)を追加し、セッション単位の遷移(`/login → / → /posts/N`)を集計して「ユーザーがどうアプリを使っているか」の上位パスをレポート表示、(c) 将来: k6 の JSON 出力(`--out json`)の取り込み。**Cookie 値そのものは記録しない**(ハッシュのみ、プライバシー/流出対策) |
+
 ### v1.0 に入れない(1.x 以降)
 
 - pprof top 関数のレポート内表示(現状のファイル DL + `go tool pprof -http` で実用十分)

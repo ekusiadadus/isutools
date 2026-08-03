@@ -126,6 +126,21 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </table>
 {{else}}<p class="empty">no core collector warnings</p>{{end}}
 
+<h2>Advisor <span class="meta">(ISUCON 定石で未設定のもの)</span></h2>
+{{if .Snapshot.Advisor}}
+<table>
+<thead><tr><th>status</th><th>check</th><th>current</th><th>recommendation</th></tr></thead>
+<tbody>
+{{range .Snapshot.Advisor}}<tr>
+<td class="l">{{if eq (printf "%s" .Status) "missing"}}<strong class="warn">missing</strong>{{else if eq (printf "%s" .Status) "warn"}}<span class="warn">warn</span>{{else}}{{.Status}}{{end}}</td>
+<td class="l">{{.Title}}</td>
+<td class="l">{{.Detail}}</td>
+<td class="l">{{.Recommendation}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{else}}<p class="empty">not captured</p>{{end}}
+
 <h2>DB Schema <span class="meta">(captured at generation start)</span></h2>
 {{if .Snapshot.DB}}{{if .Snapshot.DB.Error}}<p class="empty warn">{{.Snapshot.DB.Error}}</p>{{else}}
 <table>

@@ -20,11 +20,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"errors"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,6 +34,7 @@ import (
 	"time"
 
 	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -258,6 +261,7 @@ func Handler() http.Handler {
 			}
 			return dbinspect.Collect(ctx, name, dsn)
 		},
+		Advisor: collectAdvice,
 	}
 	collectorHealth.Set("http", health.StatusOK, "")
 	if path := os.Getenv("ISUTOOLS_NGINX_LOG"); path != "" {
@@ -287,4 +291,58 @@ func Handler() http.Handler {
 		collectorHealth.Set("proc", health.StatusDisabled, "procfs is only available on Linux")
 	}
 	return web.NewHandler(provider)
+}
+
+// collectAdvice gathers the advisor inputs available to this process:
+// the observed DSN, a raw DB connection, nginx conf (ISUTOOLS_NGINX_CONF:
+// file or directory of *.conf), the root filesystem, and GOMAXPROCS.
+func collectAdvice(ctx context.Context) []advisor.Check {
+	opts := advisor.Options{
+		FS:         os.DirFS("/"),
+		GOMAXPROCS: runtime.GOMAXPROCS(0),
+	}
+	if name, dsn, ok := sqlstats.FirstConn(); ok {
+		opts.DriverName, opts.DSN = name, dsn
+		if db, err := sql.Open(name, dsn); err == nil {
+			defer db.Close()
+			db.SetMaxOpenConns(1)
+			opts.DB = db
+			return collectAdviceWithConf(ctx, opts)
+		}
+	}
+	return collectAdviceWithConf(ctx, opts)
+}
+
+func collectAdviceWithConf(ctx context.Context, opts advisor.Options) []advisor.Check {
+	if path := os.Getenv("ISUTOOLS_NGINX_CONF"); path != "" {
+		opts.NginxConf = readNginxConf(path)
+	}
+	return advisor.Collect(ctx, opts)
+}
+
+// readNginxConf reads a conf file, or concatenates nginx.conf and *.conf
+// files when path is a directory (best effort).
+func readNginxConf(path string) []byte {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	if !info.IsDir() {
+		data, _ := os.ReadFile(path)
+		return data
+	}
+	var out []byte
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(p, ".conf") {
+			if data, rerr := os.ReadFile(p); rerr == nil {
+				out = append(out, data...)
+				out = append(out, '\n')
+			}
+		}
+		return nil
+	})
+	return out
 }
