@@ -1,9 +1,9 @@
 # Implementation and verification status
 
-Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.0.0**
+Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.1.0**
 
-`v1.0.0` tag = `faa7ca8`. The fixes under “post-release hardening” below are
-currently local/unreleased changes and must not be attributed to that tag.
+`v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1); the
+“post-release hardening” work below shipped in that tag.
 
 ## Implemented and released
 
@@ -12,8 +12,8 @@ currently local/unreleased changes and must not be attributed to that tag.
 - **v0.2.x**: dashboard + snapshot persistence (`POST /save`, `GET /files/`),
   MySQL/MariaDB schema capture (dbinspect via the first observed DSN),
   collector health / `partial`, generation-scoped SQL store, serialized reset,
-  historical admin auth modes (the post-release working tree removes
-  Bearer/query-token auth and standardizes on SSH-only reachability)
+  historical admin auth modes (v1.1.0 removes Bearer/query-token auth and
+  standardizes on SSH-only reachability)
 - **M2 (v0.2.x)**: HTTP middleware (h1/h2), nginx LTSV delta tailer with
   rotation handling and bounded `POST /collect`, Linux reset-to-snapshot
   procstats (PID-reuse detection, top 1core=100% convention)
@@ -39,17 +39,28 @@ currently local/unreleased changes and must not be attributed to that tag.
 - **v1.0.0**: run diff view (GET /diff?a=&b= with per-run diff links),
   session User Flow aggregation (sess: log field -> top transitions),
   k6 scenario example, ABBA overhead gate script, save serialization
+- **v1.1.0**: the post-release hardening listed below, plus new advisor
+  checks — HTTP/3/QUIC readiness (nginx/Caddy/Envoy config, UDP/443,
+  explicit edge/network evidence, protocol traffic, QUIC telemetry),
+  cache strategy (proxy_cache advisory, proxy_cache_lock, Set-Cookie
+  ignore hazard, app-cache hit-rate/eviction telemetry via
+  `ISUTOOLS_CACHE_METRICS`), ECH readiness (`ssl_ech_file`, key-rotation
+  window, `$ssl_ech_status` logging) — `docs/INTEGRATION.md`, and a
+  Go 1.24 compat CI job. The DESIGN.md §7 on-target ABBA gate was
+  **explicitly waived** for this tag (recorded in the tag annotation);
+  the remote multi-block rerun remains pending
 
 ## Test evidence
 
-Current working tree verification (2026-08-04, Go 1.26.5): `go vet ./...` PASS,
+v1.1.0 (`f4e7c3c`) verification (2026-08-04, Go 1.26.5): `go vet ./...` PASS,
 `go test -race -shuffle=on -coverprofile=... ./...` PASS (14 packages), aggregate
-coverage **85.0%**. Package coverage is not uniformly 80%: the root package is
-70.7%; CI enforces the documented **aggregate** 80% gate and separately runs
-`go test ./...` on Go 1.24.x. `golangci-lint run ./...` reports 0 issues,
-`govulncheck ./...` reports no known vulnerabilities, and the access-log parser
-completed a 10-second fuzz run (~761k executions) without a failure.
-`BenchmarkObserve` was 153.2 ns/op, 0 B/op, 0 allocs/op on Apple M3.
+coverage **85.0%**. Package coverage is not uniformly 80%; CI enforces the
+documented **aggregate** 80% gate, runs the `examples/abba.sh` script contract
+test, and separately runs `go test ./...` on Go 1.24.x. Recorded on the
+pre-merge hardening tree (not rerun at the tag): `golangci-lint run ./...`
+0 issues, `govulncheck ./...` no known vulnerabilities, access-log parser
+10-second fuzz run (~761k executions) without a failure, `BenchmarkObserve`
+153.2 ns/op, 0 B/op, 0 allocs/op on Apple M3.
 
 A real TLS HTTP/2 listener, HTTP/3 listener, deployed target, and physical/remote
 benchmark are not implied by those local results.
@@ -90,10 +101,11 @@ satisfy the release-gate contract in DESIGN.md §7. Also, the evidence commit
 
 The hardened `examples/abba.sh` now requires at least three blocks, fixed
 warm-up, a stable binary/image fingerprint, score/p95/error rate, TSV
-provenance, and paired 95% CI gates. It has passed its local script contract;
-it has **not yet been rerun on private-isu**.
+provenance, and paired 95% CI gates. It has passed its local script contract
+(also enforced in CI since v1.1.0); it has **not yet been rerun on
+private-isu**. v1.1.0 was tagged with this §7 gate explicitly waived.
 
-## Post-release hardening in the current working tree (unreleased)
+## Post-release hardening (released in v1.1.0)
 
 - SQL normalization removes all comments, masks PG dollar quotes and
   hex/binary/scientific literals, bounds safe tags and the final identity
@@ -124,8 +136,9 @@ it has **not yet been rerun on private-isu**.
 3. ~~counter/gauge API~~ → `isutools.Count`/`AddCount` (v0.7.0)
 4. ~~WS/SSE separation~~ → connection stats + active gauge (v0.7.0)
 5. ~~save caps~~ → initial serialization in v1.0.0; size/concurrency/read caps
-   completed in the unreleased hardening tree
-6. ~~ABBA template~~ → hardened locally; remote multi-block gate still pending
+   completed in v1.1.0
+6. ~~ABBA template~~ → hardened + CI script-contract test (v1.1.0); remote
+   multi-block gate still pending
 7. cross-collector shared generation gate — still open (1.x): benchmark
    automation must wait for `POST /reset` to return before load starts
    (the reference bench.sh does)
