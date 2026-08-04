@@ -1,65 +1,105 @@
-# 計測ギャップ解消 実装計画(2026-08-04)
+# 計測ギャップ解消 実装計画 v2(2026-08-04 レビュー反映版)
 
-ISUCON 優勝記事・作問記事 5 本を isutools v1.1.0 の実装と突き合わせた調査で
-特定した計測ギャップ 6 件の実装計画。各計画は独立した文書として `plans/`
-配下に置き、実装時は 1 計画 = 1 ブランチ = 1 PR とする。
+初版(5fbe54c)はレビューで「背景調査と課題選定は妥当、ただし 04・05・06 は
+設計の書き直し、01 は delta 方式の修正が必要」と判定された。本版は
+レビューの推奨実装順序に従って全面再構成した。旧 01〜06 は廃止し、
+基盤 3 計画 + 機能 7 計画へ分割した。
 
-調査根拠の記事:
+## 調査根拠(レビューでの事実訂正を反映)
 
-| 記事 | 主な計測手法 |
+| 記事 | 事実 |
 |---|---|
-| ISUCON12 優勝 (NaruseJun) | pprotein(pprof+alp+slp)、Netdata、帯域ボトルネック |
-| ISUCON13 優勝 (NaruseJun) | slp の Rows examined/sent 比、/initialize 自動計測、Sankey |
-| ISUCON14 感想戦 (kawaemon) | flamegraph、TIME_WAIT 監視、ロック保持時間計測 |
+| ISUCON12 優勝 | **NaruseJun**。各インスタンスを Netdata で監視。app/DB 分離、DB 4 台化 |
+| ISUCON13 優勝 | **同じく NaruseJun**(二連覇)。全サーバに Netdata。DB・DNS・app を分離。slp の Rows examined/sent 比、/initialize フックで自動計測 |
+| ISUCON14 感想戦 (kawaemon) | flamegraph、ロック保持時間計測。**TIME_WAIT 枯渇は競技サーバ側ではなくベンチマーカー側の送信元ポート枯渇** |
 | ISUCON10 予選作問 (progfay) | EXPLAIN(Using filesort)、降順/空間インデックス |
 | isucandar 解説 (catatsuy) | ベンチマーカー設計論(isutools 側ギャップなし) |
 
-## 計画一覧と優先順位
+## 実装順序(レビュー推奨順)
 
-| # | 計画 | 効果 | 実装コスト | リリース目標 |
-|---|---|---|---|---|
-| [01](./01-sql-row-stats.md) | SQL 行効率(rows examined/sent) | 最大: インデックス判断の主指標 | 中 | v1.2.0 |
-| [02](./02-runtime-contention.md) | mutex/block プロファイル + DB プール待ち | 大: ロック/プール詰まりの直接証拠 | 小 | v1.2.0 |
-| [03](./03-procstats-network.md) | TIME_WAIT / NIC 帯域のランタイム観測 | 中: 接続枯渇・帯域飽和の検出 | 小 | v1.2.x |
-| [04](./04-auto-reset-initialize.md) | /initialize 自動計測開始 | 中: 運用摩擦の削減(pprotein 方式) | 小 | v1.2.x |
-| [05](./05-query-plan-capture.md) | 代表クエリの EXPLAIN 自動化 | 中: filesort/フルスキャンの根因提示 | 中 | v1.3.0 |
-| [06](./06-multi-host.md) | 複数台構成の横断計測 | 大: app/DB 分離後の可視性 | 大 | v1.4.0 |
+基盤(先行必須):
 
-01 と 05 は重複領域がある(performance_schema の `SUM_NO_INDEX_USED` /
-`SUM_SORT_MERGE_PASSES` が EXPLAIN の所見を部分的に代替する)。01 を先に
-出荷し、05 は 01 で不足した「どのインデックスが使われたか」の粒度を補う。
+| # | 計画 | 内容 | 解消する前提問題 |
+|---|---|---|---|
+| [01](./01-db-target-registry.md) | DB target registry | `FirstConn` の単一グローバル DSN を named registry + inspector callback に置換 | shard 非対応・DSN(credential)の露出。04/09/10 の前提 |
+| [02](./02-reset-coordinator.md) | Reset coordinator | run_id・ResetResult・区間時刻・partial/invalid 状態の導入 | 世代境界の証拠欠如(既知 open item)。08/10 の前提 |
+| [03](./03-hoststats.md) | hoststats | memory/disk/PSI/cgroup/ホスト同一性(namespace 含む) | 「OS 資源が見える」の過大表現の解消。10 の前提 |
 
-## 全計画に共通する制約
+機能:
 
-1. **fail-open**: 計測の失敗はアプリを止めない。入力が得られないチェックは
-   `StatusSkip` / セクション非表示に劣化する(advisor・collector 共通の既存方針)。
-2. **オーバーヘッド既定ゼロ**: ランタイムコストが発生しうる機能
-   (mutex/block プロファイル、EXPLAIN、exemplar 保持)は既定 off の
-   opt-in とし、環境変数で明示的に有効化する。
-3. **ABBA ゲート**: 各リリース tag の前に DESIGN.md §7 の on/off ベンチ比較を
-   実施する。v1.1.0 は明示免除で出荷したが、常態化させない。
-   計測系追加ごとに `examples/abba.sh` の再実行を release checklist に含める。
-4. **TDD**: テスト先行(RED→GREEN)。集計カバレッジ 80% 以上を維持
-   (CI ゲート)。Linux 依存の /proc 読みは `fs.FS` 注入 + `fstest.MapFS` で
-   ユニットテストする(advisor/procstats の既存様式)。
-5. **JSON 互換性**: Snapshot への追加は additive(omitempty)とし、既存
-   キーの意味を変えない。schema_version は現行 3。トップレベル構造が
-   変わる 06 のみ 4 へ bump する。
-6. **ドキュメント**: 各 PR に README 環境変数表・docs/INTEGRATION.md・
-   docs/IMPLEMENTATION_STATUS.md の更新を含める。
-7. **配線パターンの踏襲**: 起動時検査は `advisor.Collect`、区間依存データは
-   snapshot 時の `advisor.WithX` 差し替え(`WithQUICTelemetry` /
-   `WithCacheTelemetry` と同型)、収集器は reset-to-snapshot デルタ
-   (procstats と同型)、web は `Provider` の nil-skip フィールド追加で行う。
+| # | 計画 | 旧番号 | 要点 |
+|---|---|---|---|
+| [04](./04-sql-row-stats.md) | SQL 行効率 | 旧01 | **全 digest baseline** 方式へ修正。NULL digest overflow・counter 後退・sent=0 を正しく扱う |
+| [05](./05-network-stats.md) | ネットワーク観測 | 旧03 | v1 は**表示のみ**(advisor 閾値なし)。単位・namespace・新規 NIC を修正 |
+| [06](./06-db-pool-stats.md) | DB プール統計 | 旧02の一部 | v1 は**表示のみ**。advisor 閾値は private-isu 実測後 |
+| [07](./07-runtime-profiles.md) | runtime プロファイル | 旧02の一部 | rate 意味論の修正。**累積プロファイル**として正しく扱い、reset/save の 2 点 + diff_base 手順を提供 |
+| [08](./08-auto-reset.md) | 計測開始の自動化 | 旧04 | HTTP 自己呼び出し廃止。**同期 API(ResetNow)が正、middleware は best-effort に格下げ** |
+| [09](./09-query-plan-capture.md) | EXPLAIN 自動化 | 旧05 | **raw exemplar 廃止**。MySQL 8 の QUERY_SAMPLE_TEXT 経路に限定。実行は collect/save 時のみ |
+| [10](./10-multi-host.md) | 複数台横断計測 | 旧06 | **ADR からやり直し**。agent protocol / hub / distributed reset の 3 段階、2〜3 週間規模 |
 
-## リリース順序と依存関係
+## 依存関係(「06 以外は独立」の撤回)
 
 ```
-v1.2.0: 01 (sqlrows) + 02 (contention)   … 独立、並行実装可
-v1.2.x: 03 (network) + 04 (auto-reset)   … 独立、並行実装可
-v1.3.0: 05 (explain)                     … 01 の advisor 統合を再利用
-v1.4.0: 06 (multi-host)                  … 03 の agent 側価値が前提
+01 registry ──→ 04 sqlrows ──→ 09 explain
+      │                              │
+      └──────────→ 10 multi-host ←───┘
+02 coordinator ─→ 08 auto-reset ─→ 10
+      └──────────→ 06 dbpool(区間デルタの baseline 契約)
+03 hoststats ───→ 10(peer identity / DB ホスト観測)
+05 network ─────→ 10(agent の観測項目)
+07 profiles: 01/02 と独立(artifact 保存のみ 02 の run_id を使用)
 ```
 
-06 以外は互いに独立しており、順序の入れ替えは可能。06 のみ、単体ホストで
-取れる情報(特に 03)が揃ってから着手する方が agent の価値が高い。
+- 01/04/09/10 は DSN 保持の一元化(registry)を共有する
+- 02/08/10 は reset 契約を共有する
+- 03/05/10 は FS 注入(procfs と sysfs の分離)と Provider/health 表示を共有する
+
+## リリース対応(見積もり改訂)
+
+```
+v1.2.0: 01 + 02 + 04            … 基盤2件と sqlrows(計 5 日規模)
+v1.2.x: 03 + 05 + 06            … 表示系(計 4 日規模)
+v1.3.0: 07 + 08 + 09            … profile / auto-reset / explain(計 5 日規模)
+v1.4.0: 10                      … ADR 承認後に着手。2〜3 週間規模(4.5 日ではない)
+```
+
+## 全計画共通の契約
+
+1. **fail-open**: 計測失敗はアプリを止めない。skip 理由は health に残す。
+2. **feature flag 必須**: 各機能は専用の環境変数で単独 on/off できる。
+   既定値は各計画に明記(ランタイムコストのあるものは既定 off)。
+3. **機能単位 ABBA**: `examples/abba.sh` を拡張し、
+   (a) 全機能 off vs 全機能 on、(b) baseline vs 単一機能 on、の両モードを
+   サポートする。リリース tag 前に対象機能の (b) を必ず実施する。
+   全体 on/off だけでは追加機能単体の影響を分離できないため。
+4. **schema version 契約**(本版で定義):
+   - additive(新しい省略可能キーの追加): bump しない。
+     `meta.capabilities` 配列(additive で導入)に機能名を追加して宣言する
+   - 既存キーの意味変更: bump する
+   - キーの削除・型変更(破壊): bump + 移行注記
+   - peer 互換判定は revision ではなく
+     `schema_version` + `protocol_version` + `capabilities` で行う(→ 10)
+5. **TDD** + 集計カバレッジ 80%(CI ゲート)。/proc・/sys は FS 注入 +
+   `fstest.MapFS`。procfs と sysfs は**別の FS として注入**する
+   (現行 procstats の注入 root は /proc であり /sys を読めないため)。
+6. **advisor 閾値は実測に基づく**: 新しい warn 閾値は private-isu での
+   フィールド検証を経てから既定有効にする。それまでは表示のみ、
+   または provisional と明記する。
+7. **ドキュメント**: 各 PR に README 環境変数表・INTEGRATION.md・
+   IMPLEMENTATION_STATUS.md の更新を含める。
+
+## レビュー指摘 → 対応計画の対応表
+
+| 指摘(要約) | 対応 |
+|---|---|
+| [CRITICAL] 旧06 reset 伝播が同一区間を保証しない | 02(単一ホストの契約)+ 10(ACK-all / invalid run) |
+| [CRITICAL] 旧04 async 既定は計測境界を保証しない / 自己 HTTP 呼び出し | 08(内部 Coordinator 直呼び + 同期 API 主軸) |
+| [CRITICAL] 旧01 上位200 baseline は delta にならない / NULL overflow | 04(全 digest baseline・overflow 独立 health) |
+| [CRITICAL] 旧05 exemplar 前提が hook 実装と不一致 | 09(QUERY_SAMPLE_TEXT 経路へ全面変更) |
+| [HIGH] 旧06 app peer の SQL/HTTP が統合されない / identity 欠落 / OS 資源過大表現 | 10(全セクション取り込み)+ 03(hoststats/identity) |
+| [HIGH] 旧02 profile rate 意味論・累積性・.pb.gz 配信不可 | 07(意味論修正・diff_base・.pprof 名) |
+| [HIGH] 旧02 dbpool advisor 判定式不成立 | 06(表示のみに縮小) |
+| [HIGH] 旧03 TIME_WAIT 50% 閾値は誤警報 / FS・単位・新規NIC | 05(表示のみ・モデル修正) |
+| [HIGH] 旧04 二重 responseWriter が透過契約を壊す / 5秒 debounce | 08(既存 wrapper から通知・request 単位の一意性) |
+| [HIGH] README「06以外は独立」不成立 / FirstConn 単一 DSN | 本書依存図 + 01 |
+| [MEDIUM] 機能単位 ABBA 不可 / schema 契約未定義 / 旧06 E2E 不足 | 共通契約 3・4 + 10 の E2E マトリクス |
