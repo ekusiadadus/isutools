@@ -1,13 +1,26 @@
 # isutools
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/ekusiadadus/isutools.svg)](https://pkg.go.dev/github.com/ekusiadadus/isutools)
+[![CI](https://github.com/ekusiadadus/isutools/actions/workflows/ci.yml/badge.svg)](https://github.com/ekusiadadus/isutools/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+
 ISUCON 向けオールインワン計測モジュール。**アプリの変更1行**で SQL / HTTP /
 nginx アクセスログ / プロセス・CPU / DB スキーマ / pprof を計測し、
 **ソート済みダッシュボード**と**自己完結スナップショット**で振り返る。
 
+*All-in-one profiling for ISUCON-style tuning: change one line, get SQL /
+HTTP / access-log / process / schema / pprof dashboards with per-benchmark
+history and diffs. Zero measured overhead (ABBA-verified).*
+
+ベンチ毎の履歴がスコア・git rev 付きで並び、行クリックで当時の全計測が開く:
+
+![isutools dashboard: per-benchmark run history with scores and git revisions](docs/images/dashboard-runs.png)
+
 - 設計書: [DESIGN.md](./DESIGN.md) / 実装状況: [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md)
 - License: MIT / Runtime: Go 1.24+
 - 実績(dogfooding): private-isu を本モジュールの計測だけで1日チューニングし
-  **score 0 → 299,668**(fail 0)
+  **score 0 → 541,650**(fail 0)。
+  [全記録はブログ記事に](https://ekusiadadus.com/writing/private-isu-0-to-540k-in-a-day)
 
 ## クイックスタート
 
@@ -94,6 +107,18 @@ curl -X POST $ADMIN/reset                  # 世代開始(CPU プロファイル
 curl -X POST "$ADMIN/save?score=$score"    # 永続化 → ダッシュボード一覧に1行追加
 curl $ADMIN/json | jq '.sql[:5]'           # その場で top5 確認
 ```
+
+## スクリーンショット
+
+**Advisor** — 「ISUCON の定石なのに未設定」を自動検出(プリペアドステートメント・
+gzip・buffer pool・カーネルパラメータ・GOMAXPROCS)。直すと ok に変わるチェックリスト:
+
+![isutools advisor: detects unconfigured ISUCON-critical settings](docs/images/report-advisor.png)
+
+**diff ビュー** — 2つの実行間でクエリ/パス毎の合計時間の増減を表示。
+「改善したのか、ボトルネックが移動しただけか」が一目で分かる:
+
+![isutools diff view: per-query total-time deltas between two runs](docs/images/diff-view.png)
 
 ## セキュリティモデル(要約)
 
