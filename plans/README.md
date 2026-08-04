@@ -42,6 +42,7 @@ v3 の中核変更: **二段階境界(BeginBoundary/Drain)**、並行 reset の
 | [08](./08-auto-reset.md) | 計測開始の自動化 | 旧04 | HTTP 自己呼び出し廃止。**同期 API(ResetNow)が正、middleware は best-effort に格下げ** |
 | [09](./09-query-plan-capture.md) | EXPLAIN 自動化 | 旧05 | **raw exemplar 廃止**。MySQL 8 の QUERY_SAMPLE_TEXT 経路に限定。実行は collect/save 時のみ |
 | [10](./10-multi-host.md) | 複数台横断計測 | 旧06 | **ADR からやり直し**。agent protocol / hub / distributed reset の 3 段階、2〜3 週間規模 |
+| [11](./11-nginx-transport.md) | nginx transport / ランタイム | 新規 | ISUCON 本 9-8/9-9 由来: UNIX domain socket 機会・`listen backlog=`・PGO の静的検査 + MTU 表示(05 に委譲)。依存なし・即実装可 |
 
 ## 依存関係(「06 以外は独立」の撤回)
 

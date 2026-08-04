@@ -69,6 +69,7 @@ type Interface struct {
     RxDropped    uint64   `json:"rx_dropped"`
     TxDropped    uint64   `json:"tx_dropped"`
     SpeedMbit    int64    `json:"speed_mbit,omitempty"` // /sys/class/net/<if>/speed(-1/不可時は省略)
+    MTU          int64    `json:"mtu,omitempty"`        // /sys/class/net/<if>/mtu(計画11: Jumbo Frame の適用状態を表示。判定なし)
 }
 ```
 
