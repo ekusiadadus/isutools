@@ -32,6 +32,9 @@ snapshot に表示される。判断は読者(+将来の advisor)に委ねる。
 // 任意 interface は受けない(typed-nil / panic / blocking 実装の混入を
 // 防ぐため *sql.DB に限定。sqlx 等は .DB を渡す)。
 func WatchDBPool(targetID string, db *sql.DB) error   // 重複 ID・nil はエラー。上限 16
+// v5: targetID は 01 の registry に登録済みの TargetID のみ受理する
+// (手書き文字列の typo で 04/09 と結合できなくなるのを防ぐ)。
+// 未登録 ID はエラー。不一致ケースをテストに含める。
 func UnwatchDBPool(targetID string) error             // プール再作成時は Unwatch → Watch
 ```
 

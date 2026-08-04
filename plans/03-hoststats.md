@@ -59,7 +59,11 @@ DB ホストの診断に必要な以下が**存在しない**:
 - identity(前節)に **CgroupNS**(`/proc/self/ns/cgroup`)を追加し、
   scope の解釈材料として常に併記する
 - `ISUTOOLS_CGROUP_PATH` で対象 cgroup(例: mysqld の service cgroup)を
-  明示指定できる(scope=configured-cgroup)。指定パスが読めない場合は skip
+  明示指定できる(scope=configured-cgroup)。指定パスが読めない場合は skip。
+  **パス境界の検証(v5)**: 指定は解決済み cgroup mount からの
+  **相対パスに限定**し、absolute path・`..` を含むパス・cgroup FS 外へ
+  抜ける symlink は拒否する(拒否時は skip + health に理由)。
+  escape fixture(`../`、symlink)をテストに含める
 - 表示は scope を併記し、「agent の limit ≠ 観測対象サービスの limit」で
   あり得ることを注記する
 

@@ -71,6 +71,15 @@ isutools v1.1.0 は `os-somaxconn`(1024 未満 warn / 4096 推奨)と
 - endpoint 単位で妥当な `backlog=` あり → ok
 - 動的・変数を含む listen や解析不能な形式は当該 endpoint を skip
   (保守的に。誤検知で起動エラーを誘発する提案をしない)
+- **conf 読み込みの前提整備(v5)**: 現行実装は `ISUTOOLS_NGINX_CONF`
+  ディレクトリ内の全 `.conf` を単純連結するだけで(isutools.go:447
+  付近)、ファイル境界・include 順・無効設定を区別できない。
+  本 check の実装範囲に **source file と include 関係を保持する保守的
+  parser** を含める(include 解決は同一ディレクトリ配下のみ、循環は
+  打ち切り、追跡不能な include は当該部分を skip)。
+  テスト対象: IPv4/IPv6/wildcard(`*:80`/`[::]:80`)・default_server・
+  同一 endpoint の重複 listen・include されていない inactive file
+  (載っていても判定に使わないこと)
 
 ### `go-pgo`(新規 check・小)
 

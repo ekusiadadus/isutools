@@ -62,11 +62,15 @@
      DIGEST 単独条件では別 schema のサンプルを取り得る)
    - **鮮度判定は DB 側時計だけで行う**(v4 修正: アプリプロセスの
      BoundaryAt と比較しない。DB 専用ホストでは時計が異なる)。
-     04 の baseline 時と本 collect 時に DB 側の `UTC_TIMESTAMP(6)` を
-     取得しておき、`QUERY_SAMPLE_SEEN` が [baseline時のDB時刻,
-     collect時のDB時刻] に入るかで判定する。区間外は過去 run のサンプル。
-     リテラル値で実行計画が変わり得るため **advisor 判定から除外**し、
-     表示は `stale`(取得時刻付き)としてグレー表示する
+     判定材料は **04 が保存する DB 側 UTC 区間**(v5 修正: 04 の
+     データモデルに、baseline 採取と final 採取それぞれの前後で取得した
+     `UTC_TIMESTAMP(6)` の before/after ペアが含まれる — 04 §区間の
+     妥当性判定を参照)。`QUERY_SAMPLE_SEEN` が
+     **[baseline 区間の after, collect 区間の before]** に入る場合のみ
+     fresh とする(点時刻比較ではなく保守的な区間判定)。
+     区間外は過去 run のサンプルであり、リテラル値で実行計画が変わり得る
+     ため **advisor 判定から除外**し、表示は `stale`(取得時刻付き)として
+     グレー表示する
    - 区間内なら `EXPLAIN <sample>` を実行。
      **sample 文字列はこの関数スコープ限りで破棄**(構造体へ保存しない)
    - **エラー整形**: driver エラーを Plan.Err に入れる際、エラー文字列に
@@ -92,21 +96,35 @@ type Plan struct {
     Rows       []PlanRow `json:"rows"`
     Err        string    `json:"err,omitempty"`    // digest とエラー種別のみ(sample 非含有)
 }
-type PlanRow struct {
-    SelectType   string `json:"select_type"`
-    Table        string `json:"table"`
-    Type         string `json:"type"`
-    Key          string `json:"key"`
-    PossibleKeys string `json:"possible_keys"`
-    Rows         int64  `json:"rows"`
-    Extra        string `json:"extra"`
+type PlanRow struct { // v5: MySQL EXPLAIN 出力仕様上、実質全列が NULL になり得る。
+                      // scan は sql.Null* で受け、JSON は omitempty の pointer にする
+    SelectType   *string `json:"select_type,omitempty"`
+    Table        *string `json:"table,omitempty"`
+    Type         *string `json:"type,omitempty"`
+    Key          *string `json:"key,omitempty"`
+    PossibleKeys *string `json:"possible_keys,omitempty"`
+    Rows         *int64  `json:"rows,omitempty"`
+    Extra        *string `json:"extra,omitempty"`
 }
 ```
 
 ### 安全性
 
-- 対象は SELECT のみ(v1)。EXPLAIN は実行を伴わないが、
-  範囲を最小にする
+- **最小権限 inspector ユーザーを必須にする(v5・CRITICAL 対応)**。
+  「SELECT のみ対象だから EXPLAIN は実行を伴わない」は安全保証に
+  ならない: MySQL 公式資料のとおり、外側の問い合わせがテーブルへ
+  アクセスし内側でデータを変更する stored function を呼ぶ場合、
+  `EXPLAIN SELECT` でも**副作用が発生し得る**。対応:
+  - EXPLAIN 用接続は専用の最小権限ユーザー(対象 schema への SELECT と
+    performance_schema への SELECT のみ。**DML なし・stored function の
+    EXECUTE なし**)を必須とし、`ISUTOOLS_EXPLAIN_DSN` 相当の
+    別 credential として 01 の registry に登録する
+  - 起動時に `SHOW GRANTS` で権限を検証し、**安全な権限を確認できない
+    target は EXPLAIN を skip**(health に理由を記録)
+  - **副作用 fixture テスト**: データを変更する stored function を含む
+    SELECT に対し EXPLAIN を実行し、テーブルが変更されないこと
+    (権限エラーで拒否されること)を検証する
+  - INTEGRATION.md に GRANT 文の実例を記載する
 - 接続は registry 管理の短命接続(multiStatements を付与しない。
   DSN は registry の外に出ない)
 - サンプル非保存の保証はテストで固定する
@@ -145,4 +163,5 @@ type PlanRow struct {
 
 ## 見積もり
 
-probe+queryplan 1.5 日、配線+docs+検証 1 日。
+probe+queryplan 1.5 日、最小権限ユーザー検証(SHOW GRANTS + 副作用
+fixture)0.5 日、配線+docs+検証 1 日。計 3 日。

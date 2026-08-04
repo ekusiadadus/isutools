@@ -1,164 +1,155 @@
-# 02: Reset coordinator(run 契約の導入)— v4
+# 02: Run lifecycle coordinator — v5
 
 種別: 基盤 / 対象リリース: v1.2.0 / 変更箇所: `internal/runctl`(新規)、`web`、`isutools.go`、各 collector
 
-## v4 での変更点(第3回レビュー差し戻し対応)
+## v5 での変更点(第4回レビュー差し戻し対応)
 
-1. **[CRITICAL] collector を 2 種類に分離**。v3 は baseline 取得を
-   境界後の非同期 Drain に置いたため、境界宣言(T0)〜baseline 実採取(T2)
-   の間の CPU・SQL・network・dbpool が baseline に吸収され、
-   **新 run の冒頭が欠落**していた(現行 procstats も実サンプル時刻を
-   StartedAt にしている — procstats/procstats.go:202, :242)。
-   → **generation collector**(世代スワップ型)と
-   **baseline collector**(基準値採取型)の契約を分け、baseline は
-   StartRun 内で **bounded I/O を同期実行**する。禁止事項は
-   「旧世代 in-flight の完了待ちを StartRun 内で行わない」ことだけに絞る
-2. **[CRITICAL] Drain の世代識別と遷移期間**。v3 は Drain(ctx) に世代
-   token がなく、reset 拒否も BeginBoundary 完了までだったため、
-   reset1 の background Drain 中に reset2 が開始でき、どの旧世代を
-   Drain しているか不定だった。
-   → **reset 遷移は DrainPrevious 完了まで継続**とし、その間の新規 reset
-   は 409(同一 nonce は保存済み結果を返す)。Drain handle は世代 token 付き
-3. **[HIGH] 返却値の不変化**。WaitDrain:false の返却値に後から確定する
-   DrainedAt/Err が含まれ、snapshot/health と競合していた。
-   → 不変の **StartResult** と、別途取得する **DrainStatus /
-   PreviousRunResult** に分割。background 処理は request context から
-   切り離す(`context.WithoutCancel` + 内部 timeout)
+1. **[CRITICAL] GenerationHandle の取得手段を API に定義**(v4 は
+   BeginBoundary が時刻しか返さず、DrainPrevious に渡す handle を
+   取得できなかった = 実装不能)
+2. **[CRITICAL] run lifecycle を Start だけでなく
+   Start → Finish → Abort → Ack/Expire の完全な状態機械として定義**。
+   特に **Finish(終了境界)を全 collector 共通の契約**にする:
+   世代型は現在世代を freeze して handle を返し、baseline 型は
+   終了サンプルを同期取得する。immutable snapshot は
+   **固定済みの値だけ**から構築する(10 が本契約を wire に一対一で写す)
+3. **[HIGH] BeginBoundary 途中失敗の扱いを定義**(required/optional
+   collector 区分、invalid 化、切替済み世代の seal)
+4. **[HIGH] Drain の ctx cancellation 契約**(現行 httpstats は無期限
+   待機する — httpstats/httpstats.go:341。契約 + conformance test で保証)
 
 ## ゴール
 
-1. run_id・StartResult・collector 別の**実測**境界時刻を持つ run 契約
-2. 計測対象 handler の内側から呼んでもデッドロックしない reset
-3. **新 run の冒頭を欠落させない**(baseline は境界と同期)
-4. 応答済み run を後続 reset が無言で無効化・上書きしない
-5. admin 無効・DB 未接続・Handler() 複数回生成で一貫動作
+1. run の開始・終了・中止・破棄を含む**完全な lifecycle** を単一の
+   Controller が所有する
+2. 計測対象 handler の内側から呼んでもデッドロックしない
+3. 新 run の冒頭・末尾を欠落/混入させない(開始 baseline 同期採取・
+   終了 freeze 同期固定)
+4. どの失敗経路からも**次の run を開始できる**(Abort による回復)
 
-## 設計
-
-### collector 契約(2 種類)
+## collector 契約(v5)
 
 ```go
-// 世代スワップ型: httpstats / sqlstats / accesslog / counters。
-// BeginBoundary は table swap 等の高速な世代切替のみ(非ブロッキング)。
-// BoundaryAt はスワップ実行時刻。
 type GenerationCollector interface {
-    BeginBoundary(runID string) (BoundaryAt time.Time, err error)
-    // DrainPrevious は handle が指す旧世代のみを確定する
-    // (in-flight 完了待ち・追い付き collect)。非同期に呼ばれる。
-    DrainPrevious(ctx context.Context, handle GenerationHandle) error
+    // 開始境界: 新世代へスワップし、閉じた旧世代の handle を返す。
+    // 高速・非ブロッキング。boundaryAt はスワップ実行時刻(実測)。
+    BeginBoundary(runID string) (prev GenerationHandle, boundaryAt time.Time, err error)
+
+    // 終了境界: 現在世代を freeze し、その handle を返す。高速・同期。
+    // freeze 後の観測は次世代(run 外)に入る。
+    Freeze(runID string) (cur GenerationHandle, frozenAt time.Time, err error)
+
+    // handle が指す世代のみを確定する(in-flight 完了待ち・追い付き
+    // collect)。ctx.Done() で必ず return し、return 後に当該世代を
+    // 変更する goroutine を残さないこと(conformance test で保証)。
+    Drain(ctx context.Context, h GenerationHandle) error
+
+    // Drain 済み handle の確定データを読む(immutable snapshot 構築用)。
+    Collect(h GenerationHandle) (any, error)
 }
 
-// 基準値採取型: procstats / sqlrows / dbpool / network / hoststats。
-// CaptureBaseline は bounded I/O を同期実行し、実サンプル完了時刻を返す。
-// 旧世代の in-flight には依存しないため StartRun 内で安全に呼べる。
 type BaselineCollector interface {
+    // 開始・終了とも bounded I/O の同期採取。SampledAt は実測時刻。
     CaptureBaseline(ctx context.Context, runID string) (SampledAt time.Time, err error)
+    CaptureFinal(ctx context.Context, runID string) (SampledAt time.Time, err error)
 }
 ```
 
-- BoundaryAt / SampledAt は**宣言時刻ではなく実測時刻**。
-  BoundaryWindow(min/max)はこの実測値から計算する
-- GenerationHandle は世代 token(runID + collector 内世代番号)を持ち、
-  「どの旧世代を Drain しているか」を常に一意にする
+- 世代型: httpstats / sqlstats / accesslog(EOF offset を freeze 点で
+  記録)/ counters。baseline 型: procstats / sqlrows / dbpool /
+  network / hoststats
+- collector は登録時に **required / optional** を宣言する
+  (既定: sql・http は required、その他 optional。Provider 配線で変更可)
 
-### StartRun のシーケンス
-
-```
-1. 遷移ガード: state==idle のみ許可(下記)。nonce 一致は保存済み
-   StartResult を返す
-2. generation collectors: BeginBoundary(高速スワップ)
-3. baseline collectors: CaptureBaseline を同期実行
-   (collector ごと timeout、全体 budget 2s。失敗した collector は
-   partial 記録して続行)
-4. 不変の StartResult を確定して返す
-5. state=draining にして background で DrainPrevious(全 generation
-   collectors、世代 handle 付き、request context から切り離した
-   timeout 付き context、上限 10s)。完了で state=idle
-```
-
-- StartRun 内に「旧世代 in-flight の完了待ち」は存在しない
-  → 計測対象 handler 内からの呼び出しでもデッドロックしない
-  (baseline の /proc 読みや P_S クエリは in-flight と無関係)
-- baseline 同期化により T0〜T2 問題は消える: ベンチ負荷は StartRun
-  応答後に始まり、baseline はその前に採取済み
-
-### 遷移状態機械と並行 reset
+## run lifecycle 状態機械
 
 ```
-idle → starting(StartRun 実行中)→ draining(旧世代確定中)→ idle
+idle ─ StartRun ─→ started ─ FinishRun ─→ finishing ─→ finished ─→ (acknowledged | expired)
+         │                        │
+         └──── AbortRun ──→ aborting ──→ aborted(→ idle)
 ```
 
-- **starting / draining 中の新規 reset は 409**(ErrResetInProgress)。
-  同一 nonce は保存済み StartResult を 200 で返す(冪等)
-- DrainPrevious の上限 10s で遷移は必ず終わる(timeout 時は prev を
-  partial 記録)。長寿命 in-flight リクエストが遷移を延ばす trade-off は
-  文書化する(WS/SSE は既に世代から detach 済みで対象外)
-- 世代 handle により「reset2 が reset1 の Drain 対象を上書きする」経路は
-  存在しない(遷移中 409 + handle の二重防御)
+### StartRun(nonce 付き・冪等)
 
-### 返却値の分離
+1. 遷移ガード: idle のみ。同一 nonce は保存済み StartResult を返す。
+   それ以外の状態は 409(started 中は先に FinishRun か AbortRun)
+2. 全 generation collector: `BeginBoundary` → (prev handle, 実測時刻)
+3. **途中失敗の扱い(v5)**: required collector の失敗 →
+   残りの collector も**切替まで完了させて**プロセス状態を新世代で
+   統一した上で、run を **invalid** とし、切替済みの旧世代 handle は
+   seal(Drain 後に「invalid run の断片」として破棄可能マーク)する。
+   optional の失敗 → partial で続行
+4. 全 baseline collector: `CaptureBaseline` を同期実行(全体 budget 2s)
+5. 不変 **StartResult**(RunID / Nonce / collector 別実測境界・
+   required 区分 / State)を確定して返す
+6. background: prev handles の `Drain`(detached ctx、上限 10s。
+   **ctx cancellation で必ず終了する契約**)
 
-```go
-// StartRun が返す不変値。以後書き換えない。
-type StartResult struct {
-    RunID          string              `json:"run_id"`
-    Nonce          string              `json:"nonce,omitempty"`
-    RequestedAt    time.Time           `json:"requested_at"`
-    BoundaryWindow Window              `json:"boundary_window"` // 実測 min/max
-    Collectors     []CollectorBoundary `json:"collectors"`      // 実測時刻 + 種別
-    State          RunState            `json:"state"`           // valid | partial
-}
+### FinishRun(終了境界 — v5 で全 collector に拡張)
 
-// 旧世代の確定結果。Drain 完了後に別途取得(snapshot の prev に添付)。
-type PreviousRunResult struct {
-    RunID     string    `json:"run_id"`
-    DrainedAt time.Time `json:"drained_at"`
-    TimedOut  bool      `json:"timed_out,omitempty"`
-    Errors    []string  `json:"errors,omitempty"`
-}
-```
+1. started のみ受理(冪等: 同一 runID の再送は同じ FinishAccepted を返す)
+2. **freeze phase(高速・同期)**: 全 generation collector の
+   `Freeze` + 全 baseline collector の `CaptureFinal`(全体 budget 2s)。
+   ここが**全セクション共通の計測終了境界**(v4 は HTTP と accesslog
+   しか固定していなかった)
+3. **FinishAccepted**(collector 別 frozenAt / final SampledAt)を
+   即座に返す(Drain や snapshot 構築は待たない)
+4. background: frozen handle の `Drain` → `Collect` で
+   **固定値だけから immutable run snapshot を構築**して保存 →
+   state=finished。以後この run のデータは変化しない
+5. snapshot 構築の完了は状態(finishing/finished)として照会できる
 
-- snapshot の Meta には現行 run の StartResult(immutable)を、
-  prev には PreviousRunResult を添付する
-- health への反映は Drain 完了イベントとして別経路(StartResult は不変)
+### AbortRun(冪等 — v5 新設)
 
-### Controller(process-wide singleton、v3 から維持)
+- どの状態からでも受理(idle では no-op 成功)。started/finishing の
+  run を **aborted** にし、freeze/seal 済み世代を破棄可能にして
+  idle へ戻す。**部分開始・部分失敗からの回復経路**として、
+  10 の分散 abort がこれを一対一で呼ぶ
+- StartRun 途中の required 失敗(上記 3)は内部的に AbortRun 相当へ
+  遷移する(invalid run として記録は残す)
 
-- sync.Once で一度だけ生成。admin HTTP と独立。
-  `Handler()` / `ResetNow()` は同一 Controller へ委譲
-- テスト必須: admin off の ResetNow / DB 未接続 / Handler() 複数回
+### Ack / Expire
 
-### HTTP API(v3 から維持 + 遷移拡張)
+- finished run の結果は **Ack(取得完了の明示)または TTL(10 分)**まで
+  保持する。単一ホストでは `POST /save` の永続化成功が Ack に相当。
+  10 では hub の明示 ACK API が対応する
+- 保持は直近 2 run 分(10 と同一の契約)
 
-- `POST /reset`: StartRun + Drain 完了まで待って応答(bench 用の
-  full barrier)。204 + `X-Isutools-Run-Id`。`?format=json` で
-  StartResult。遷移中 409 / 同一 nonce 200
-- `ResetNow`: StartRun 完了(境界 + baseline 確定)で返る。
-  Drain は background(呼び出し元が in-flight のため待てない)
+## API(単一ホスト)
+
+- `POST /reset` = StartRun(full barrier: 応答前に background Drain の
+  完了も待つ従来動作を維持)。204 + `X-Isutools-Run-Id`、
+  409 / nonce 冪等は v4 のまま
+- `POST /collect` / `POST /save` = FinishRun を内包(freeze →
+  snapshot 構築 → 保存)
+- `ResetNow(ctx) (StartResult, error)`(v5 変更: runID 文字列ではなく
+  **StartResult を返す**。08 が partial/invalid を判定できるようにする)
+- `AbortRun` は内部 API(単一ホストでは次の StartRun が実質的な
+  代替になるが、10 の wire 写像のために定義する)
 
 ## 実装ステップ(TDD)
 
-1. runctl: 状態機械(idle/starting/draining・409・nonce・timeout)を
-   fake collector でテスト先行
-2. StartResult 不変性(background 完了後も値が変わらない)+
-   PreviousRunResult 分離のテスト
-3. httpstats を GenerationCollector に分割(swap/drain、handle 付き)。
-   透過契約・世代テスト全通し
-4. procstats を BaselineCollector 化(SampledAt = 実測。既存
-   StartedAt セマンティクスの維持を回帰テスト)
-5. **デッドロック回帰テスト**: 計測 handler 内 ResetNow(タイムアウト付き)
-6. **冒頭欠落回帰テスト**: StartRun 応答直後に発生した負荷が新 run に
-   全量計上されること(fake clock で T0/T1/T2 を再現)
-7. web /reset・Meta/prev 反映・docs
+1. 状態機械(全遷移 × API の受理/拒否表を先にテスト化)
+2. handle 付き BeginBoundary/Freeze/Drain/Collect への httpstats 分割
+   + **Drain conformance test**(ctx cancel で return・return 後に
+   旧世代を変更する goroutine が残らないことを race detector 下で検証)
+3. baseline collector(procstats)の Capture 2 点化
+4. StartRun 途中失敗(required/optional)・seal・invalid のテスト
+5. FinishRun freeze phase と「固定値のみから snapshot 構築」の検証
+   (freeze 後に故意の負荷を掛け、snapshot に混入しないこと)
+6. AbortRun 冪等性と「部分失敗 → abort → 次 run 成功」のテスト
+7. デッドロック回帰・冒頭欠落回帰(v4 から維持)
+8. web /reset・/save 配線、docs
 
 ## リスク
 
 | リスク | 対策 |
 |---|---|
-| baseline 同期化による StartRun 遅延 | 全体 budget 2s + collector 別 timeout。実測値を docs に記録 |
-| 遷移中 409 が bench リトライと衝突 | nonce 冪等で同一 run を返す。INTEGRATION.md に手順明記 |
-| collector 分割リファクタの退行 | 互換 shim で段階移行 + 既存テスト網 |
+| 契約が大きくなり移行コスト増 | 互換 shim(旧 Reset() を新契約で包む)で collector ごとに段階移行 |
+| freeze phase の budget 超過 | 2s budget + 超過 collector は partial。実測値を docs に記録 |
+| Drain の cancellation 対応漏れ | conformance test を全 collector の受け入れ条件に固定 |
 
 ## 見積もり
 
-4 日(v3 の 3 日から増。2 契約分離と状態機械、回帰テスト 2 本を含む)。
+**5 日**(v4 の 4 日から増。Finish/Abort 契約・conformance test・
+状態機械の遷移表テストを含む)。

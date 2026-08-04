@@ -28,15 +28,21 @@ in-flight** のため永遠に待つ(middleware は handler 開始時に in-flig
 ```go
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
     // ... DB 再構築など ...
-    runID, err := isutools.ResetNow(r.Context())  // 境界+baseline 確定して返る(Drainは非同期)
-    if err != nil {
-        // 境界を確定できないまま計測を続けてはいけない(v4)。
-        // 500 を返せばベンチマーカーは initialize をリトライする。
-        http.Error(w, "isutools reset failed: "+err.Error(), http.StatusInternalServerError)
+    // v5: ResetNow は runID 文字列ではなく不変の StartResult を返す。
+    // 02 は required collector の失敗を State で表現するため、
+    // 呼び出し側は partial/invalid を判定できる(できないと
+    // 汚れた run のまま 200 を返してしまう)。
+    start, err := isutools.ResetNow(r.Context())
+    if err != nil || start.State == runctl.StateInvalid {
+        http.Error(w, "isutools reset failed", http.StatusInternalServerError)
         return
     }
+    if start.State == runctl.StatePartial {
+        // 既定ポリシー: required が揃っていれば partial は計測続行可。
+        // 厳格運用では 500 にする(caller policy を必ず明示する)。
+        log.Printf("isutools: run %s started partial: %v", start.RunID, start.Collectors)
+    }
     w.WriteHeader(http.StatusOK)                  // 境界確定後に応答
-    _ = runID
 }
 ```
 
@@ -81,8 +87,9 @@ v2 から変更なしの方針(既存 responseWriter への observer callback、
 二重 wrapper なし)+ v3 の修正:
 
 - `ISUTOOLS_RESET_ON_INITIALIZE=besteffort` で有効化(既定 off)
-- 発火は応答完了後・**非同期**。`Controller.Reset(WaitDrain:false)` を
-  リクエスト固有 nonce 付きで呼ぶ(HTTP 経由ではない)
+- 発火は応答完了後・**非同期**。02 の `Controller.StartRun` を
+  リクエスト固有 nonce 付きで直接呼ぶ(HTTP 経由ではない。
+  v5: 旧 `Reset(WaitDrain:false)` 表記を StartRun API へ統一)
 - 先頭数リクエストの前世代混入があり得ることを明示し、run に
   `reset_trigger: "initialize-besteffort"` + ダッシュボードに
   「境界非保証」バッジ
@@ -110,8 +117,9 @@ v2 から変更なしの方針(既存 responseWriter への observer callback、
 
 - unit: POST /initialize 200 → Controller.Reset 呼び出し 1 回(fake)
 - unit: 別パス / GET / 500 / モード off → 呼ばれない
-- unit: 同時 initialize 2 本 → 片方が ErrResetInProgress、
-  世代は 1 回だけ進む
+- unit: 同時 initialize 2 本 → **2 本とも順番に成功し、世代は 2 回
+  進み、最後の nonce の run が有効になる**(v5: ResetNow は待機 →
+  自 nonce 再 reset のため。「片方 409・世代 1 回」の旧期待値を撤回)
 - integration: ResetNow 完了時点で generation +1、以後のリクエストが
   新世代、呼び出し元リクエストは旧世代
 - 回帰: httpstats 透過契約(observer 有効/無効の両方)

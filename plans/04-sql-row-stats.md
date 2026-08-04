@@ -68,7 +68,10 @@ WHERE SCHEMA_NAME = DATABASE() OR (SCHEMA_NAME IS NULL AND DIGEST IS NULL)
     実測上限を受け入れ条件にし、実測値を docs に記録する**
   - baseline には DIGEST_TEXT を**含めない**(メモリ節約)。
     表示対象に決まった上位 200 についてのみ、Snapshot 時に
-    `WHERE DIGEST IN (...)` で DIGEST_TEXT(512B に切り詰め)を追加取得
+    `WHERE SCHEMA_NAME = DATABASE() AND DIGEST IN (...)` で
+    DIGEST_TEXT(512B に切り詰め)を追加取得(v5 修正: 主キーは
+    (SCHEMA_NAME, DIGEST)。DIGEST 単独条件では別 schema の同一 digest
+    行を取り得る。複数 schema fixture をテストに追加)
 - delta 計算: current − baseline。baseline に無い digest は
   「区間中に初登場」なので current 値をそのまま採用(全件取得している
   ため、これは正しい区間値)
@@ -90,6 +93,11 @@ counter 後退のみの検出では、(a) TRUNCATE 後に同数以上実行さ�
 - baseline / snapshot の両時点で `@@server_uuid` と
   `SHOW GLOBAL STATUS LIKE 'Uptime'` を取得:
   server_uuid 変化または Uptime 減少 → **DB 再起動**として区間 partial
+- **DB 側 UTC 区間の保存(v5 追加 — 09 の鮮度判定が依存)**:
+  baseline 採取と final 採取のそれぞれ**前後**で `UTC_TIMESTAMP(6)` を
+  取得し、before/after ペアを Snapshot に保存する
+  (`db_clock: {baseline: [before, after], final: [before, after]}`)。
+  クエリ数・データモデル・query budget にこの 2×2 回分を計上する
 - **baseline keyset の消失**: baseline に存在した digest が current に
   1 つでも無い → 外部 TRUNCATE / instrument reset として区間 partial
 - いずれかの digest の counter 後退 → 区間 partial
@@ -150,7 +158,7 @@ digest 全件 1 + 上位 200 の DIGEST_TEXT 取得 1。
 | 全 digest 取得のコスト | digest table 上限 ~1 万行・2 回/世代のみ。probe 失敗で以後停止 |
 | 複数 schema を跨ぐアプリ | v1 は接続先 schema のみ(WHERE 条件)。表示にその旨明記 |
 | MariaDB の列差異 | probe で列存在も確認し、欠落時 skip |
-| baseline と snapshot の間の TRUNCATE | counter 後退検出 → partial(仕様どおり) |
+| baseline と snapshot の間の TRUNCATE | server_uuid + Uptime + baseline keyset 消失 + counter 後退の**複合判定** → partial(§区間の妥当性判定。v5: counter 後退のみへの先祖返りを修正) |
 
 ## 見積もり
 

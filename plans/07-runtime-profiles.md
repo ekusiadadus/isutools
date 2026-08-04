@@ -98,8 +98,9 @@
 ## 実装ステップ(TDD)
 
 1. PR-a: env パース(不正値は off + health warn)・設定反映・health
-2. PR-b: 保存(rate=0 で mutex/block を書かない・heap は書く・
-   reset/save の 2 点・ファイル名規約)・files 配信テスト
+2. PR-b: 保存(rate=0 で mutex/block を書かない・**heap は
+   ISUTOOLS_HEAP_PROFILE=1 のときのみ書く**・reset/save の 2 点・
+   ファイル名規約・capture window メタ)・files 配信テスト
 3. docs: INTEGRATION.md「ロック競合の診断」節
    (rate 意味論、diff_base 手順、`go tool pprof -http` の見方)
 
@@ -118,8 +119,8 @@
 | リスク | 対策 |
 |---|---|
 | block profile の高コスト設定 | 既定 off + 推奨値と実測値を README に併記 |
-| プロファイル取得自体の stop-the-world | WriteTo は短時間だが、save 時のみ(ベンチ区間外)を基本とし、reset 時取得は世代開始前に完了する順序を coordinator で保証 |
-| ファイル数の増加 | run ごと最大 6 ファイル。既存の DataDir 運用(手動削除)に従う |
+| プロファイル取得自体の stop-the-world | v5 で整理: profile 取得は**境界後の近似観測**と位置づける(StartRun budget に含めず、02 の境界順序も拘束しない)。取得ごとに実測 capture window(開始/終了時刻)を artifact メタに保存し、取得失敗・遅延は profile 側の partial として記録する |
+| ファイル数の増加 | 保持上限契約(直近 20 run・合計 512MiB、超過は古い run から自動削除)に従う(v5: 「手動削除」表記を撤回し PR-b の retention 契約に一本化) |
 
 ## 見積もり
 

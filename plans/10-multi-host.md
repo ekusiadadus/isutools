@@ -39,11 +39,17 @@
 
 ## run プロトコル(protocol_version = 1)
 
+02 の run lifecycle(Start → Finish → Abort → Ack/Expire)を
+**一対一で wire に写す**(v5):
+
 ```
 GET  /peer/info                     handshake(識別・互換性・capability)
-POST /peer/runs                     ResetRun {run_id, nonce}    → ResetResult
-POST /peer/runs/{run_id}/finish     FinishRun                   → FinishResult
-GET  /peer/runs/{run_id}            immutable run snapshot 取得(LocalSnapshot)
+POST /peer/runs                     StartRun {run_id, nonce}    → StartResult
+POST /peer/runs/{run_id}/finish     FinishRun(freeze 受付)     → FinishAccepted
+GET  /peer/runs/{run_id}            状態照会 + immutable snapshot 取得
+                                    (finishing 中は 202 + 状態、finished で 200)
+POST /peer/runs/{run_id}/abort      AbortRun(冪等)            → AbortResult
+POST /peer/runs/{run_id}/ack        取得完了の明示 ACK(冪等)  → 204
 ```
 
 ### handshake(v2 から維持 + 判定変更)
@@ -59,8 +65,14 @@ hub が要求する capability の欠如。optional peer は partial 記録で�
 複数 app プロセスという正当な構成を拒否してしまう。
 
 - **host identity**(machine_id/boot_id hash): hoststats の
-  **host 単位 dedup に使う**(同一 host の複数 peer から hoststats を
-  二重計上しない)。拒否はしない
+  host 単位 dedup に使う(同一 host の複数 peer から hoststats を
+  二重計上しない)。拒否はしない。
+  **観測範囲を無視した dedup はしない(v5 修正)**: 同一ホストでも
+  host namespace の agent と container 内 visible-root の agent では
+  CPU/iowait/cgroup の観測値が異なる。dedup キーは
+  (host identity, namespace 群, cgroup_scope) とし、**集約の代表値には
+  明示的な host scope の agent だけを採用**する。host scope が無い場合は
+  代表値を出さず、各観測を scope 付きで並記する
 - **agent instance identity**(`agent_id`: 起動時に生成し DataDir に
   永続化する UUID + role/process 情報): **peer の識別に使う**。
   同一 agent_id の二重指定のみ設定エラー
@@ -84,43 +96,79 @@ participant #0 として peer と同一のコードパス・同一の順序で�
    required 不適合 → **reset を開始せず invalid + 503**
 2. 全 participant へ StartRun(run_id, nonce) を並列発行。各 participant は
    02 の StartRun(世代スワップ + baseline 同期採取)を実行し、
-   StartResult を ACK として返す
+   不変の StartResult を ACK として返す
 3. **全 required ACK が揃ってから** hub の `POST /reset` が応答する。
    required 失敗 → 503 + invalid(bench を開始させない)。optional → partial
+4. **部分開始からの回復(v5・CRITICAL 対応)**: required 失敗時、hub は
+   503 を返す**前に**、既に started になった全 participant へ
+   **AbortRun(run_id) を並列送信**する(冪等・失敗しても各 peer の
+   TTL で最終的に回収)。hub の invalid 記録には**部分開始 peer 一覧**と
+   各 abort の成否を含める。これにより「成功 peer が started に残って
+   次 run を 409 で拒否し続ける」停止状態を排除する。
+   **E2E 必須ケース: 部分開始 → abort → 次 run 成功**
 
-### FinishRun バリア(v4: 全 participant で同一順序)
+### FinishRun バリア(v5: 02 の終了契約を全 collector に適用)
 
-各 participant は**同じ順序**で終了処理を行う:
+v4 は freeze 対象が HTTP 世代と accesslog EOF だけで、
+sqlstats/counters(世代型)や procstats/sqlrows/dbpool/network/
+hoststats(baseline 型)の終了値を snapshot 生成時に読んでいたため、
+Finish 後の負荷や fetch 遅延が混入し得た。v5 は 02 の FinishRun 契約を
+そのまま使う:
 
-1. **freeze point の固定(高速・同期)**: HTTP 世代スワップ +
-   accesslog の EOF offset 記録。この時点が計測終了境界
-2. **固定点までの Drain(非同期可)**: 記録した offset までの
-   accesslog collect、旧世代 in-flight の確定
-3. **LocalSnapshot を run_id 付きで immutable に保存**し、FinishResult
-   (freeze point 実測時刻)を ACK として返す
+1. **freeze phase(高速・同期)**: 全 generation collector の
+   `Freeze`(sqlstats/counters を含む)+ 全 baseline collector の
+   `CaptureFinal`(procstats/sqlrows/dbpool/network/hoststats の
+   終了サンプル同期取得)。これが全セクション共通の計測終了境界
+2. participant は freeze 完了時点で **FinishAccepted**(collector 別
+   frozenAt / final SampledAt)を即 ACK する(Drain・snapshot 構築は
+   待たない — deadline 分離のため)
+3. background で frozen handle を Drain し、**固定値だけから**
+   LocalSnapshot を構築して immutable 保存(state=finished)
+4. hub は `GET /peer/runs/{run_id}` を **polling**(finishing 中は
+   202 + 状態、finished で 200 + LocalSnapshot)で取得する。
+   run_id 不一致は protocol error
+5. required の freeze 失敗 → invalid(部分開始と同様に abort 伝播)。
+   optional → partial
 
-hub は `POST /save` / `POST /collect` を起点に全 participant へ
-FinishRun(run_id) を並列発行し、required の ACK が揃ってから
-`GET /peer/runs/{run_id}` で取得する(run_id 不一致は protocol error)。
-required の finish 失敗 → invalid(得られた範囲は保持)。optional → partial。
-各 participant の計測区間は自身の StartResult / FinishResult の
-実測境界時刻で表示し、fetch 遅延は区間に影響しない。
+### deadline の分離(v5・HIGH 対応)
 
-### participant 状態機械と再試行(v4 新設)
+v4 は per-peer 2s / total 5s の単一 deadline に対し 02 の Drain 上限が
+10s で、正常な長寿命リクエストでも hub 側が先に timeout していた。
+
+| フェーズ | deadline |
+|---|---|
+| StartRun バリア(境界+baseline は同期・高速) | per-peer 3s / total 6s |
+| FinishRun freeze 受付(freeze phase のみ待つ) | per-peer 3s / total 6s |
+| snapshot polling(Drain 10s + 構築を含む) | per-peer 20s / total 30s |
+| fetch(200 応答の body 読み) | per-peer 5s |
+
+### participant 状態機械(v5: 遷移表で一意化)
 
 ```
-idle → started(StartRun 済) → finished(freeze+保存済) → acknowledged(hub 取得済)
+idle → started → finishing → finished → acknowledged
+  ↑        └──────┴─→ aborting → aborted ─┘(TTL/ack 後に破棄 → idle)
 ```
 
-- **冪等な再送**: 同一 run_id+nonce の StartRun / FinishRun 再送は
-  保存済みの同じ不変結果を返す(再実行しない)
-- **競合**: 別 run_id の StartRun が started/finished 中に来たら 409
-  (hub 側で先行 run を invalid にしてから明示的に新 run を開始する)。
-  finished 後の同一 run への StartRun 再送も 409
-- **保持**: LocalSnapshot は hub の ACK(acknowledged)または
-  TTL(10 分)まで保持し、**直近 2 run 分**を持つ(hub 障害後の
-  再取得を可能にする。v3 の「1 run のみ・即置換」を撤回)
-- nonce は「直近 1 件」ではなく **TTL 付き履歴**(10 分)で照合する
+**state × API の遷移表**(HTTP status と返却 DTO を一意に定義。
+v4 の「保存済み結果を返す」と「finished 後 409」の矛盾を解消):
+
+| state \ API | StartRun(同一 run_id+nonce) | StartRun(別 run_id) | FinishRun(同一) | FinishRun(別) | Abort(同一) | GET(同一) | Ack(同一) |
+|---|---|---|---|---|---|---|---|
+| idle | 200 保存済み StartResult(TTL 内) / 404(期限切れ) | 200 新規開始 | 404 | 404 | 200 no-op | 404 | 404 |
+| started | 200 保存済み StartResult | **409** | 202 freeze 実行 → FinishAccepted | 409 | 200 abort | 202(未 finish) | 409 |
+| finishing | 200 保存済み StartResult | 409 | 200 保存済み FinishAccepted | 409 | 200 abort | 202 + 状態 | 409 |
+| finished | 200 保存済み StartResult | 409(hub は先に Abort か Ack) | 200 保存済み FinishAccepted | 409 | 200 abort | 200 + LocalSnapshot | 204 → acknowledged |
+| aborted | 404(この run は不成立) | 200 新規開始 | 404 | 404 | 200 no-op | 410 + abort 理由 | 410 |
+
+- **同一 run_id+nonce の再送は常に保存済みの不変結果**(表の 200 系)。
+  「finished 後の同一 StartRun 再送も 409」は撤回し、冪等 200 に統一
+- 別 run_id は当該 run が終端状態(acknowledged/aborted/期限切れ)に
+  なるまで 409。hub は競合時に明示的に Abort してから新 run を開始する
+- **Ack API(v5 新設)**: `POST /peer/runs/{id}/ack`(冪等)。
+  hub が LocalSnapshot の受信・検証を終えた後に送る。
+  ack または TTL(10 分)で保持を解放する(acknowledged 状態の
+  「hub 取得済み」を peer 側が確定できなかった v4 の欠陥を解消)
+- 保持は直近 2 run 分 + nonce は TTL 付き履歴(v4 から維持)
 
 ## wire DTO と容量 budget
 
@@ -128,14 +176,16 @@ idle → started(StartRun 済) → finished(freeze+保存済) → acknowledged(h
 // LocalSnapshot: peer が保存・返却する自ホスト分のみの DTO。
 // Peers / Prev を含まない(再帰なし)。schema v4 で hub 側 Snapshot が
 // Peers map[string]*PeerResult を持つ。
-type PeerResult struct {
-    Info        PeerInfo      `json:"info"`
-    Reset       ResetResult   `json:"reset"`             // ResetRun の ACK(immutable)
-    Finish      FinishResult  `json:"finish"`
-    BoundarySendAck [2]time.Time `json:"boundary_send_ack"` // hub 観測の不確実性区間
-    Err         string        `json:"err,omitempty"`
-    Dropped     []string      `json:"dropped,omitempty"`
-    Local       *LocalSnapshot `json:"local,omitempty"`
+type PeerResult struct {                                     // v5: 02 の DTO と一対一
+    Info          PeerInfo       `json:"info"`
+    Start         StartResult    `json:"start"`               // StartRun の ACK(immutable)
+    Finish        FinishAccepted `json:"finish"`              // freeze 時刻群(immutable)
+    StartSendAck  [2]time.Time   `json:"start_send_ack"`      // hub 観測の不確実性区間(開始)
+    FinishSendAck [2]time.Time   `json:"finish_send_ack"`     // 同(終了)。単一配列に潰さない
+    Aborted       *AbortResult   `json:"aborted,omitempty"`
+    Err           string         `json:"err,omitempty"`
+    Dropped       []string       `json:"dropped,omitempty"`
+    Local         *LocalSnapshot `json:"local,omitempty"`
 }
 ```
 
@@ -170,7 +220,12 @@ budget(32MiB snapshot キャップ内、決定的優先順):
   ]
   ```
 
-  `driver` は必須項目。id は 01 の TargetID と同一の名前空間
+  `driver` は必須項目。id は 01 の TargetID と同一の名前空間。
+  **ファイルの安全性契約(v5)**: regular file であること・agent 実行
+  ユーザー所有・mode 0600・サイズ上限 64KiB を起動時に検証し、
+  symlink は拒否する。**DSN がログ・PeerInfo・snapshot・health の
+  いずれにも出力されないことをテストで固定する**(表示は 01 の
+  allowlist Display のみ)
 - 配布: **リリース tag 固定の事前 build 済み単一 binary + SHA-256
   checksum** を GitHub Releases に添付(make target で linux/amd64,
   arm64 を cross-build)。hub と agent は**同一 binary バージョン**を
@@ -178,8 +233,9 @@ budget(32MiB snapshot キャップ内、決定的優先順):
   `go run @latest` は例示にも使わない
 - bind は loopback 限定。peer 指定は literal loopback IP のみ
   (SSH トンネル強制)。redirect 禁止・Proxy 無効の専用 Transport・
-  header/body/展開後サイズ上限・並行度 4・per-peer 2s / total 5s
-  deadline・peer 数上限 8・重複 endpoint 拒否(v2 から維持)
+  header/body/展開後サイズ上限・並行度 4・peer 数上限 8・
+  重複 endpoint 拒否(v2 から維持)。deadline は**フェーズ別**
+  (「deadline の分離」の表を正とする — v5)
 
 ## E2E マトリクス(v2 から維持 + 追加)
 
@@ -189,6 +245,7 @@ budget(32MiB snapshot キャップ内、決定的優先順):
 - トポロジ: app+DB / app×2+DB / app+DB×4(shard)
 - 障害: peer 再起動、SSH トンネル切断、fetch timeout、version skew、
   reset 中の peer 障害、**finish 中の peer 障害と復旧**、
+  **部分開始 → AbortRun 伝播 → 次 run 成功(v5・必須)**、
   duplicate identity、32MiB 総上限、peer 数超過
 - 検証: 同一 run の全 peer 区間表示(境界時刻 + uncertainty)、
   invalid run で bench が開始されないこと、
@@ -197,15 +254,16 @@ budget(32MiB snapshot キャップ内、決定的優先順):
 
 ## 実装ステップ
 
-1. **ADR 作成・承認**(run プロトコル 2 バリア、invalid 契約、
-   LocalSnapshot/schema v4、budget 決定則、配布方式)— 2 日
+1. **ADR 作成・承認**(run lifecycle の wire 写像(Start/Finish/
+   Abort/Ack)、遷移表、invalid 契約、LocalSnapshot/schema v4、
+   budget 決定則、配布方式)— 2 日
 2. Phase A: agent binary + handshake + 複数 target — 3 日
-3. Phase B: ResetRun バリア(503/invalid 含む)— 3 日
-4. Phase C: FinishRun バリア + immutable run 取得 + budget — 4 日
+3. Phase B: StartRun バリア + **AbortRun 伝播**(503/invalid 含む)— 4 日
+4. Phase C: FinishRun freeze 受付 + polling 取得 + Ack/TTL + budget — 5 日
 5. E2E マトリクス + 配布(cross-build/checksum)+ docs — 3 日
 
-計 **15 日程度**。ADR は上記の分散終了契約(FinishRun)まで要件に
-含めた上でレビューに回す。
+計 **17 日程度**(v5: Abort/Ack と遷移表の追加で +2 日)。ADR は
+run lifecycle の完全な写像を要件に含めた上でレビューに回す。
 
 ## リスク
 

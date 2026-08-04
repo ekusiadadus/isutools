@@ -42,9 +42,16 @@
 ### TargetID
 
 ```go
-// 既定: 構造化 DSN から決定的に導出(接続順非依存)
-//   mysql tcp(db1:3306)/isuconp  →  "mysql-db1_3306-isuconp"
-// 同一 ID になる DSN は同一 target として dedup。
+// 既定の自動 ID(接続順非依存): 表示名と内部 ID を分離する(v5 修正)。
+//   表示名(alias): "mysql-db1_3306-isuconp"(人間可読 slug)
+//   内部 ID: alias + "-" + hash8
+//     hash8 = sha256(driver \x00 host \x00 port \x00 database)[:8]
+//     (credential を除いた canonical tuple から導出。slug への
+//      不可逆変換で別 DB が同名になる衝突を hash suffix で防ぐ)
+// 同一 canonical tuple → 同一 target として dedup。
+// **異なる canonical tuple が同一 ID になった場合は dedup せずエラー**
+// (04/06/09/10 の集計を壊すため。RegisterDBTarget の明示 ID どうしの
+//  衝突も同様にエラー)。
 
 // 明示命名(第一 API)。SQLDriverName より前に呼ぶ。
 // driverName は必須引数(v4 修正: MySQL DSN に driver 種別は含まれず、
@@ -80,11 +87,17 @@ type DSNFeatures struct {
 }
 func Features(id string) (f DSNFeatures, known bool)
 
-// Inspect: target 所有の inspector(MaxOpenConns(1)、再利用)で fn を実行。
-// fn には制限付き interface を渡す。*sql.DB は渡さない。
-// v4 修正: 素の *sql.Rows を返すと callback 外へ保持でき、唯一の接続を
-// 恒久的に pin できてしまう。Rows は追跡 wrapper で返し、Inspect の
-// return 時に未 Close の Rows を強制 Close する(以後の操作はエラー)。
+// Inspect: target 所有の inspector で fn を実行。
+// v5 修正: MaxOpenConns(1) の *sql.DB は「同一セッション」の保証には
+// ならない(接続断・再接続で session state(SET time_zone 等)が失われ、
+// 後続クエリが別セッションになり得る。connection-local state には
+// database/sql の Conn が必要)。
+// → Inspect は呼び出しごとに db.Conn(ctx) で専用 *sql.Conn を取得し、
+//   それを制限付き Querier で包んで fn に渡し、callback 終了時に必ず
+//   Close する。session 初期化(09 の SET time_zone 等)は
+//   この Conn 上で毎回行う。
+// v4 から維持: 素の *sql.Rows は返さない。Rows は追跡 wrapper で返し、
+// Inspect の return 時に未 Close の Rows を強制 Close する。
 type Querier interface {
     QueryContext(ctx context.Context, q string, args ...any) (Rows, error) // 追跡 wrapper
     QueryRowContext(ctx context.Context, q string, args ...any) Row

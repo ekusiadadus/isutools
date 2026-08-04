@@ -1,17 +1,19 @@
-# 計測ギャップ解消 実装計画 v4(2026-08-04 第3回レビュー反映版)
+# 計測ギャップ解消 実装計画 v5(2026-08-04 第4回レビュー反映版)
 
-初版(5fbe54c)→ v2(a3d26d9、基盤+機能へ再構成)→ v3(0a0c6ec、
-run 境界契約の導入)と改訂し、v3 も第3回レビューで CRITICAL 4 件により
-差し戻された。本 v4 は指示された修正順序
-(02 → 08 → 10 → 01 → 03/09 → 04/07/11 → README)に従う改訂である。
+初版(5fbe54c)→ v2(基盤+機能へ再構成)→ v3(run 境界契約)→
+v4(0b68d6c、2 契約分離)と改訂し、v4 も第4回レビューで CRITICAL 4 件
+(run 終了境界・部分失敗回復・自動 EXPLAIN 安全性)により差し戻された。
+本 v5 はレビューの承認条件
+「**02 に Start → Finish → Abort → Ack/Expire の完全な run lifecycle を
+定義し、それを 10 の wire protocol へ一対一で写す**」に従う改訂である。
 
-v4 の中核変更: 02 を **generation collector(世代スワップ)と
-baseline collector(基準値同期採取)の 2 契約**へ書き直し
-(新 run 冒頭の欠落を排除)、**遷移状態機械(Drain 完了まで 409)**、
-**不変 StartResult / PreviousRunResult の分離**、08 の
-**409 握り潰し禁止(待機 + 自 nonce 再 reset、失敗は 500)**、10 の
-**participant モデル(hub = participant #0、freeze point 固定 →
-固定点まで Drain の統一順序、状態機械 + TTL 保持)**。
+v5 の中核変更: 02 の collector 契約に **Freeze / CaptureFinal
+(全 collector 共通の終了境界)**と **handle を返す BeginBoundary**を
+定義し、run lifecycle を完全な状態機械(Abort・Ack/Expire 含む)にした。
+10 は Start/Finish/Abort/Ack を wire に一対一で写し、**遷移表・
+AbortRun による部分開始回復・freeze 受付 + polling の deadline 分離**を
+定義。09 は**最小権限 inspector ユーザー必須**(EXPLAIN SELECT でも
+stored function 経由の副作用があり得るため)。
 
 ## 調査根拠(レビューでの事実訂正を反映)
 
@@ -30,7 +32,7 @@ baseline collector(基準値同期採取)の 2 契約**へ書き直し
 | # | 計画 | 内容 | 解消する前提問題 |
 |---|---|---|---|
 | [01](./01-db-target-registry.md) | DB target registry | **安定 TargetID**(DSN 構造から決定的導出 + 明示登録)+ 接続1本の inspector + allowlist 表示 | shard 非対応・接続順命名の不安定・DSN(credential)の露出。04/06/09/10 の前提 |
-| [02](./02-reset-coordinator.md) | Reset coordinator | **二段階境界(BeginBoundary/Drain)**・409+nonce・singleton Controller・run_id/ResetResult | 自己デッドロック・並行 reset 汚染・世代境界の証拠欠如。08/10 の前提 |
+| [02](./02-reset-coordinator.md) | Run lifecycle coordinator | **完全な run lifecycle(Start/Finish/Abort/Ack/Expire)**・generation/baseline の 2 契約(handle 付き境界 + 全 collector 共通の終了 freeze)・409+nonce・singleton Controller・不変 StartResult | 自己デッドロック・冒頭欠落・終了境界の混入・部分失敗からの回復。08/10 の前提 |
 | [03](./03-hoststats.md) | hoststats | memory/disk/PSI/cgroup/ホスト同一性(namespace 含む) | 「OS 資源が見える」の過大表現の解消。10 の前提 |
 
 機能:
@@ -64,11 +66,13 @@ baseline collector(基準値同期採取)の 2 契約**へ書き直し
 ## リリース対応(見積もり v4 改訂: 全計画を計上 + buffer 数値化)
 
 ```
-v1.2.0: 01(2日) + 02(4日) + 04(2.5日)            = 実装 8.5 日 → +30% ≈ 11 日
+v1.2.0: 01(2日) + 02(5日) + 04(2.5日)            = 実装 9.5 日 → +30% ≈ 12.5 日
 v1.2.x: 03(2日) + 05(1.75日※) + 06(1日) + 11(1日) = 実装 5.75 日 → +30% ≈ 7.5 日
-v1.3.0: 07(2日) + 08(1.5日) + 09(2.5日)           = 実装 6 日 → +30% ≈ 8 日
-v1.4.0: 10                                        = 15 日 → +30% ≈ 19.5 日
+v1.3.0: 07(2日) + 08(1.5日) + 09(3日)             = 実装 6.5 日 → +30% ≈ 8.5 日
+v1.4.0: 10                                        = 17 日 → +30% ≈ 22 日
 ※ 05 は 11 から委譲された MTU 列 +0.25 日を含む
+(v5: 02 の Finish/Abort 契約 +1 日、09 の最小権限検証 +0.5 日、
+ 10 の Abort/Ack + 遷移表 +2 日を反映)
 ```
 
 buffer(+30%)は統合・機能単位 ABBA・ドキュメント・レビュー対応分。
@@ -84,10 +88,11 @@ buffer(+30%)は統合・機能単位 ABBA・ドキュメント・レビュー対
    `ISUTOOLS_BLOCK_RATE_NS` / `ISUTOOLS_HEAP_PROFILE`(07・**既定off**)、
    `ISUTOOLS_RESET_ON_INITIALIZE`(08・既定off)、
    `ISUTOOLS_EXPLAIN`(09・**既定off**)。
-   **例外(v4 で明文化)**: 設定ファイル・buildinfo の読み取りだけで
-   完結する静的 advisor check(11 の 3 check、既存の nginx/OS check 類)は
-   ランタイムコストがゼロのため専用 flag を要求しない。ランタイム観測・
-   追加クエリ・追加 I/O を伴う機能のみ flag 必須とする。
+   **例外(v4 で明文化、v5 で表現修正)**: 設定ファイル・buildinfo の
+   読み取りだけで完結する静的 advisor check(11 の 3 check、既存の
+   nginx/OS check 類)は、**ベンチ実行中の追加観測を行わない**
+   (設定 I/O と解析は境界時のみ)ため専用 flag を要求しない。
+   ランタイム観測・追加クエリ・追加 I/O を伴う機能のみ flag 必須とする。
 3. **機能単位 ABBA**: `examples/abba.sh` を拡張し、
    (a) 全機能 off vs 全機能 on、(b) baseline vs 単一機能 on、の両モードを
    サポートする。リリース tag 前に対象機能の (b) を必ず実施する。
@@ -167,4 +172,33 @@ buffer(+30%)は統合・機能単位 ABBA・ドキュメント・レビュー対
 | [MEDIUM] 重複 peer 判定が同一ホスト複数プロセスを拒否 | 10: host identity(hoststats dedup)と agent_id(peer 識別)の 2 層分離 |
 | [MEDIUM] backlog の解析単位 / https UDS 提案 | 11: listen endpoint(address:port)単位の保守的解析。https:// は UDS 対象外、前提条件 3 点を文言化 |
 | [MEDIUM] 依存図と 02 契約の不一致 | 本書: 依存種別(API / 実装順 / artifact 参照)付きの表へ書き換え |
-| [LOW] 見積もりに 11/MTU 欠落・buffer 非数値化・flag 例外未定義 | 本書: v1.2.x に 11+MTU を計上、全リリースの +30% を数値化(v1.4.0 ≈ 19.5 日)、静的 check の flag 例外を明文化 |
+| [LOW] 見積もりに 11/MTU 欠落・buffer 非数値化・flag 例外未定義 | 本書: v1.2.x に 11+MTU を計上、全リリースの +30% を数値化、静的 check の flag 例外を明文化 |
+
+## 第4回レビュー指摘(再差し戻し)→ v5 対応の対応表
+
+| 指摘(要約) | 対応 |
+|---|---|
+| [CRITICAL] GenerationHandle の取得手段がなく実装不能 | 02: `BeginBoundary → (handle, 実測時刻)` / `Freeze → (handle, 実測時刻)` に契約変更 |
+| [CRITICAL] Finish が HTTP/accesslog しか固定せず終了値に混入 | 02: 全 collector 共通の終了契約(世代型 Freeze + baseline 型 CaptureFinal)。immutable snapshot は固定値のみから構築。10 が一対一で使用 |
+| [CRITICAL] 部分開始 run を abort できず次計測が停止 | 02: AbortRun(冪等)+ aborting/aborted 状態。10: required 失敗時に hub が全 started peer へ AbortRun 伝播、部分開始一覧を記録、「部分開始→abort→次 run 成功」を E2E 必須化 |
+| [CRITICAL] EXPLAIN SELECT でも stored function 副作用があり得る | 09: 最小権限 inspector ユーザー必須(DML・EXECUTE なし)、SHOW GRANTS 検証、確認不能 target は skip、副作用 fixture テスト |
+| [HIGH] BeginBoundary 途中失敗が未定義 | 02: required/optional 区分、required 失敗は全切替完了後に invalid + seal、optional は partial |
+| [HIGH] Drain の ctx cancellation 契約なし(httpstats は無期限待機) | 02: ctx.Done() で必ず return + 旧世代を触る goroutine を残さない契約を conformance test で保証 |
+| [HIGH] finish の deadline(5s)と Drain 上限(10s)の矛盾 | 10: FinishRun を「freeze 受付 → polling」に変更し、start/finish-freeze/polling/fetch の deadline を分離 |
+| [HIGH] 再送 200 と 409 の矛盾 | 10: state × API × run_id × nonce の遷移表で HTTP status と DTO を一意化(同一 run 再送は常に冪等 200) |
+| [HIGH] acknowledged 状態に対応する ACK API がない | 10: 冪等 `POST /peer/runs/{id}/ack` を新設、ack または TTL で解放 |
+| [HIGH] MaxOpenConns(1) はセッション保証でない | 01: Inspect ごとに db.Conn(ctx) を取得し制限付き Querier で包み callback 終了時に Close。session 初期化は Conn 上で毎回実施 |
+| [HIGH] ResetNow が runID しか返さず partial を検知できない | 08: StartResult を返し、invalid は 500、partial は caller policy 必須(example を更新) |
+| [HIGH] hoststats dedup が観測範囲差を無視 | 10: dedup キーを (host identity, namespace, cgroup_scope) にし、代表値は明示 host scope のみ |
+| [HIGH] 自動 TargetID の slug 衝突が dedup される | 01: 表示 alias + canonical tuple 由来の hash suffix で内部 ID を分離。異 tuple の衝突はエラー |
+| [MEDIUM] wire DTO が旧 ResetResult / uncertainty 単一配列 | 10: PeerResult を Start/Finish + StartSendAck/FinishSendAck に更新 |
+| [MEDIUM] 04 に DB 側 UTC 取得がない | 04: baseline/final の前後で UTC_TIMESTAMP(6) を取得し before/after 区間を保存。09 は区間で保守的に鮮度判定 |
+| [MEDIUM] EXPLAIN 全列の nullability | 09: PlanRow を全列 pointer/sql.Null* 化 |
+| [MEDIUM] targets JSON の安全性契約なし | 10: regular file・所有者・0600・64KiB・symlink 拒否 + DSN 非出力テスト |
+| [MEDIUM] CGROUP_PATH の境界未定義 | 03: cgroup mount 相対のみ・絶対/../symlink escape 拒否 + fixture |
+| [MEDIUM] WatchDBPool の TargetID 未検証 | 06: registry 登録済み ID のみ受理 |
+| [MEDIUM] DIGEST_TEXT 取得に SCHEMA_NAME 条件なし | 04: (SCHEMA_NAME, DIGEST) 条件 + 複数 schema fixture |
+| [MEDIUM] 08 の旧 API 参照・旧テスト期待値 | 08: StartRun API へ統一、同時 initialize は「2 本とも成功・世代 2 回・最後の nonce 有効」へ修正 |
+| [MEDIUM] 07 の取得順序矛盾・budget 未定 | 07: 境界後の近似観測と明示、capture window を保存、StartRun budget 外 |
+| [MEDIUM] 11 の conf 連結では endpoint 解析不能 | 11: source/include を保持する保守的 parser を実装範囲に追加 + endpoint テスト群 |
+| [LOW] README の ResetResult 表記 / 静的 check の「コストゼロ」/ 07 の heap・手動削除残存 / 04 の risk 表先祖返り / 見積もり未再算定 | 各該当箇所を修正(本 v5 に反映済み) |
