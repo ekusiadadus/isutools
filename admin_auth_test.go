@@ -19,74 +19,59 @@ func TestIsLoopbackAdminAddr(t *testing.T) {
 	}
 }
 
-func TestProtectAdminKeepsLoopbackTokenFreeAndRequiresExplicitContainerOptIn(t *testing.T) {
+func TestProtectAdminIsSSHOnlyAndHasNoTokenMode(t *testing.T) {
 	next := &authTestHandler{}
-	if got, err := protectAdmin("127.0.0.1:19191", "", false, next); err != nil || got != next {
-		t.Fatalf("loopback protect = (%T, %v), want unchanged", got, err)
+	loopback, err := protectAdmin("127.0.0.1:19191", false, next)
+	if err != nil || loopback == nil {
+		t.Fatalf("loopback protect = (%T, %v), want handler", loopback, err)
 	}
-	// Docker commonly binds 0.0.0.0 inside the container while compose
-	// publishes only host 127.0.0.1. Require an explicit security opt-in.
-	if _, err := protectAdmin("0.0.0.0:19191", "", false, next); err == nil {
-		t.Fatal("tokenless non-loopback bind without explicit opt-in must fail closed")
+	if _, err := protectAdmin("0.0.0.0:19191", false, next); err == nil {
+		t.Fatal("non-loopback bind without explicit SSH/container opt-in must fail closed")
 	}
-	if got, err := protectAdmin("0.0.0.0:19191", "", true, next); err != nil || got != next {
-		t.Fatalf("explicit tokenless container bind = (%T, %v), want unchanged", got, err)
+	if got, err := protectAdmin("0.0.0.0:19191", true, next); err != nil || got == nil {
+		t.Fatalf("explicit SSH/container bind = (%T, %v), want handler", got, err)
 	}
 
-	protected, err := protectAdmin("0.0.0.0:19191", "correct horse", false, next)
-	if err != nil {
-		t.Fatalf("protect: %v", err)
-	}
-	for _, tc := range []struct {
-		authorization string
-		want          int
-	}{
-		{"", http.StatusUnauthorized},
-		{"Bearer wrong", http.StatusUnauthorized},
-		{"Basic YTpi", http.StatusUnauthorized},
-		{"Bearer correct horse", http.StatusNoContent},
-	} {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/json", nil)
-		req.Header.Set("Authorization", tc.authorization)
-		protected.ServeHTTP(rec, req)
-		if rec.Code != tc.want {
-			t.Errorf("Authorization %q: status = %d, want %d", tc.authorization, rec.Code, tc.want)
-		}
-		if tc.want == http.StatusUnauthorized && rec.Header().Get("WWW-Authenticate") == "" {
-			t.Error("401 response must advertise Bearer authentication")
-		}
+	// The old Bearer/query-token layer is intentionally gone. When reachability
+	// is allowed, requests pass through without application-level auth.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/json?token=ignored", nil)
+	req.Host = "localhost:19191"
+	loopback.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("SSH-only handler unexpectedly used token auth: status=%d cookies=%v", rec.Code, rec.Result().Cookies())
 	}
 }
 
-func TestProtectAdminAcceptsQueryTokenAndSetsCookie(t *testing.T) {
-	protected, err := protectAdmin("0.0.0.0:19191", "correct horse", false, &authTestHandler{})
+func TestSSHOnlyAdminRejectsCrossSiteBrowserRequests(t *testing.T) {
+	protected, err := protectAdmin("127.0.0.1:19191", false, &authTestHandler{})
 	if err != nil {
-		t.Fatalf("protect: %v", err)
+		t.Fatal(err)
 	}
-
-	rec := httptest.NewRecorder()
-	protected.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/?token=correct+horse", nil))
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("query token status = %d, want 204", rec.Code)
-	}
-	cookie := rec.Result().Cookies()
-	if len(cookie) == 0 || cookie[0].Value == "" || !cookie[0].HttpOnly {
-		t.Fatalf("valid query token must set an HttpOnly session cookie, got %v", cookie)
-	}
-
-	rec = httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/json", nil)
-	req.AddCookie(cookie[0])
-	protected.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("cookie auth status = %d, want 204", rec.Code)
-	}
-
-	rec = httptest.NewRecorder()
-	protected.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/?token=wrong", nil))
-	if rec.Code != http.StatusUnauthorized {
-		t.Errorf("wrong query token status = %d, want 401", rec.Code)
+	for _, tc := range []struct {
+		name       string
+		host       string
+		origin     string
+		fetchSite  string
+		wantStatus int
+	}{
+		{name: "curl", host: "127.0.0.1:19191", wantStatus: http.StatusNoContent},
+		{name: "same origin", host: "localhost:19191", origin: "http://localhost:19191", fetchSite: "same-origin", wantStatus: http.StatusNoContent},
+		{name: "foreign host", host: "evil.example", wantStatus: http.StatusForbidden},
+		{name: "foreign origin", host: "localhost:19191", origin: "https://evil.example", wantStatus: http.StatusForbidden},
+		{name: "cross site fetch", host: "localhost:19191", fetchSite: "cross-site", wantStatus: http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/reset", nil)
+			req.Host = tc.host
+			req.Header.Set("Origin", tc.origin)
+			req.Header.Set("Sec-Fetch-Site", tc.fetchSite)
+			protected.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"io"
+	"sync"
 	"testing"
 )
 
@@ -46,6 +47,7 @@ func (r *fakeRows) Next(dest []driver.Value) error {
 
 func init() {
 	sql.Register("isutoolsfake", fakeDriver{})
+	sql.Register("isutoolsconcurrentfake", fakeDriver{})
 }
 
 func TestRegisterAndObserveQueries(t *testing.T) {
@@ -58,7 +60,7 @@ func TestRegisterAndObserveQueries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	rows, err := db.Query("SELECT   1\nFROM t")
 	if err != nil {
@@ -66,7 +68,9 @@ func TestRegisterAndObserveQueries(t *testing.T) {
 	}
 	for rows.Next() {
 	}
-	rows.Close()
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := db.Exec("UPDATE t SET c = ?"); err != nil {
 		t.Fatalf("Exec: %v", err)
@@ -97,7 +101,7 @@ func TestFirstConnCapturesDSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := db.Ping(); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
@@ -125,5 +129,25 @@ func TestRegisterIsIdempotent(t *testing.T) {
 func TestRegisterUnknownDriverFails(t *testing.T) {
 	if err := Register("no-such-driver"); err == nil {
 		t.Fatal("want error for unknown driver, got nil")
+	}
+}
+
+func TestRegisterIsSafeUnderConcurrency(t *testing.T) {
+	const workers = 64
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- Register("isutoolsconcurrentfake")
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

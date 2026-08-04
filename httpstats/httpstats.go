@@ -87,10 +87,13 @@ type Snapshot []Entry
 // they cannot distort p95/avg. Active spans generations; the rest reset
 // with the generation.
 type ConnSnapshot struct {
-	Total      int64   `json:"total"`
-	Active     int64   `json:"active"`
-	AvgSeconds float64 `json:"avg_seconds"`
-	MaxSeconds float64 `json:"max_seconds"`
+	Total        int64   `json:"total"`
+	Active       int64   `json:"active"`
+	AvgSeconds   float64 `json:"avg_seconds"`
+	P95Seconds   float64 `json:"p95_seconds"`
+	MaxSeconds   float64 `json:"max_seconds"`
+	BytesRead    int64   `json:"bytes_read"`
+	BytesWritten int64   `json:"bytes_written"`
 }
 
 type identity struct {
@@ -135,11 +138,14 @@ type Collector struct {
 	maxKeys int
 	rules   []Rule
 
-	connMu     sync.Mutex
-	connTotal  int64
-	connActive int64
-	connDurSum time.Duration
-	connDurMax time.Duration
+	connMu      sync.Mutex
+	connTotal   int64
+	connActive  int64
+	connDurSum  time.Duration
+	connDurMax  time.Duration
+	connRead    int64
+	connWrote   int64
+	connBuckets [64]int64
 }
 
 // Default is used by the package-level Middleware helper.
@@ -207,13 +213,19 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g := c.begin()
 		start := time.Now()
+		tracker := &connectionTracker{collector: c, generation: g, started: start}
 		capture := &responseWriter{ResponseWriter: w}
-		wrapped := preserveOptionalInterfaces(capture)
-
-		wsRequested := strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
-		if wsRequested {
-			c.connStart()
+		capture.onCommit = func(status int) {
+			if status == http.StatusSwitchingProtocols ||
+				strings.HasPrefix(capture.Header().Get("Content-Type"), "text/event-stream") {
+				tracker.start(false)
+			}
 		}
+		capture.onHijack = func(conn net.Conn) net.Conn {
+			tracker.start(true)
+			return &trackedConn{Conn: conn, onClose: tracker.finishHijacked}
+		}
+		wrapped := preserveOptionalInterfaces(capture)
 
 		defer func() {
 			panicked := recover()
@@ -223,13 +235,12 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 			if capture.status == 0 {
 				capture.status = http.StatusOK
 			}
-			// Long-lived connections (WebSocket / SSE) go to the connection
-			// stats instead of the latency table: their multi-second
-			// lifetimes would otherwise destroy p95/avg.
-			sse := strings.HasPrefix(capture.ResponseWriter.Header().Get("Content-Type"), "text/event-stream")
-			if wsRequested || capture.status == http.StatusSwitchingProtocols || sse {
-				c.connFinish(wsRequested, time.Since(start))
-				c.release(g)
+			if strings.HasPrefix(capture.Header().Get("Content-Type"), "text/event-stream") {
+				tracker.start(false)
+			}
+			if tracker.finishHandler(capture.bytes) {
+				// Long-lived connections are released from the request generation
+				// as soon as they are confirmed, so Reset never waits for them.
 			} else {
 				id := identity{
 					method:   r.Method,
@@ -260,9 +271,31 @@ func (c *Collector) Snapshot() Snapshot {
 func (c *Collector) Connections() ConnSnapshot {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	snap := ConnSnapshot{Total: c.connTotal, Active: c.connActive}
+	snap := ConnSnapshot{
+		Total: c.connTotal, Active: c.connActive,
+		BytesRead: c.connRead, BytesWritten: c.connWrote,
+	}
 	if c.connTotal > 0 {
 		snap.AvgSeconds = c.connDurSum.Seconds() / float64(c.connTotal)
+		target := (c.connTotal*95 + 99) / 100
+		var seen int64
+		for bucket, count := range c.connBuckets {
+			seen += count
+			if count > 0 && seen >= target {
+				if bucket == 0 {
+					snap.P95Seconds = 0
+				} else if bucket == len(c.connBuckets)-1 {
+					snap.P95Seconds = c.connDurMax.Seconds()
+				} else {
+					upper := time.Duration(int64(1) << uint(bucket))
+					if upper > c.connDurMax {
+						upper = c.connDurMax
+					}
+					snap.P95Seconds = upper.Seconds()
+				}
+				break
+			}
+		}
 	}
 	snap.MaxSeconds = c.connDurMax.Seconds()
 	return snap
@@ -274,13 +307,18 @@ func (c *Collector) connStart() {
 	c.connMu.Unlock()
 }
 
-func (c *Collector) connFinish(started bool, d time.Duration) {
+func (c *Collector) connFinish(d time.Duration, bytesRead, bytesWritten int64) {
 	c.connMu.Lock()
-	if started {
-		c.connActive--
-	}
+	c.connActive--
 	c.connTotal++
 	c.connDurSum += d
+	bucket := bits.Len64(uint64(max(d.Nanoseconds(), 0)))
+	if bucket >= len(c.connBuckets) {
+		bucket = len(c.connBuckets) - 1
+	}
+	c.connBuckets[bucket]++
+	c.connRead += bytesRead
+	c.connWrote += bytesWritten
 	if d > c.connDurMax {
 		c.connDurMax = d
 	}
@@ -292,6 +330,8 @@ func (c *Collector) connFinish(started bool, d time.Duration) {
 func (c *Collector) Reset() Snapshot {
 	c.connMu.Lock()
 	c.connTotal, c.connDurSum, c.connDurMax = 0, 0, 0
+	c.connRead, c.connWrote = 0, 0
+	c.connBuckets = [64]int64{}
 	c.connMu.Unlock()
 	c.resetMu.Lock()
 	defer c.resetMu.Unlock()
@@ -331,6 +371,91 @@ func (c *Collector) finish(g *generation, id identity, duration time.Duration, r
 		c.changed.Broadcast()
 	}
 	c.mu.Unlock()
+}
+
+// connectionTracker owns the one-way transition from an ordinary request to
+// a confirmed long-lived connection. A requested Upgrade header alone is not
+// confirmation: rejected handshakes stay in the ordinary latency table.
+type connectionTracker struct {
+	mu         sync.Mutex
+	collector  *Collector
+	generation *generation
+	started    time.Time
+	long       bool
+	hijacked   bool
+	finished   bool
+}
+
+func (t *connectionTracker) start(hijacked bool) {
+	t.mu.Lock()
+	if t.long {
+		if hijacked {
+			t.hijacked = true
+		}
+		t.mu.Unlock()
+		return
+	}
+	t.long = true
+	t.hijacked = hijacked
+	t.mu.Unlock()
+	t.collector.connStart()
+	t.collector.release(t.generation)
+}
+
+func (t *connectionTracker) finishHandler(bytesWritten int64) bool {
+	t.mu.Lock()
+	if !t.long {
+		t.mu.Unlock()
+		return false
+	}
+	if t.hijacked || t.finished {
+		t.mu.Unlock()
+		return true
+	}
+	t.finished = true
+	t.mu.Unlock()
+	t.collector.connFinish(time.Since(t.started), 0, bytesWritten)
+	return true
+}
+
+func (t *connectionTracker) finishHijacked(bytesRead, bytesWritten int64) {
+	t.mu.Lock()
+	if t.finished {
+		t.mu.Unlock()
+		return
+	}
+	t.finished = true
+	t.mu.Unlock()
+	t.collector.connFinish(time.Since(t.started), bytesRead, bytesWritten)
+}
+
+type trackedConn struct {
+	net.Conn
+	read, wrote atomic.Int64
+	closeOnce   sync.Once
+	onClose     func(int64, int64)
+}
+
+func (c *trackedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.read.Add(int64(n))
+	return n, err
+}
+
+func (c *trackedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.wrote.Add(int64(n))
+	return n, err
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose(c.read.Load(), c.wrote.Load())
+		}
+	})
+	return err
 }
 
 func newTable(maxKeys int) *table {
@@ -460,6 +585,9 @@ func p95(s *stat) int64 {
 			if i == 0 {
 				return 0
 			}
+			if i == numBuckets-1 {
+				return s.max
+			}
 			return int64(1) << uint(i)
 		}
 	}
@@ -533,8 +661,10 @@ func isDecimal(value string) bool {
 
 type responseWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int64
+	status   int
+	bytes    int64
+	onCommit func(int)
+	onHijack func(net.Conn) net.Conn
 }
 
 func (w *responseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -548,6 +678,9 @@ func (w *responseWriter) WriteHeader(status int) {
 		return
 	}
 	w.status = status
+	if w.onCommit != nil {
+		w.onCommit(status)
+	}
 	w.ResponseWriter.WriteHeader(status)
 }
 
@@ -574,9 +707,18 @@ func (f flushFeature) Flush() {
 	f.f.Flush()
 }
 
-type hijackFeature struct{ h http.Hijacker }
+type hijackFeature struct {
+	h *responseWriter
+	u http.Hijacker
+}
 
-func (h hijackFeature) Hijack() (net.Conn, *bufio.ReadWriter, error) { return h.h.Hijack() }
+func (h hijackFeature) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := h.u.Hijack()
+	if err == nil && h.h.onHijack != nil {
+		conn = h.h.onHijack(conn)
+	}
+	return conn, rw, err
+}
 
 type pushFeature struct{ p http.Pusher }
 
@@ -613,7 +755,7 @@ func preserveOptionalInterfaces(w *responseWriter) http.ResponseWriter {
 		mask |= 8
 	}
 	ff := flushFeature{w: w, f: f}
-	hf := hijackFeature{h: h}
+	hf := hijackFeature{h: w, u: h}
 	pf := pushFeature{p: p}
 	rff := readFromFeature{w: w, rf: rf}
 	switch mask {

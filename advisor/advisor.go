@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/fs"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,11 +55,21 @@ type Options struct {
 	FS fs.FS
 	// GOMAXPROCS is runtime.GOMAXPROCS(0); 0 skips the check.
 	GOMAXPROCS int
+	// Protocol supplies HTTP/3/QUIC readiness evidence. Configuration content
+	// is inspected locally; off-host network and edge facts must be explicit.
+	Protocol ProtocolOptions
+	// Cache supplies application-side cache telemetry (memcached/redis
+	// stats); nil skips the check. CacheError records why it could not be
+	// read.
+	Cache      *CacheTelemetry
+	CacheError string
 }
 
 var statusRank = map[Status]int{
 	StatusMissing: 0, StatusWarn: 1, StatusInfo: 2, StatusOK: 3, StatusSkip: 4,
 }
+
+var nginxUpstreamKeepalive = regexp.MustCompile(`(?m)(?:^|[;{}])\s*keepalive\s+[0-9]+\s*;`)
 
 // Collect runs every check and returns findings sorted most-severe first.
 func Collect(ctx context.Context, opts Options) []Check {
@@ -68,6 +79,10 @@ func Collect(ctx context.Context, opts Options) []Check {
 	checks = append(checks, checkNginx(opts)...)
 	checks = append(checks, checkOS(opts)...)
 	checks = append(checks, checkGOMAXPROCS(opts))
+	checks = append(checks, checkHTTP3(opts)...)
+	checks = append(checks, checkResponseCache(opts)...)
+	checks = append(checks, cacheHealthCheck(opts.Cache, opts.CacheError))
+	checks = append(checks, checkECH(opts)...)
 	sort.SliceStable(checks, func(i, j int) bool {
 		return statusRank[checks[i].Status] < statusRank[checks[j].Status]
 	})
@@ -172,7 +187,7 @@ func checkNginx(opts Options) []Check {
 	set(0, strings.Contains(conf, "gzip on"),
 		"gzip 未設定(HTML/JSON が非圧縮で転送)",
 		"http コンテキストに gzip on; gzip_types text/css application/json application/javascript; を追加")
-	set(1, strings.Contains(conf, "keepalive"),
+	set(1, nginxUpstreamKeepalive.MatchString(conf),
 		"upstream keepalive なし(リクエスト毎に TCP 再接続 → 高RPSで502)",
 		"upstream ブロックに keepalive 64; + proxy_http_version 1.1 + Connection \"\"")
 	wc := 0
@@ -336,5 +351,5 @@ func readNofileSoftLimit(fsys fs.FS) (uint64, error) {
 			}
 		}
 	}
-	return 0, fmt.Errorf("Max open files not found")
+	return 0, fmt.Errorf("max open files not found")
 }

@@ -1,6 +1,6 @@
-// Package accesslog parses and aggregates explicitly configured nginx access
-// logs. Collection is pull based, so it adds no work to an application's HTTP
-// request path.
+// Package accesslog parses and aggregates explicitly configured nginx LTSV,
+// flat JSON, Caddy native JSON, and explicit Apache JSON access logs.
+// Collection is pull based, so it adds no work to an application's HTTP path.
 package accesslog
 
 import (
@@ -12,11 +12,19 @@ import (
 	"time"
 )
 
-// Record is one parsed nginx isutools LTSV record.
+const (
+	maxSessionBytes  = 128
+	maxScenarioBytes = 64
+)
+
+// Record is one normalized access-log record.
 type Record struct {
 	Method string `json:"method"`
 	URI    string `json:"uri"`
-	Status int    `json:"status"`
+	// Protocol is the client-facing HTTP protocol reported by the proxy.
+	// It is optional so existing access-log formats remain compatible.
+	Protocol string `json:"protocol,omitempty"`
+	Status   int    `json:"status"`
 
 	RequestTime time.Duration `json:"request_time_ns"`
 	Bytes       int64         `json:"bytes"`
@@ -33,6 +41,9 @@ type Record struct {
 	// Session is a pseudonymous session fragment (sess: field) used for
 	// user-flow aggregation. Never a full cookie value.
 	Session string `json:"session,omitempty"`
+	// Scenario is a caller-supplied, non-secret story label such as
+	// "login_and_browse". It is never inferred from authentication material.
+	Scenario string `json:"scenario,omitempty"`
 
 	QueryStripped bool   `json:"query_stripped,omitempty"`
 	Partial       bool   `json:"partial,omitempty"`
@@ -78,21 +89,34 @@ func ParseLine(line string) (Record, error) {
 
 // jsonAliases maps alp's default JSON key names to isutools field names.
 var jsonAliases = map[string]string{
-	"body_bytes":    "bytes",
-	"response_time": "reqtime",
-	"upstream_time": "upstime",
+	"body_bytes":       "bytes",
+	"response_time":    "reqtime",
+	"upstream_time":    "upstime",
+	"protocol":         "proto",
+	"request_protocol": "proto",
 }
 
-// ParseNginxJSON parses one JSON-object access-log line. Both isutools key
-// names (method/uri/status/reqtime/upstime/bytes/cache/ctype) and alp's
-// defaults (body_bytes/response_time) are accepted. Missing optional fields
-// default: bytes 0, upstime "-", empty cache/ctype.
+// ParseNginxJSON parses one JSON-object access-log line. The name is retained
+// for compatibility; flat isutools/alp JSON and Caddy native JSON are accepted.
+// Missing optional fields default to bytes 0, upstime "-", empty cache/ctype.
 func ParseNginxJSON(line string) (Record, error) {
 	raw := map[string]any{}
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
 		return Record{}, fmt.Errorf("accesslog: invalid JSON line: %w", err)
 	}
 	fields := make(map[string]string, len(raw))
+	// Caddy's native access log nests client request fields. Flatten only the
+	// bounded fields isutools understands; unknown and sensitive headers remain
+	// ignored.
+	if request, ok := raw["request"].(map[string]any); ok {
+		copyJSONScalar(fields, "method", request["method"])
+		copyJSONScalar(fields, "uri", request["uri"])
+		copyJSONScalar(fields, "proto", request["proto"])
+		if headers, ok := request["headers"].(map[string]any); ok {
+			copyFirstJSONHeader(fields, "sess", headers, "X-Isutools-Session")
+			copyFirstJSONHeader(fields, "scenario", headers, "X-Isutools-Scenario")
+		}
+	}
 	for key, value := range raw {
 		if alias, ok := jsonAliases[key]; ok {
 			key = alias
@@ -104,6 +128,26 @@ func ParseNginxJSON(line string) (Record, error) {
 			fields[key] = strconv.FormatFloat(v, 'f', -1, 64)
 		case bool:
 			fields[key] = strconv.FormatBool(v)
+		}
+	}
+	if _, ok := fields["reqtime"]; !ok {
+		copyJSONScalar(fields, "reqtime", raw["duration"])
+	}
+	if _, ok := fields["bytes"]; !ok {
+		copyJSONScalar(fields, "bytes", raw["size"])
+	}
+	if headers, ok := raw["resp_headers"].(map[string]any); ok {
+		if values, ok := headers["Content-Type"].([]any); ok && len(values) > 0 {
+			copyJSONScalar(fields, "ctype", values[0])
+		}
+	}
+	if _, ok := fields["reqtime"]; !ok {
+		if micros, exists := fields["reqtime_us"]; exists {
+			value, err := strconv.ParseFloat(micros, 64)
+			if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				return Record{}, fmt.Errorf("accesslog: invalid reqtime_us %q", micros)
+			}
+			fields["reqtime"] = strconv.FormatFloat(value/1e6, 'f', -1, 64)
 		}
 	}
 	for _, name := range []string{"method", "uri", "status", "reqtime"} {
@@ -118,6 +162,30 @@ func ParseNginxJSON(line string) (Record, error) {
 		fields["upstime"] = "-"
 	}
 	return recordFromFields(fields)
+}
+
+func copyJSONScalar(fields map[string]string, key string, value any) {
+	switch v := value.(type) {
+	case string:
+		fields[key] = v
+	case float64:
+		fields[key] = strconv.FormatFloat(v, 'f', -1, 64)
+	case bool:
+		fields[key] = strconv.FormatBool(v)
+	}
+}
+
+func copyFirstJSONHeader(fields map[string]string, key string, headers map[string]any, name string) {
+	for headerName, raw := range headers {
+		if !strings.EqualFold(headerName, name) {
+			continue
+		}
+		values, ok := raw.([]any)
+		if ok && len(values) > 0 {
+			copyJSONScalar(fields, key, values[0])
+		}
+		return
+	}
 }
 
 // recordFromFields builds a Record from normalized field values, shared by
@@ -149,10 +217,16 @@ func recordFromFields(fields map[string]string) (Record, error) {
 	if sess == "-" {
 		sess = ""
 	}
+	scenario := fields["scenario"]
+	if scenario == "-" {
+		scenario = ""
+	}
 	rec := Record{
 		Session:       sess,
+		Scenario:      scenario,
 		Method:        fields["method"],
 		URI:           cleanURI,
+		Protocol:      canonicalProtocol(fields["proto"]),
 		Status:        status,
 		RequestTime:   reqtime,
 		Bytes:         bytes,
@@ -161,9 +235,16 @@ func recordFromFields(fields map[string]string) (Record, error) {
 		UpstreamRaw:   fields["upstime"],
 		QueryStripped: stripped,
 	}
+	if sess != "" && !validSession(sess) {
+		rec.Session = ""
+		appendIssue(&rec, "sess was not a bounded pseudonymous identifier and was discarded")
+	}
+	if rec.Scenario != "" && !validScenario(rec.Scenario) {
+		rec.Scenario = ""
+		appendIssue(&rec, "scenario was not a bounded non-secret identifier and was discarded")
+	}
 	if stripped {
-		rec.Partial = true
-		rec.Issue = "uri contained a query string; query was stripped"
+		appendIssue(&rec, "uri contained a query string; query was stripped")
 	}
 
 	total, attempts, complete, noTiming, err := parseUpstream(fields["upstime"])
@@ -173,14 +254,60 @@ func recordFromFields(fields map[string]string) (Record, error) {
 	rec.NoUpstreamTiming = noTiming
 	rec.UpstreamValid = err == nil
 	if err != nil {
-		rec.Partial = true
-		if rec.Issue == "" {
-			rec.Issue = err.Error()
-		} else {
-			rec.Issue += "; " + err.Error()
-		}
+		appendIssue(&rec, err.Error())
 	}
 	return rec, nil
+}
+
+func canonicalProtocol(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "HTTP/1", "HTTP/1.0", "H1":
+		return "HTTP/1.0"
+	case "HTTP/1.1", "H1.1":
+		return "HTTP/1.1"
+	case "HTTP/2", "HTTP/2.0", "H2":
+		return "HTTP/2.0"
+	case "HTTP/3", "HTTP/3.0", "H3":
+		return "HTTP/3.0"
+	case "":
+		return ""
+	default:
+		return "(other)"
+	}
+}
+
+func validSession(value string) bool {
+	return validSafeIdentifier(value, maxSessionBytes)
+}
+
+func validScenario(value string) bool {
+	return validSafeIdentifier(value, maxScenarioBytes)
+}
+
+func validSafeIdentifier(value string, maxBytes int) bool {
+	if value == "" || len(value) > maxBytes {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if !isSafeSessionByte(value[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isSafeSessionByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || strings.ContainsRune("._~-", rune(c))
+}
+
+func appendIssue(rec *Record, issue string) {
+	rec.Partial = true
+	if rec.Issue == "" {
+		rec.Issue = issue
+	} else {
+		rec.Issue += "; " + issue
+	}
 }
 
 func parseUpstream(raw string) (total time.Duration, attempts int, complete, noTiming bool, err error) {

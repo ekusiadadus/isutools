@@ -6,13 +6,22 @@ on:
   pull_request:
 
 jobs:
+  go-1-24-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - run: go test ./...
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: "stable"
       - name: vet
         run: go vet ./...
       - name: test (race)
@@ -22,6 +31,10 @@ jobs:
           total=$(go tool cover -func=cover.out | awk '/^total:/ {sub("%","",$3); print $3}')
           echo "total coverage: ${total}%"
           awk -v t="$total" 'BEGIN { exit (t < 80) }'
+      - name: ABBA script contract
+        run: |
+          bash -n examples/abba.sh examples/abba_test.sh
+          bash examples/abba_test.sh
       # Informational only: shared runners are too noisy for a hard latency
       # gate. The real overhead gate is the on/off benchmark comparison on
       # the target host before tagging a release (DESIGN.md §7).

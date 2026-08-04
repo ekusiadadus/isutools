@@ -2,6 +2,9 @@
 
 Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.0.0**
 
+`v1.0.0` tag = `faa7ca8`. The fixes under “post-release hardening” below are
+currently local/unreleased changes and must not be attributed to that tag.
+
 ## Implemented and released
 
 - **M1 (v0.1.0)**: bounded SQL aggregation (sharded, log2-bucket p95), literal
@@ -9,9 +12,8 @@ Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.0.0**
 - **v0.2.x**: dashboard + snapshot persistence (`POST /save`, `GET /files/`),
   MySQL/MariaDB schema capture (dbinspect via the first observed DSN),
   collector health / `partial`, generation-scoped SQL store, serialized reset,
-  admin auth 3 modes (loopback free / Bearer+`?token=`+cookie / explicit
-  `ISUTOOLS_ALLOW_UNAUTHENTICATED=1` opt-in for SSH-tunnel +
-  `127.0.0.1`-publish Docker topologies)
+  historical admin auth modes (the post-release working tree removes
+  Bearer/query-token auth and standardizes on SSH-only reachability)
 - **M2 (v0.2.x)**: HTTP middleware (h1/h2), nginx LTSV delta tailer with
   rotation handling and bounded `POST /collect`, Linux reset-to-snapshot
   procstats (PID-reuse detection, top 1core=100% convention)
@@ -40,12 +42,17 @@ Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.0.0**
 
 ## Test evidence
 
-Every release: `go vet ./...` PASS, `go test -race ./...` PASS (12 packages),
-aggregate coverage 86%+ (per-package floor 81%+). CI enforces vet + race +
-80% coverage gate; benchmarks are informational
-(`BenchmarkObserve` ~164ns/op, 0 allocs, worst-case single hot key ×8 threads).
-The access-log parser also passed fuzzing. A real TLS HTTP/2 listener test is
-environment-gated; the protocol label path is covered with `HTTP/2.0` requests.
+Current working tree verification (2026-08-04, Go 1.26.5): `go vet ./...` PASS,
+`go test -race -shuffle=on -coverprofile=... ./...` PASS (14 packages), aggregate
+coverage **85.0%**. Package coverage is not uniformly 80%: the root package is
+70.7%; CI enforces the documented **aggregate** 80% gate and separately runs
+`go test ./...` on Go 1.24.x. `golangci-lint run ./...` reports 0 issues,
+`govulncheck ./...` reports no known vulnerabilities, and the access-log parser
+completed a 10-second fuzz run (~761k executions) without a failure.
+`BenchmarkObserve` was 153.2 ns/op, 0 B/op, 0 allocs/op on Apple M3.
+
+A real TLS HTTP/2 listener, HTTP/3 listener, deployed target, and physical/remote
+benchmark are not implied by those local results.
 
 ## Field verification (private-isu, WSL2 Docker, 2026-08-03..04)
 
@@ -62,9 +69,9 @@ with snapshots, JSON, and CPU profiles archived per run:
 | + write-through placement fix | 111,756 | httpstats: app-served images collapse |
 | + db pool / GOMAXPROCS / nginx keepalive | **299,668** | cpuTotal 11.6% busy vs per-process caps (server 84%/1core); 502 storm diagnosed from bench fails |
 
-## v1.0.0 release gate: ABBA overhead measurement
+## Historical v1.0.0 ABBA observation (not a complete release gate)
 
-Ran on private-isu (2026-08-04, same binary, same host, off→on→on→off):
+Recorded on private-isu (2026-08-04, off→on→on→off):
 
 ```text
 mode=off score=361203
@@ -75,9 +82,40 @@ off avg: 360968 / on avg: 363045
 ABBA overhead: -0.58% (gate: < 2%) -> PASS
 ```
 
-Measurement enabled is indistinguishable from disabled at ~360k score
-(the -0.58% delta is run-to-run noise). The gate script is
-`examples/abba.sh`.
+This four-run score observation has only one ABBA block, no p95/error-rate
+series, no confidence interval, and no archived binary fingerprint. It is
+therefore useful historical evidence but cannot establish “zero overhead” or
+satisfy the release-gate contract in DESIGN.md §7. Also, the evidence commit
+`9924ddc` is 11 minutes newer than tag `v1.0.0` (`faa7ca8`).
+
+The hardened `examples/abba.sh` now requires at least three blocks, fixed
+warm-up, a stable binary/image fingerprint, score/p95/error rate, TSV
+provenance, and paired 95% CI gates. It has passed its local script contract;
+it has **not yet been rerun on private-isu**.
+
+## Post-release hardening in the current working tree (unreleased)
+
+- SQL normalization removes all comments, masks PG dollar quotes and
+  hex/binary/scientific literals, bounds safe tags and the final identity
+- confirmed WebSocket/SSE connections detach from reset generations; rejected
+  upgrades stay in HTTP; Hijack close/wire bytes and duration p95 are tracked
+- run IDs are collision-free, legacy ambiguous IDs fail explicitly, snapshots
+  and reads are size-bounded, and concurrent mutations fail fast
+- counter/session/flow identities are bounded and surface dropped/partial health
+- access-log collection has context and per-call byte limits; nginx LTSV/JSON
+  and explicit Apache JSON `%D` microseconds are documented
+- diff separates total/count/avg and does not color unequal-count totals as an
+  improvement; health recovers after successful collect/reset
+- DB driver, nginx/Apache, pprof/procstats/k6 prerequisites are documented in
+  `docs/INTEGRATION.md`
+- HTTP/3/QUIC readiness advisor inspects nginx/Caddy/Envoy config, local
+  UDP/443, explicit edge/network evidence, client-facing protocol traffic,
+  and optional retransmit/drop counters; it does not claim a real listener test
+- scenario stories group bounded `METHOD URI` journeys by explicit non-secret
+  scenario label and pseudonymous session; raw authentication data is rejected
+- the retained Bearer/query-token implementation was removed to match the
+  authoritative SSH-only security decision; non-loopback remains explicit
+  opt-in and fail-closed otherwise
 
 ## Resolved in v1.0.0 (previously "known hardening gaps") (tracked for v1.0 — see DESIGN.md §10.5)
 
@@ -85,8 +123,9 @@ Measurement enabled is indistinguishable from disabled at ~360k score
 2. ~~snapshot diff view~~ → `GET /diff?a=&b=` (v1.0.0)
 3. ~~counter/gauge API~~ → `isutools.Count`/`AddCount` (v0.7.0)
 4. ~~WS/SSE separation~~ → connection stats + active gauge (v0.7.0)
-5. ~~save caps~~ → serialized saves (v1.0.0); collect was already bounded
-6. ~~ABBA gate~~ → `examples/abba.sh`, passed at -0.58% (above)
+5. ~~save caps~~ → initial serialization in v1.0.0; size/concurrency/read caps
+   completed in the unreleased hardening tree
+6. ~~ABBA template~~ → hardened locally; remote multi-block gate still pending
 7. cross-collector shared generation gate — still open (1.x): benchmark
    automation must wait for `POST /reset` to return before load starts
    (the reference bench.sh does)

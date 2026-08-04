@@ -5,6 +5,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -35,6 +36,13 @@ var reportTZ = time.FixedZone("JST", 9*60*60)
 // schemaVersion identifies the Snapshot JSON layout for downstream tooling.
 const schemaVersion = 3
 
+const (
+	defaultInspectionTimeout = 5 * time.Second
+	maxSnapshotBytes         = 32 << 20
+)
+
+var errSnapshotTooLarge = errors.New("snapshot exceeds 32 MiB limit")
+
 type sqlSnapshotter interface {
 	Snapshot() []agg.Entry
 }
@@ -52,6 +60,10 @@ type accessLogCollector interface {
 
 type stableAccessLogCollector interface {
 	CollectUntilStable(context.Context, time.Duration, time.Duration) error
+}
+
+type contextAccessLogCollector interface {
+	CollectContext(context.Context) error
 }
 
 type processCollector interface {
@@ -73,13 +85,24 @@ type Provider struct {
 	AccessLogQuiet time.Duration
 	AccessLogPoll  time.Duration
 	CollectTimeout time.Duration
-	Proc           processCollector
+	// InspectionTimeout bounds the context passed to DB and Advisor callbacks.
+	InspectionTimeout time.Duration
+	Proc              processCollector
 	// DB captures the database schema (tables/indexes). Called at handler
 	// startup and on every reset so each generation records the pre-run state.
 	DB func(context.Context) *dbinspect.Schema
 	// Advisor reports well-known settings that are not configured. Captured
 	// alongside the DB schema at startup and on every reset.
 	Advisor func(context.Context) []advisor.Check
+	// CacheTelemetry is evaluated at snapshot time so application cache
+	// hit/miss/eviction counters can match the measured interval.
+	CacheTelemetry func() (*advisor.CacheTelemetry, error)
+	// QUICTelemetry is evaluated at snapshot time so packet counters can match
+	// the completed benchmark interval rather than handler startup.
+	QUICTelemetry func() (*advisor.QUICTelemetry, error)
+	// ProtocolTrafficClientFacing is false when a CDN/LB terminates the client
+	// connection before the locally collected access log.
+	ProtocolTrafficClientFacing *bool
 	// Counters exposes user-defined counters (isutools.Count). Reset per
 	// generation.
 	Counters interface {
@@ -133,7 +156,8 @@ type handler struct {
 	mu         sync.Mutex
 	resetMu    sync.Mutex
 	prev       *Snapshot
-	saveMu     sync.Mutex
+	runSeq     atomic.Uint64
+	operation  chan struct{}
 	curDB      *dbinspect.Schema
 	curAdvisor []advisor.Check
 }
@@ -143,7 +167,7 @@ type handler struct {
 // GET /snapshot.html, GET /json, GET /files/<name>,
 // POST /reset, POST /collect, POST /save.
 func NewHandler(p Provider) http.Handler {
-	h := &handler{p: p}
+	h := &handler{p: p, operation: make(chan struct{}, 1)}
 	h.gen.Store(1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.root)
@@ -163,11 +187,19 @@ func NewHandler(p Provider) http.Handler {
 func (h *handler) captureDB() {
 	var schema *dbinspect.Schema
 	var checks []advisor.Check
+	timeout := h.p.InspectionTimeout
+	if timeout <= 0 {
+		timeout = defaultInspectionTimeout
+	}
 	if h.p.DB != nil {
-		schema = h.p.DB(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		schema = h.p.DB(ctx)
+		cancel()
 	}
 	if h.p.Advisor != nil {
-		checks = h.p.Advisor(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		checks = h.p.Advisor(ctx)
+		cancel()
 	}
 	if schema == nil && checks == nil {
 		return
@@ -232,6 +264,13 @@ func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries [
 	}
 	if h.p.Counters != nil {
 		snap.Counters = h.p.Counters.Snapshot()
+		if dropped, ok := h.p.Counters.(interface{ Dropped() uint64 }); ok && dropped.Dropped() > 0 {
+			snap.Meta.Partial = true
+			upsertHealth(&snap.Meta, health.Entry{
+				Collector: "counters", Status: health.StatusDegraded,
+				Message: "name limit exceeded; identities merged into (other)", Dropped: dropped.Dropped(),
+			})
+		}
 	}
 	if hc, ok := h.p.HTTP.(interface{ Connections() httpstats.ConnSnapshot }); ok && h.p.HTTP != nil {
 		conns := hc.Connections()
@@ -262,12 +301,85 @@ func (h *handler) take() Snapshot {
 		snap.Proc = &value
 		applyProcHealth(&snap.Meta, value.Health)
 	}
+	h.applyProtocolAdvice(&snap)
+	h.applyQUICTelemetry(&snap)
+	h.applyCacheTelemetry(&snap)
 	return snap
 }
 
+func applyProtocolAdvice(snap *Snapshot) {
+	applyProtocolAdviceWithSource(snap, true)
+}
+
+func (h *handler) applyProtocolAdvice(snap *Snapshot) {
+	clientFacing := true
+	if h.p.ProtocolTrafficClientFacing != nil {
+		clientFacing = *h.p.ProtocolTrafficClientFacing
+	}
+	applyProtocolAdviceWithSource(snap, clientFacing)
+}
+
+func applyProtocolAdviceWithSource(snap *Snapshot, clientFacing bool) {
+	samples := []advisor.ProtocolSample(nil)
+	source := ""
+	if snap.AccessLog != nil && len(snap.AccessLog.Protocols) > 0 {
+		if clientFacing {
+			source = "proxy access log"
+		} else {
+			source = "origin proxy access log (edge declared)"
+		}
+		samples = make([]advisor.ProtocolSample, 0, len(snap.AccessLog.Protocols))
+		for _, entry := range snap.AccessLog.Protocols {
+			samples = append(samples, advisor.ProtocolSample{
+				Protocol: entry.Protocol, Count: entry.Count,
+				Errors: entry.Status5xx, P95: entry.RequestP95,
+			})
+		}
+	} else if len(snap.HTTP) > 0 {
+		source = "application middleware"
+		samples = make([]advisor.ProtocolSample, 0, len(snap.HTTP))
+		for _, entry := range snap.HTTP {
+			errors := int64(0)
+			if entry.Status >= 500 {
+				errors = entry.Count
+			}
+			samples = append(samples, advisor.ProtocolSample{
+				Protocol: entry.Protocol, Count: entry.Count,
+				Errors: errors, P95: entry.P95,
+			})
+		}
+	}
+	snap.Advisor = advisor.WithProtocolTrafficEvidence(snap.Advisor, source, clientFacing, samples)
+}
+
+func (h *handler) applyQUICTelemetry(snap *Snapshot) {
+	if h.p.QUICTelemetry == nil {
+		return
+	}
+	telemetry, err := h.p.QUICTelemetry()
+	applyQUICTelemetry(snap, telemetry, err)
+}
+
+func applyQUICTelemetry(snap *Snapshot, telemetry *advisor.QUICTelemetry, err error) {
+	snap.Advisor = advisor.WithQUICTelemetry(snap.Advisor, telemetry, err)
+}
+
+func (h *handler) applyCacheTelemetry(snap *Snapshot) {
+	if h.p.CacheTelemetry == nil {
+		return
+	}
+	telemetry, err := h.p.CacheTelemetry()
+	applyCacheTelemetry(snap, telemetry, err)
+}
+
+func applyCacheTelemetry(snap *Snapshot, telemetry *advisor.CacheTelemetry, err error) {
+	snap.Advisor = advisor.WithCacheTelemetry(snap.Advisor, telemetry, err)
+}
+
 // runIDPattern is the timestamp id embedded at the start of persisted
-// snapshot names (e.g. 20260803-140100).
-var runIDPattern = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}$`)
+// snapshot names. Old second-resolution IDs remain readable; new IDs include
+// nanoseconds and a per-handler sequence to prevent overwrite collisions.
+var runIDPattern = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}(?:\.[0-9]{9}-[0-9]{6,})?$`)
 
 // root serves the run index at "/" and stored run details at "/<run-id>".
 func (h *handler) root(w http.ResponseWriter, r *http.Request) {
@@ -283,13 +395,20 @@ func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	matches := make([]string, 0, 1)
 	for _, name := range h.listFiles() {
 		if strings.HasPrefix(name, id+"_") {
-			http.ServeFile(w, r, filepath.Join(h.p.DataDir, name))
-			return
+			matches = append(matches, name)
 		}
 	}
-	http.NotFound(w, r)
+	switch len(matches) {
+	case 0:
+		http.NotFound(w, r)
+	case 1:
+		http.ServeFile(w, r, filepath.Join(h.p.DataDir, matches[0]))
+	default:
+		http.Error(w, "run id is ambiguous; use a collision-free saved run", http.StatusConflict)
+	}
 }
 
 func (h *handler) index(w http.ResponseWriter) {
@@ -335,7 +454,7 @@ func (h *handler) listRuns() []runEntry {
 			continue
 		}
 		run := runEntry{ID: parts[0], Label: parts[0], File: name, JSON: base + ".json"}
-		if ts, err := time.Parse("20060102-150405", parts[0]); err == nil {
+		if ts, err := time.Parse("20060102-150405", parts[0][:15]); err == nil {
 			run.Label = ts.Format("2006-01-02 15:04:05")
 		}
 		for _, part := range parts[1:] {
@@ -410,23 +529,36 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ISUTOOLS_DATA_DIR is not configured", http.StatusBadRequest)
 		return
 	}
-	// Serialize saves: concurrent bench scripts must not interleave the
-	// html/json pair writes (release-hardening cap).
-	h.saveMu.Lock()
-	defer h.saveMu.Unlock()
+	if !h.beginOperation(w) {
+		return
+	}
+	defer h.endOperation()
+	// Use the same boundary as reset/collect so a persisted pair cannot mix
+	// collector generations.
+	h.resetMu.Lock()
+	defer h.resetMu.Unlock()
 	snap := h.take()
 	base := fmt.Sprintf("%s_gen%d_%s",
-		time.Now().In(reportTZ).Format("20060102-150405"), snap.Meta.Generation, fileSafeRevision(snap.Meta))
+		h.nextRunID(), snap.Meta.Generation, fileSafeRevision(snap.Meta))
 	if score := r.URL.Query().Get("score"); score != "" {
 		snap.Meta.Score = sanitizeName(score)
 		base += "_score" + snap.Meta.Score
 	}
 	if err := h.writeSnapshot(snap, base); err != nil {
+		if errors.Is(err, errSnapshotTooLarge) {
+			http.Error(w, "isutools: save failed: "+err.Error(), http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "isutools: save failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]string{"file": base + ".html"})
+}
+
+func (h *handler) nextRunID() string {
+	stamp := time.Now().In(reportTZ).Format("20060102-150405.000000000")
+	return fmt.Sprintf("%s-%06d", stamp, h.runSeq.Add(1))
 }
 
 // writeSnapshot persists html+json atomically (tmp + rename).
@@ -435,18 +567,39 @@ func (h *handler) writeSnapshot(snap Snapshot, base string) error {
 	if err != nil {
 		return err
 	}
+	if len(jsonBytes) > maxSnapshotBytes {
+		return errSnapshotTooLarge
+	}
 	var htmlBuf strings.Builder
 	if err := reportTmpl.Execute(&htmlBuf, page{Snapshot: snap, Sortable: true}); err != nil {
 		return err
 	}
-	for ext, content := range map[string][]byte{
-		".json": jsonBytes,
-		".html": []byte(htmlBuf.String()),
-	} {
-		tmp := filepath.Join(h.p.DataDir, base+ext+".tmp")
-		if err := os.WriteFile(tmp, content, 0o644); err != nil {
+	if htmlBuf.Len() > maxSnapshotBytes {
+		return errSnapshotTooLarge
+	}
+	// Prepare both files first, then publish JSON followed by HTML. The run
+	// index only lists HTML, so it can never expose a run before its JSON pair.
+	outputs := []struct {
+		ext     string
+		content []byte
+	}{
+		{ext: ".json", content: jsonBytes},
+		{ext: ".html", content: []byte(htmlBuf.String())},
+	}
+	for _, output := range outputs {
+		tmp := filepath.Join(h.p.DataDir, base+output.ext+".tmp")
+		if err := os.WriteFile(tmp, output.content, 0o600); err != nil {
 			return err
 		}
+	}
+	defer func() {
+		for _, output := range outputs {
+			_ = os.Remove(filepath.Join(h.p.DataDir, base+output.ext+".tmp"))
+		}
+	}()
+	for _, output := range outputs {
+		ext := output.ext
+		tmp := filepath.Join(h.p.DataDir, base+ext+".tmp")
 		if err := os.Rename(tmp, filepath.Join(h.p.DataDir, base+ext)); err != nil {
 			return err
 		}
@@ -464,8 +617,8 @@ func (h *handler) files(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimPrefix(r.URL.Path, "/files/")
 	if name != filepath.Base(name) || name == "" ||
-		!(strings.HasSuffix(name, ".html") || strings.HasSuffix(name, ".json") ||
-			strings.HasSuffix(name, ".pprof")) {
+		(!strings.HasSuffix(name, ".html") && !strings.HasSuffix(name, ".json") &&
+			!strings.HasSuffix(name, ".pprof")) {
 		http.Error(w, "invalid file name", http.StatusBadRequest)
 		return
 	}
@@ -474,7 +627,7 @@ func (h *handler) files(w http.ResponseWriter, r *http.Request) {
 
 // sanitizeName keeps only characters safe for a filename component.
 func sanitizeName(s string) string {
-	return strings.Map(func(r rune) rune {
+	name := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.':
 			return r
@@ -482,6 +635,10 @@ func sanitizeName(s string) string {
 			return '_'
 		}
 	}, s)
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	return name
 }
 
 func (h *handler) json(w http.ResponseWriter, r *http.Request) {
@@ -505,6 +662,10 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	if !h.beginOperation(w) {
+		return
+	}
+	defer h.endOperation()
 	h.resetMu.Lock()
 	defer h.resetMu.Unlock()
 
@@ -531,6 +692,8 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		applyOverflowHealth(&snap)
 		if err := h.p.AccessLog.Reset(); err != nil && h.p.Health != nil {
 			h.p.Health.Set("accesslog", health.StatusDegraded, err.Error())
+		} else if h.p.Health != nil {
+			h.p.Health.Set("accesslog", health.StatusOK, "")
 		}
 	}
 	if h.p.Proc != nil {
@@ -539,8 +702,13 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		applyProcHealth(&snap.Meta, value.Health)
 		if err := h.p.Proc.Reset(); err != nil && h.p.Health != nil {
 			h.p.Health.Set("proc", health.StatusDegraded, err.Error())
+		} else if h.p.Health != nil {
+			h.p.Health.Set("proc", health.StatusOK, "")
 		}
 	}
+	h.applyProtocolAdvice(&snap)
+	h.applyQUICTelemetry(&snap)
+	h.applyCacheTelemetry(&snap)
 	h.mu.Lock()
 	h.prev = &snap
 	h.mu.Unlock()
@@ -565,6 +733,10 @@ func (h *handler) collect(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if !h.beginOperation(w) {
+		return
+	}
+	defer h.endOperation()
 	h.resetMu.Lock()
 	defer h.resetMu.Unlock()
 
@@ -577,6 +749,8 @@ func (h *handler) collect(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if stable, ok := h.p.AccessLog.(stableAccessLogCollector); ok && h.p.AccessLogQuiet > 0 {
 		err = stable.CollectUntilStable(ctx, h.p.AccessLogQuiet, h.p.AccessLogPoll)
+	} else if aware, ok := h.p.AccessLog.(contextAccessLogCollector); ok {
+		err = aware.CollectContext(ctx)
 	} else {
 		err = h.p.AccessLog.Collect()
 	}
@@ -587,8 +761,24 @@ func (h *handler) collect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: accesslog collect failed", http.StatusServiceUnavailable)
 		return
 	}
+	if h.p.Health != nil {
+		h.p.Health.Set("accesslog", health.StatusOK, "")
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (h *handler) beginOperation(w http.ResponseWriter) bool {
+	select {
+	case h.operation <- struct{}{}:
+		return true
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "another reset, collect, or save is already running", http.StatusConflict)
+		return false
+	}
+}
+
+func (h *handler) endOperation() { <-h.operation }
 
 func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
 	if r.Method == method {
@@ -656,12 +846,26 @@ func applyOverflowHealth(snapshot *Snapshot) {
 		}
 	}
 	if snapshot.AccessLog != nil {
+		messages := make([]string, 0, 3)
+		dropped := snapshot.AccessLog.StoryDropped + snapshot.AccessLog.FlowDropped
+		if snapshot.AccessLog.StoryDropped > 0 {
+			messages = append(messages, "scenario-story limit exceeded; sessions, pages, or steps were truncated")
+		}
+		if snapshot.AccessLog.FlowDropped > 0 {
+			messages = append(messages, "user-flow limit exceeded; transitions were merged or skipped")
+		}
 		for _, entry := range snapshot.AccessLog.Entries {
 			if entry.URI == accesslog.OverflowURI {
-				snapshot.Meta.Partial = true
-				upsertHealth(&snapshot.Meta, health.Entry{Collector: "accesslog", Status: health.StatusDegraded, Message: "key limit exceeded; identities merged into (other)"})
+				messages = append(messages, "key limit exceeded; identities merged into (other)")
 				break
 			}
+		}
+		if len(messages) > 0 {
+			snapshot.Meta.Partial = true
+			mergeHealth(&snapshot.Meta, health.Entry{
+				Collector: "accesslog", Status: health.StatusDegraded,
+				Message: strings.Join(messages, "; "), Dropped: uint64(dropped),
+			})
 		}
 	}
 }
@@ -679,6 +883,31 @@ func upsertHealth(meta *Meta, update health.Entry) {
 	}
 	meta.Health = append(meta.Health, update)
 	sort.Slice(meta.Health, func(i, j int) bool { return meta.Health[i].Collector < meta.Health[j].Collector })
+}
+
+// mergeHealth combines independent diagnostics from one collector. This is
+// used when parser health and bounded-aggregation health are both relevant to
+// the same snapshot; replacing either would hide partial-data evidence.
+func mergeHealth(meta *Meta, update health.Entry) {
+	for i := range meta.Health {
+		if meta.Health[i].Collector != update.Collector {
+			continue
+		}
+		current := &meta.Health[i]
+		if healthSeverity(update.Status) > healthSeverity(current.Status) {
+			current.Status = update.Status
+		}
+		if update.Message != "" && update.Message != current.Message {
+			if current.Message == "" {
+				current.Message = update.Message
+			} else {
+				current.Message += "; " + update.Message
+			}
+		}
+		current.Dropped += update.Dropped
+		return
+	}
+	upsertHealth(meta, update)
 }
 
 func healthSeverity(status health.Status) int {

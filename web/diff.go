@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -16,12 +17,20 @@ import (
 	"github.com/ekusiadadus/isutools/internal/agg"
 )
 
-// diffRow is one key's total-time change between two runs.
+// diffRow separates traffic volume from per-operation latency. Total time is
+// useful for bottleneck share, but only comparable as an improvement signal
+// when request/query counts are equal.
 type diffRow struct {
-	Key     string
-	AMs     float64
-	BMs     float64
-	DeltaMs float64
+	Key        string
+	ACount     int64
+	BCount     int64
+	AMs        float64
+	BMs        float64
+	DeltaMs    float64
+	AAvgMs     float64
+	BAvgMs     float64
+	DeltaAvgMs float64
+	Comparable bool
 }
 
 type diffPage struct {
@@ -39,7 +48,7 @@ func (h *handler) diff(w http.ResponseWriter, r *http.Request) {
 	}
 	a, b := r.URL.Query().Get("a"), r.URL.Query().Get("b")
 	if !runIDPattern.MatchString(a) || !runIDPattern.MatchString(b) {
-		http.Error(w, "a and b must be run ids (YYYYMMDD-HHMMSS)", http.StatusBadRequest)
+		http.Error(w, "a and b must be valid run ids", http.StatusBadRequest)
 		return
 	}
 	snapA, err := h.loadRun(a)
@@ -73,21 +82,43 @@ func (h *handler) loadRun(id string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	matches := make([]string, 0, 1)
 	for _, e := range entries {
 		name := e.Name()
 		if strings.HasPrefix(name, id+"_") && strings.HasSuffix(name, ".json") {
-			data, err := os.ReadFile(filepath.Join(h.p.DataDir, name))
-			if err != nil {
-				return nil, err
-			}
-			snap := &Snapshot{}
-			if err := json.Unmarshal(data, snap); err != nil {
-				return nil, err
-			}
-			return snap, nil
+			matches = append(matches, name)
 		}
 	}
-	return nil, fmt.Errorf("run %s not found", id)
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("run %s not found", id)
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("run %s is ambiguous (%d snapshots)", id, len(matches))
+	}
+	file, err := os.Open(filepath.Join(h.p.DataDir, matches[0]))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() > maxSnapshotBytes {
+		return nil, errSnapshotTooLarge
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSnapshotBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxSnapshotBytes {
+		return nil, errSnapshotTooLarge
+	}
+	snap := &Snapshot{}
+	if err := json.Unmarshal(data, snap); err != nil {
+		return nil, err
+	}
+	return snap, nil
 }
 
 func entriesOf(s httpstats.Snapshot) []agg.Entry {
@@ -99,20 +130,38 @@ func entriesOf(s httpstats.Snapshot) []agg.Entry {
 }
 
 func diffEntries(a, b []agg.Entry) []diffRow {
-	totals := map[string][2]float64{}
+	type values struct {
+		aCount, bCount int64
+		aTotal, bTotal float64
+	}
+	totals := map[string]values{}
 	for _, e := range a {
 		v := totals[e.Key]
-		v[0] = float64(e.Total.Nanoseconds()) / 1e6
+		v.aCount = e.Count
+		v.aTotal = float64(e.Total.Nanoseconds()) / 1e6
 		totals[e.Key] = v
 	}
 	for _, e := range b {
 		v := totals[e.Key]
-		v[1] = float64(e.Total.Nanoseconds()) / 1e6
+		v.bCount = e.Count
+		v.bTotal = float64(e.Total.Nanoseconds()) / 1e6
 		totals[e.Key] = v
 	}
 	rows := make([]diffRow, 0, len(totals))
 	for key, v := range totals {
-		rows = append(rows, diffRow{Key: key, AMs: v[0], BMs: v[1], DeltaMs: v[1] - v[0]})
+		row := diffRow{
+			Key: key, ACount: v.aCount, BCount: v.bCount,
+			AMs: v.aTotal, BMs: v.bTotal, DeltaMs: v.bTotal - v.aTotal,
+			Comparable: v.aCount > 0 && v.aCount == v.bCount,
+		}
+		if v.aCount > 0 {
+			row.AAvgMs = v.aTotal / float64(v.aCount)
+		}
+		if v.bCount > 0 {
+			row.BAvgMs = v.bTotal / float64(v.bCount)
+		}
+		row.DeltaAvgMs = row.BAvgMs - row.AAvgMs
+		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		return math.Abs(rows[i].DeltaMs) > math.Abs(rows[j].DeltaMs)
@@ -148,15 +197,15 @@ a { color: #0b57d0; }
 </head>
 <body>
 <h1>diff: {{.A}} (score {{.AScore}}) &rarr; {{.B}} (score {{.BScore}})</h1>
-<p class="meta">delta = B - A(負 = 改善)。合計時間の変化量順、上位30件。<a href="./">&larr; runs</a></p>
+<p class="meta">delta = B - A。合計時間の変化量順、上位30件。件数が異なる行では合計deltaを改善・悪化とは判定できません。avgと負荷条件を確認してください。<a href="./">&larr; runs</a></p>
 
 <h2>SQL</h2>
 {{if .SQL}}
 <table>
-<thead><tr><th>delta(ms)</th><th>A(ms)</th><th>B(ms)</th><th>query</th></tr></thead>
+<thead><tr><th>total delta(ms)</th><th>A total(ms)</th><th>B total(ms)</th><th>A count</th><th>B count</th><th>A avg(ms)</th><th>B avg(ms)</th><th>avg delta(ms)</th><th>query</th></tr></thead>
 <tbody>{{range .SQL}}<tr>
-<td data-v="{{.DeltaMs}}">{{if gt .DeltaMs 0.0}}<span class="up">+{{ms1 .DeltaMs}}</span>{{else}}<span class="down">{{ms1 .DeltaMs}}</span>{{end}}</td>
-<td>{{ms1 .AMs}}</td><td>{{ms1 .BMs}}</td><td class="l">{{.Key}}</td>
+<td data-v="{{.DeltaMs}}">{{if .Comparable}}{{if gt .DeltaMs 0.0}}<span class="up">+{{ms1 .DeltaMs}}</span>{{else}}<span class="down">{{ms1 .DeltaMs}}</span>{{end}}{{else}}{{ms1 .DeltaMs}}*{{end}}</td>
+<td>{{ms1 .AMs}}</td><td>{{ms1 .BMs}}</td><td>{{.ACount}}</td><td>{{.BCount}}</td><td>{{ms1 .AAvgMs}}</td><td>{{ms1 .BAvgMs}}</td><td>{{ms1 .DeltaAvgMs}}</td><td class="l">{{.Key}}</td>
 </tr>{{end}}</tbody>
 </table>
 {{else}}<p class="empty">no SQL data</p>{{end}}
@@ -164,10 +213,10 @@ a { color: #0b57d0; }
 <h2>HTTP</h2>
 {{if .HTTP}}
 <table>
-<thead><tr><th>delta(ms)</th><th>A(ms)</th><th>B(ms)</th><th>request</th></tr></thead>
+<thead><tr><th>total delta(ms)</th><th>A total(ms)</th><th>B total(ms)</th><th>A count</th><th>B count</th><th>A avg(ms)</th><th>B avg(ms)</th><th>avg delta(ms)</th><th>request</th></tr></thead>
 <tbody>{{range .HTTP}}<tr>
-<td data-v="{{.DeltaMs}}">{{if gt .DeltaMs 0.0}}<span class="up">+{{ms1 .DeltaMs}}</span>{{else}}<span class="down">{{ms1 .DeltaMs}}</span>{{end}}</td>
-<td>{{ms1 .AMs}}</td><td>{{ms1 .BMs}}</td><td class="l">{{.Key}}</td>
+<td data-v="{{.DeltaMs}}">{{if .Comparable}}{{if gt .DeltaMs 0.0}}<span class="up">+{{ms1 .DeltaMs}}</span>{{else}}<span class="down">{{ms1 .DeltaMs}}</span>{{end}}{{else}}{{ms1 .DeltaMs}}*{{end}}</td>
+<td>{{ms1 .AMs}}</td><td>{{ms1 .BMs}}</td><td>{{.ACount}}</td><td>{{.BCount}}</td><td>{{ms1 .AAvgMs}}</td><td>{{ms1 .BAvgMs}}</td><td>{{ms1 .DeltaAvgMs}}</td><td class="l">{{.Key}}</td>
 </tr>{{end}}</tbody>
 </table>
 {{else}}<p class="empty">no HTTP data</p>{{end}}

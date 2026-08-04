@@ -93,6 +93,15 @@ func TestNginxConfAbsent(t *testing.T) {
 	}
 }
 
+func TestNginxKeepaliveTimeoutIsNotUpstreamKeepalive(t *testing.T) {
+	checks := Collect(context.Background(), Options{
+		NginxConf: []byte("http { keepalive_timeout 65; upstream app { server app:8080; } }"),
+	})
+	if got := byID(checks)["nginx-keepalive"].Status; got != StatusMissing {
+		t.Errorf("keepalive_timeout must not satisfy upstream keepalive: %q", got)
+	}
+}
+
 func TestOSChecks(t *testing.T) {
 	checks := Collect(context.Background(), Options{
 		FS: fakeOS("128", "49152\t50000", lowLimits, "max 100000"),

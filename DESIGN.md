@@ -2,8 +2,8 @@
 
 `github.com/ekusiadadus/isutools` — ISUCON 向けオールインワン計測モジュール
 
-- Status: Implementation Candidate v3 (2026-08-03、M0 core/M2をlocal実装済み。
-  private-isuへのv0.2再統合、ABBA性能gate、collector横断atomic swapは未完)
+- Status: v1.0.0 released / post-release hardening in working tree (2026-08-04)。
+  local test と remote/private-isu release gate は別の証拠として扱う
 - Runtime: Go 1.24+
 - Author: ekusiadadus (with Claude)
 
@@ -55,8 +55,8 @@ ISUCON 本番に「`go get` + 数行」で持ち込めることをゴールと�
 | M1 / v0.1 | MySQL / MariaDB / PostgreSQL(database/sql) | 登録済み `driver.Driver` をプロキシ化。pgx native API は対象外 |
 | M1 / v0.1 | buildinfo + Snapshot + HTML/JSON | schema version付きSnapshotから全rendererを生成 |
 | M2 / v0.2 | HTTP/1.1, HTTP/2 + nginx + procstats | Handler middleware、差分ログ、ベンチ区間の `/proc` 差分 |
-| M3 / v0.3 | Apache + gqlgen | Apache明示format、gqlgen operation adapter |
-| M4 / v1.0 | WebSocket/SSE接続 + HTTP/3互換性 | 接続レベル計測とoptional統合テスト。フレーム計測は除外 |
+| v0.3–v0.7 | run履歴、pprof、CPU total、advisor、counter | 段階リリース済み |
+| v1.0 | diff、WebSocket/SSE接続、User Flow、k6例 | 接続レベル計測。フレーム計測は除外 |
 
 ### 非スコープ(v1)
 
@@ -64,6 +64,7 @@ ISUCON 本番に「`go get` + 数行」で持ち込めることをゴールと�
 - pgx ネイティブ API(`pgxpool` 直接利用)— `database/sql` 経由のみ対応。制約として明記
 - 分散トレーシング・時系列保存・外部ストレージ
 - WebSocket のフレーム/メッセージ数—ライブラリ別アダプタが必要なため Phase 2
+- Apache combined の推測 parser、gqlgen operation adapter、HTTP/3 実統合テスト
 
 ## 4. アーキテクチャ
 
@@ -72,9 +73,7 @@ isutools/
 ├── isutools.go      // SQLDriverName() / HTTP() / Handler() + loopback admin
 ├── sqlstats/        // SQL: ドライバプロキシ + メモリ内集計
 ├── httpstats/       // HTTP in: ミドルウェア集計 (h1/h2, パス正規化)
-├── gqlstats/        // GraphQL: 共通operation集計
-│   └── gqlgen/      // optional: gqlgen HandlerExtension adapter
-├── accesslog/       // nginx/Apache ログの pull 型集計 (alp 相当)
+├── accesslog/       // nginx LTSV/JSON + Caddy native JSON + 明示Apache/Envoy JSON
 ├── procstats/       // /proc スキャン: プロセス別 CPU/RSS top-N
 ├── buildinfo/       // git hash + dirty 検出
 ├── internal/agg/    // 共通集計コア (bounded map, log2 バケットヒストグラム)
@@ -97,42 +96,37 @@ db, _ = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // ①(既存行の書�
 `SQLDriverName()` が成功時に**別ポートの管理サーバ**を1度だけ起動する
 (既定 `127.0.0.1:19191`、`ISUTOOLS_ADDR` で変更、`ISUTOOLS_ADDR=off` で無効)。
 既定値ではアプリのルーター・nginx を経由せず外部にもbindしない(P0-6 の安全境界に合致)。
-loopbackはtokenなしで即閲覧できる。Docker内の `0.0.0.0` bind + host側
+loopbackは即閲覧できる。Docker内の `0.0.0.0` bind + host側
 `127.0.0.1` publishでは `ISUTOOLS_ALLOW_UNAUTHENTICATED=1` を明示した場合だけ
-tokenなしを許可する。`ISUTOOLS_TOKEN` は外部公開時の保護であり、設定時は
-Bearer認証を全endpointへ適用する。
+bindを許可する。application-level token機構は持たない。
 Docker ではhost側も `127.0.0.1` に限定したport mappingで到達性を制御する。`Handler()` も公開して
 おり、アプリと同一ポートに載せたい場合は従来どおり任意のルーターに Mount できる。
 
-#### 管理サーバの認証ポリシー(確定・v0.2.1、2026-08-03 ユーザー決定)
+#### 管理サーバのSSH-onlyポリシー(確定、2026-08-04 ユーザー決定)
 
 **前提とする閲覧経路は「SSH トンネル経由のみ」である。** 管理ポートは
-インターネットにも LAN にも直接公開しない。この前提を崩す構成にする場合は
-必ず `ISUTOOLS_TOKEN` を設定すること。
+インターネットにも LAN にも直接公開しない。Bearer、query token、認証Cookieは
+この前提と重複して複雑さだけを増やすため廃止する。
 
-認証の全モード(実装と1対1対応):
+到達性の全モード(実装と1対1対応):
 
-| bind 先 | ISUTOOLS_TOKEN | ISUTOOLS_ALLOW_UNAUTHENTICATED | 挙動 |
-|---|---|---|---|
-| loopback(既定 `127.0.0.1:19191`) | 不要 | 不要 | **認証なし**で提供。到達性が OS により loopback に限定されているため |
-| 非 loopback(`:19191` 等) | 設定あり | — | 全 endpoint に Bearer 認証(SHA-256 定数時間比較)。ブラウザは `?token=` 1回 → HttpOnly Cookie |
-| 非 loopback | 未設定 | `=1` を明示 | **認証なし**で提供 + 起動ログに警告 + collector health を `degraded` に固定(ダッシュボード上でも常時見える) |
-| 非 loopback | 未設定 | 未設定 | **fail closed**: 管理サーバを起動しない(黙って無防備公開しない) |
+| bind 先 | ISUTOOLS_ALLOW_UNAUTHENTICATED | 挙動 |
+|---|---|---|
+| loopback(既定 `127.0.0.1:19191`) | 不要 | OSのloopback到達性だけで提供 |
+| 非 loopback | `=1` を明示 | 提供 + 起動警告 + admin health message。外側のSSH/firewall制限が必須 |
+| 非 loopback | 未設定 | **fail closed**: listenしない |
 
 `ALLOW_UNAUTHENTICATED=1` を正当化できるのは、**プロセスの外側で到達性が
 制限されている場合だけ**である。具体的には本プロジェクトの private-isu 構成:
 コンテナ内 bind は `0.0.0.0:19191` だが、(1) Docker の port publish が
 `127.0.0.1:19191` に限定され、(2) そこへは SSH トンネルでしか到達できない。
-この2段の制限が「アプリ内 token と同等以上」の防護であるため、token を
-外して UX(素の `http://localhost:19191/` で閲覧)を優先する — これが
+この2段の制限を唯一の防護境界とし、素の `http://localhost:19191/` で閲覧する — これが
 本決定の全根拠である。**Docker なしで NIC に直接 bind する本番 ISUCON
 サーバでは (1)(2) が存在しないため、この env を設定してはならない。**
 
-経緯: v0.2.0 は「非 loopback = token 必須」で fail closed のみだった。
-SSH トンネル前提の実運用でブラウザ閲覧の摩擦が問題となり、ユーザー決定で
-「明示 opt-in の無認証モード」を追加した(token 機構自体は廃止していない)。
-なお、認証を緩める変更のコミットは Claude 側の権限ゲートで拒否されるため、
-ユーザー自身の手でコミットされた(0eaa475)。
+経緯: v0.2–v1.0.0にはBearer/query-token方式も残っていたが、SSH-onlyという
+確定アーキテクチャと矛盾していた。post-release hardeningでコード、test、README、
+ADRから同時に削除した。
 
 **on/off 契約**(レビュー P0-1 反映): 有効判定は `SQLDriverName()` の1箇所に集約する。
 `ISUTOOLS=off` ならラップせず素のドライバ名を返す(ゼロコスト)。登録失敗時も
@@ -177,8 +171,8 @@ SSH トンネル前提の実運用でブラウザ閲覧の摩擦が問題とな�
 - ResponseWriter wrapper はstatus/bytesを記録しつつ、`Unwrap`、`Flusher`、
   `Hijacker`、`io.ReaderFrom` 等の元writerの能力を壊さない。アプリHandlerのpanicは再panicする
 - HTTP/2: net/http 標準(TLS)/ h2c どちらも同一ミドルウェアで計測可能
-- HTTP/3/QUIC: `http3.Server{Handler: isutools.HTTP(mux)}` に渡すだけ。
-  core はquic-goをimportせず、HTTP/3互換性はbuild tag付き統合テストで保証する
+- HTTP/3/QUIC: middleware 自体は `r.Proto` を記録できるが、quic-go を使った実 listener
+  統合テストは v1.0.0 の保証範囲外。検証なしに互換性を宣言しない
 
 ### 5.2.1 WebSocket / 長寿命コネクション(SSE 含む)
 
@@ -204,7 +198,7 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
 - 制約: WebSocket over HTTP/2 (RFC 8441) / HTTP/3 (RFC 9220) は Go 標準の
   サーバ側サポートが限定的なため v1 は HTTP/1.1 Upgrade を対象とする(明記)
 
-### 5.3 gqlstats
+### 5.3 gqlstats（1.x候補、未実装）
 
 - HTTP レベルでは `POST /graphql` に潰れてしまうため operation 単位で集計する
 - gqlgen 利用時: optionalな `gqlstats/gqlgen` パッケージから
@@ -214,7 +208,7 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
   Bodyサイズ上限、読み取り後のBody復元、匿名operationの安定hashを必須とする。
   batch/APQ/multipart/WebSocketを未対応のまま推測集計せず、healthにunsupportedを出す
 
-### 5.4 accesslog(nginx / Apache)
+### 5.4 accesslog(nginx / 明示Apache JSON)
 
 - **pull 型**: アプリのホットパスには一切関与しない。`POST /reset` で現在の
   inode・offsetを世代の開始点として記録し、snapshot/`POST /collect` で
@@ -222,8 +216,9 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
 - ローテーションは inode 変更前の旧ファイル末尾を可能な限りdrainしてから新ファイルへ
   移り、copytruncate(同じinodeでsize < offset)はoffset=0へ戻す。欠損・重複の可能性は
   collector healthへ表示する
-- M2実装のフォーマットは下記の**明示nginx LTSVのみ**。combined+`$request_time` と
-  Apache combined+`%D` はM3へ送る。自動判別で曖昧なログを推測して読まない
+- v1実装は nginx LTSV/JSON（alp aliases含む）を行頭で自動判定する。Apache は
+  `reqtime_us:%D` を持つ明示 JSON のみ対応する。nginx/Apache combined を
+  自動判別で推測して読まない
 - Docker 構成ではログの volume 共有が必要(compose 例を同梱。5.8 参照)
 
 #### 5.4.1 nginx ltsv フォーマット仕様(同梱スニペット)
@@ -241,7 +236,10 @@ log_format isutools ltsv escape=json
   "\tupstime:$upstream_response_time" # upstream時間。retry時は複数値、"-"は計測値なし
   "\tbytes:$body_bytes_sent"          # 転送バイト数(画像サイズ分析の主役)
   "\tcache:$upstream_cache_status"    # proxy_cache の HIT/MISS/BYPASS
-  "\tctype:$sent_http_content_type";  # MIME 別集計用
+  "\tctype:$sent_http_content_type"
+  "\tproto:$server_protocol"
+  "\tsess:$http_x_isutools_session"   # 疑似session ID。生Cookieは禁止
+  "\tscenario:$http_x_isutools_scenario"; # 非秘密のstoryラベル
 ```
 
 #### 5.4.2 集計軸
@@ -255,6 +253,8 @@ log_format isutools ltsv escape=json
 | **status 304 比率** | Conditional GET / ETag・expires 設定の効き目 |
 | **cache HIT/MISS 率** | proxy_cache 導入の効き目 |
 | ctype 別集計 | 画像/CSS/JS/HTML の帯域内訳 |
+| proto 別 count / 5xx / p95 | reverse proxy終端を含むHTTP/1.1・2・3の実測比率と移行signal |
+| scenario + sess 別 request列 | 明示scenarioごとの上位ユーザーストーリー。URL意味推測なし |
 | status 101 / 499 / 5xx | WebSocket 接続はレイテンシ集計から分離、499・reset は警告表示(接続枯渇の兆候) |
 
 - `$upstream_response_time` のカンマ/コロン区切り値は全試行をparseし、raw値、合計、
@@ -373,14 +373,14 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 
 - 自動管理serverは既定で `127.0.0.1:19191` にbindし、アプリrouter/reverse proxyから
   分離する。SSH tunnelまたは対象host上のbench scriptから利用する
-- loopbackはtoken不要。Docker内で非loopback bindしてもhost側port mappingを
-  `127.0.0.1` に限定し、`ISUTOOLS_ALLOW_UNAUTHENTICATED=1` を明示した場合はtokenなしでよい。
-  この明示opt-in時はwarningとhealth degradedで外部露出リスクを表示する。
-  tokenもopt-inもない非loopback bindはlisten前にfail-closedとする
-- `ISUTOOLS_TOKEN` 設定時は `Authorization: Bearer <token>` をSHA-256後に定数時間比較。
-  ブラウザ向けには初回 `/?token=<token>` でHttpOnly cookieを発行し、以後は通常URLで閲覧できる
+- loopbackはそのまま利用する。Docker内で非loopback bindする場合はhost側port mappingを
+  `127.0.0.1` に限定し、`ISUTOOLS_ALLOW_UNAUTHENTICATED=1` を明示する。
+  この明示opt-in時はsecurity warningを表示するが、計測データの`partial`とは分離する。
+  opt-inのない非loopback bindはlisten前にfail-closedとする。token認証へのfallbackはない
 - `GET /`、`GET /snapshot.html`、`GET /json`、`POST /collect`、`POST /reset` の
   methodを固定する。collect対象のfile size、Body、実行時間、同時実行数に上限を設ける
+- 自動管理serverはloopback `Host`、同一 `Origin` / `Referer`、`Sec-Fetch-Site`を検査し、
+  DNS rebindingとcross-site browser requestを拒否する。`Handler()`直mount時は呼出側責任
 - SQL引数・query stringは保存しない。HTMLは `html/template` のcontextual escapingを使い、
   inline JSON中の `<`、`>`、`&`、`</script>` を安全にescapeする
 - collector失敗はHTTP成功に見せかけず、Snapshotの `partial` とhealthへ残す。
@@ -395,7 +395,7 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 | Docker ビルドに `.git` が無い | build.args でハッシュ注入(5.6 フォールバック) |
 | コンテナ内 `/proc` は自コンテナの PID namespace のみ | 単一台構成なら `pid: "host"`(compose)で全プロセス可視化。Docker Desktop は VM 内プロセスになる旨を注記 |
 | 集計メモリの際限ない成長 | 全collectorと正規化cacheに個別上限。SQL/HTTPは各10k、超過分は `(other)` に合算しUI/healthへ警告 |
-| debug endpoint の外部露出 | 独立loopback admin server。外部公開時はBearer token、Docker host-loopbackは明示的なunauthenticated opt-in。collectにsize/time/concurrency上限 |
+| debug endpoint の外部露出 | 独立loopback admin server。Docker host-loopbackは明示opt-inし、SSH/firewallで隔離。collectにsize/time/concurrency上限 |
 
 ## 6. オーバーヘッドと安定性の設計
 
@@ -424,7 +424,7 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 | accesslog | golden / 複数upstream / inode rotate / copytruncate / buffered flush / malformed・巨大行fuzz |
 | procstats | start/end差分 / PID再利用 / process出現・消滅 / permission failure / RSS |
 | buildinfo | VCSあり・なし / dirty・clean・unknown / ldflags・env優先順位 |
-| web | schema互換 / sort / HTML escape / method・loopback・token / 同時reset・snapshot |
+| web | schema互換 / sort / HTML escape / method・loopback・SSH-only bind policy / 同時reset・snapshot |
 
 - 機能CI: `go vet` / `go test -race` / 集約cover profile 80% / parser fuzz seed /
   optional adapterごとのcompile・integration job
@@ -435,15 +435,15 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 
 ## 8. マイルストーンと受け入れ条件
 
-0. **M0(設計契約・release gate、local core実装済み)**: on/off、health、generation、
-   Snapshot schema v3、method固定、nonloopback Bearer/明示unauthenticated opt-inをcontract testで固定。
-   collector横断barrierとremote性能gateは未完
-1. **M1(v0.1.0、実装・private-isu基本統合済み)**: internal/agg + sqlstats + web +
-   buildinfo + sysinfo + loopback admin server。private-isu ABBA比較を残す
-2. **M2(v0.2、local candidate実装済み)**: httpstats(h1/h2) + nginx LTSV accesslog +
-   区間差分procstats + dashboard/DB schema。private-isu再統合とABBAを残す
-3. **M3(v0.3)**: Apache + gqlstats/gqlgen adapter
-4. **M4(v1.0)**: WebSocket/SSE接続計測 + HTTP/3 optional integration + 全体ABBA gate
+0. **M0–M2(v0.1–v0.2)**: on/off、health、generation、SQL、HTTP(h1/h2)、
+   nginx accesslog、procstats、dashboard/DB schema（リリース済み）
+1. **v0.3–v0.7**: run履歴、pprof、CPU total、advisor、path rules、counter、
+   WebSocket/SSE接続分離（リリース済み）
+2. **v1.0.0**: diff、User Flow、k6例、初期ABBA手順（リリース済み）
+3. **post-v1 hardening**: privacy dialect、接続reset、保存衝突/上限、比較件数、
+   複数ABBA block + CI、統合文書（ローカル変更。remote gate は別途再実行が必要）
+4. **1.x候補**: gqlstats/gqlgen、Apache combined parser、HTTP/3実listener統合、
+   collector横断barrier
 
 各milestoneは次をすべて満たすまで「完了」としない:
 
@@ -517,8 +517,8 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 ### 記事から取り込んだ設計上の教訓(機能ではなく原則)
 
 - 「機能が多いものより、自分が理解できてその場で書き換えられるもの」(takonomura)
-  → 依存ゼロ UI・小さなcore・optional adapter分離を優先する。総行数2,000のhard capで
-  テストや安全性を削らず、package責務とcyclomatic complexityで管理する
+  → 依存ゼロ UI・小さなcore・optional adapter分離を優先する。総行数の固定値を
+  品質指標にはせず、package責務、依存、テスト、cyclomatic complexityで管理する
 - 「無駄な変更をしない。判断材料になる計測結果を常に持つ」(takonomura)
   → スナップショット差分(候補2)を UI の一等市民にする
 - 「終盤はネックが DB → アプリ CPU → GC/map へ移動する」(mazrean)
@@ -535,30 +535,33 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 | SQL時間にRows読取を含まない | query dispatch durationと明記 | M1実装・UI脚注あり |
 | SQLリテラル/PIIとcache増大 | literal mask、引数非保存、値キーcache 50k、4KB超非cache | M1実装済み、dialect fuzzは未完 |
 | p95がlog2近似 | bucket上限値としてUI/JSONに表示 | M1 UI実装済み |
-| buildinfo欠落をcleanと誤認 | dirty / clean / unknownの3値 | 設計反映、M1実装conformance未完 |
+| buildinfo欠落をcleanと誤認 | dirty / clean / unknownの3値 | buildinfo test実装済み |
 | fail-openが欠損を隠す | collector health / partialをSnapshotへ追加 | schema v3/HTML/JSONへ実装済み |
 | resetと同時計測の境界 | generationをatomic swapし旧世代を凍結 | SQL/HTTP単体と同時reset直列化は実装済み、collector横断barrier未完 |
-| WebSocket汎用frame wrapper不成立 | v1はconnection/wire bytes、messageはPhase 2 adapter | M4予定 |
+| WebSocket汎用frame wrapper不成立 | v1はconnection/wire bytes、messageはPhase 2 adapter | v1実装。成功した101/Hijackのみ分類 |
 | procがベンチ後を測る | reset/snapshotの区間差分 | M2 local実装済み |
-| upstream複数値、Apache `%B`誤解 | 5.4のraw/合計/試行数、`%O`区別 | nginx LTSVはM2 local実装済み、ApacheはM3予定 |
+| upstream複数値、Apache `%B`誤解 | 5.4のraw/合計/試行数、`%O`区別 | nginx実装済み。Apacheは明示JSON+`%D`のみ |
 | gqlgen operation単位 | `InterceptOperation`、subscription重複回避 | M3予定 |
 | optional dependency | gqlgen/quic-goをcoreから分離 | package/module境界は実装前に確定 |
-| 共有CIのns hard gate | informational + 固定host ABBA | 手順反映、remote検証未実施 |
+| 共有CIのns hard gate | informational + 固定host ABBA | 複数block/CIスクリプト実装。remote再検証は未実施 |
 | recoverがアプリpanicを隠す | isutools内部だけrecover | SQL hookとHTTP再panicを実装・test済み |
-| debug endpoint露出 | 独立loopback admin、外部公開時はBearer認証 | localhost無認証、Docker明示opt-in、token/header/query-cookie、method固定を実装済み。collect resource上限は未完 |
+| debug endpoint露出 | 独立loopback admin、非loopbackは外部隔離の明示opt-in | token方式を削除し、method固定・収集/保存上限を実装済み |
 
-## 10.5 v1.0 ギャップと優先順位(2026-08-04 整理 → 同日 v1.0.0 で全消化)
+## 10.5 v1.0 ギャップの履歴と post-release hardening
 
-**v1.0.0 リリース時点の結果**: 必須6件 + 追加要望2件をすべて実装済み。
+**v1.0.0 リリース時点の結果**: 必須機能6件 + 追加要望2件を実装したが、
+レビューで privacy、長寿命接続reset、保存衝突/上限、比較の件数差、ABBA証跡に
+hardening不足が見つかった。現在のworking treeではこれらを回帰test付きで修正した。
+ただし tag `v1.0.0` は修正前を指し、remote/private-isu の再ABBAは未実施である。
 #1 パス正規化(v0.7)・#2 差分ビュー `/diff`(v1.0)・#3 counters(v0.7)・
-#4 WS/SSE分離(v0.7)・#5 save直列化(v1.0)・#6 ABBA スクリプト
+#4 WS/SSE分離(v0.7)・#5 save直列化(v1.0、post-releaseでsize/time/concurrencyを補強)・#6 ABBA スクリプト
 `examples/abba.sh`(v1.0)・#7 advisor(v0.6)・#8 k6 例 + User Flow
 (`sess:` 遷移集計、v1.0)。以下は当時の計画として保存。
 
-現況: v0.5.0。実装済み = SQL(3DB・リテラルマスク・世代ストア)/ HTTP(h1/h2)/
+当時の計画時点（v0.5.0）の現況記録: SQL(3DB・リテラルマスク・世代ストア)/ HTTP(h1/h2)/
 nginx ログ(LTSV+JSON+alp キー・ローテ追随)/ procstats+CPU total / dbinspect(MySQL)/
 pprof(endpoint+ベンチ連動自動採取)/ snapshot-first UI(実行一覧・日時ID詳細・live)/
-JST / score-in-meta / health・generation / 管理サーバ認証3モード / CI(12pkg・cover 86%+)。
+JST / score-in-meta / health・generation / 管理サーバ認証3モード。
 private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)。
 
 ### v1.0 必須(このギャップを埋めたら 1.0 を切る)
@@ -576,7 +579,7 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 
 | # | 項目 | 設計方針 |
 |---|---|---|
-| 7 | **設定アドバイザ(advisor)** | 「ISUCON 必須級だが未設定」を検出してレポートに常時表示する新コレクター。検査対象: **DSN**(`interpolateParams` = プリペアドステートメント往復の削減)、**MySQL 変数**(`max_connections` / `innodb_buffer_pool_size` vs データ量 / `slow_query_log`)、**nginx conf**(gzip / upstream keepalive / worker_connections / sendfile / expires — `ISUTOOLS_NGINX_CONF` でconfを読み取り)、**OS**(`somaxconn` / `ip_local_port_range` / nofile 上限)、**Go**(GOMAXPROCS vs cgroup CPU クォータ)。各チェックは fail-open、ok/missing/warn/info の4値 |
+| 7 | **設定アドバイザ(advisor)** | 「ISUCON 必須級だが未設定」を検出してレポートに常時表示するコレクター。DSN/MySQL/nginx/OS/Goに加え、post-v1 working treeでは**HTTP/3/QUIC readiness**を追加。nginx/Caddy/Envoy設定、TLS、Alt-Svc、fallback、local UDP/443、明示edge/network evidence、client-facing protocol traffic、任意の再送/drop counterを独立判定する。全checkはfail-open |
 | 8 | **シナリオ負荷試験の可視化(k6 連携 + 行動フロー)** | 負荷生成は **k6 を外部ツールとして採用**(再実装しない。書籍4章の方針)。isutools 側は (a) private-isu 用のシナリオ例を examples/ に同梱、(b) **行動フロー可視化**: nginx ログにセッション識別子(セッション Cookie の短縮ハッシュ `sess:`)を追加し、セッション単位の遷移(`/login → / → /posts/N`)を集計して「ユーザーがどうアプリを使っているか」の上位パスをレポート表示、(c) 将来: k6 の JSON 出力(`--out json`)の取り込み。**Cookie 値そのものは記録しない**(ハッシュのみ、プライバシー/流出対策) |
 
 ### v1.0 に入れない(1.x 以降)
@@ -592,12 +595,8 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 
 ## 11. 決定事項ログ
 
-- 2026-08-03 (v0.2.1): **管理サーバの無認証モードを明示 opt-in で追加**
-  (`ISUTOOLS_ALLOW_UNAUTHENTICATED=1`)。前提は「SSH トンネル + Docker の
-  `127.0.0.1` 限定 publish」の2段制限であり、**token 機構は廃止していない**
-  (外部公開時の必須保護として維持、未設定かつ opt-in なしの非 loopback は
-  fail closed のまま)。詳細は 4章「管理サーバの認証ポリシー」参照
-  (ユーザー決定・ユーザー自身のコミット 0eaa475)
+- 2026-08-04: **SSH-onlyを唯一の管理サーバ到達性契約とし、token方式を廃止**。
+  既定loopback、Docker host-loopback publishの明示opt-in、非loopbackのfail closedを維持する
 - 2026-08-03: 閲覧方式は **snapshot-first**(リモートで計測 → 自己完結 HTML を
   ダウンロード → 手元 PC で閲覧)に決定。ライブ表示は補助として残す(5.7)
 - 2026-08-03: リポジトリは **public + MIT** で確定(Docker ビルド内 `go get` 対応)
@@ -612,7 +611,7 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 - 2026-08-03: procstatsはreset/snapshot区間差分。表示時500ms sample案は廃止
 - 2026-08-03: SQL/HTTPの既定キー上限は各10,000、正規化cacheは50,000。
   超過・欠損はhealthへ表示する
-- 2026-08-03: localhostは設定なしで閲覧可能。Docker host-loopback publishのtoken省略は
+- 2026-08-03: localhostは設定なしで閲覧可能。Docker host-loopback publishは
   `ISUTOOLS_ALLOW_UNAUTHENTICATED=1` の明示opt-inを要求し、health warningを出す
 - 2026-08-03: DB schema/health/M2 collectorsを加えたSnapshotをschema v3とする。
   SQL/HTTP単体のgeneration swapは実装済み、collector横断barrierは別gateとして残す
@@ -624,7 +623,7 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 - **Context**: suffix環境変数とglobal offが競合し、アプリ起動失敗または意図しないproxy利用が起きる
 - **Decision**: `SQLDriverName`が起動時にraw/proxyを選び、成功時だけ独立loopback adminを起動する
 - **Consequences**: 基本導入は1行。fail-openはアプリを守る一方、health実装なしでは計測欠損を見逃す
-- **Status**: Implemented。localhost無認証、Docker明示opt-in、non-loopback Bearer、health表示を検証済み
+- **Status**: Implemented。localhost、Docker明示opt-in、非loopback fail closed、health表示を検証済み。token方式なし
 
 ### ADR-002: GenerationベースSnapshot
 
@@ -638,20 +637,40 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 - **Context**: WebSocket/SSEを通常HTTPへ混ぜるとavg/p95が壊れ、generic frame wrapperも型安全に作れない
 - **Decision**: v1は接続数・active・duration・wire bytesだけを専用tableへ記録する
 - **Consequences**: message単位の判断にはPhase 2 adapterが必要
-- **Status**: Accepted、M4予定
+- **Status**: Implemented in v1。成功した101/HijackとSSE確定時だけ分離し、reset非阻害をrace test済み
 
 ### ADR-004: Fail-openと安全境界
 
 - **Context**: 計測器がアプリを止めてはならないが、silent failureと外部公開も危険
 - **Decision**: isutools内部だけrecoverし、欠損はhealth/partialへ出す。adminはloopbackを既定とする
-- **Consequences**: 外部公開にはtokenまたは外部認証を推奨。Docker host-loopback publishは
-  明示opt-inによりtokenなしで使える。opt-inなしの非loopbackはfail-closedとなる
+- **Consequences**: Docker host-loopback publishは明示opt-inで使える。opt-inなしの
+  非loopbackはfail-closed。公開ネットワークへ直接出す構成はサポートしない
 - **Status**: Implemented for core/admin。accesslog/proc固有healthもsnapshotへ保持
+
+### ADR-005: HTTP/3 readinessは設定・実測・外部evidenceを分離する
+
+- **Context**: reverse proxyがHTTP/3を終端すると、アプリの`r.Proto`はclient protocolではなく
+  upstream protocolになる。また、プロセス内からfirewall/NAT/LB/CDNの外部経路は証明できない
+- **Decision**: nginx/Caddy/Envoy設定とlocal UDP listenerを静的検査し、traffic判断はproxy
+  access logの`proto`を優先する。外部UDP/edgeは明示evidence、再送/dropはsnapshot時callbackで扱う
+- **Consequences**: 根拠のない自動`ok`を避けられる一方、実listener・外部client試験とproxy固有
+  telemetry準備は利用者が行う。coreに`quic-go`依存は追加しない
+- **Alternatives considered**: `r.Proto`だけで判定（proxy終端で誤る）、UDP/443へ自己probe
+  （NAT/LB経路を証明できず副作用がある）、provider別cloud API（認証・依存・変化が大きい）
+- **Status**: Implemented in post-v1 working tree。実HTTP/3 listener統合試験は未実施
+
+### ADR-006: シナリオは認証情報から推測せず、安全な明示ラベルで分ける
+
+- **Context**: GA4風flowを見たいが、生Cookie/token/user IDの保存やURL意味の自動推測は
+  privacy・誤分類・アプリ依存を招く
+- **Decision**: callerが非秘密`scenario`と疑似`sess`を付け、観測した`METHOD URI`列を
+  boundedに集約する。最大10,000 session、共有page辞書10,000、32 step、表示上位20 storyとする
+- **Consequences**: 数行のproxy/k6設定で複数ユーザーストーリーを比較できる。必須step、
+  conversion、drop-offを持つfunnel定義は将来の明示DSLに分離する
+- **Status**: Implemented in post-v1 working tree
 
 ## 13. 未決事項
 
-- [ ] パス正規化ルールの注入方法(コード / 環境変数 / 設定ファイル)
 - [ ] gqlgen / quic-go adapterをnested moduleにするか、別repository/moduleにするか
-- [ ] collector横断generation barrierをv0.2で必須にするか、reset応答後にbench開始する運用契約で十分か
-- [ ] scoreをSnapshot JSONへ後付けするCLI/API、またはファイル名だけに限定するか
+- [ ] collector横断generation barrierを1.xで実装するか、reset応答後にbench開始する運用契約で十分か
 - [ ] 背景分析ログの保存先と一次資料リンク

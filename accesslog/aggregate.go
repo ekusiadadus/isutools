@@ -24,6 +24,16 @@ type DimensionCount struct {
 	Count int64  `json:"count"`
 }
 
+// ProtocolEntry summarizes client-facing protocol traffic observed at the
+// reverse proxy. It must not be confused with the proxy-to-application
+// upstream protocol.
+type ProtocolEntry struct {
+	Protocol   string        `json:"protocol"`
+	Count      int64         `json:"count"`
+	Status5xx  int64         `json:"status_5xx"`
+	RequestP95 time.Duration `json:"request_p95_ns"`
+}
+
 // Entry is one method/path aggregate. Status 101 contributes to count and
 // bytes, but is deliberately excluded from latency and residual fields.
 type Entry struct {
@@ -56,11 +66,15 @@ type Entry struct {
 
 // Snapshot is an immutable copy of one access-log generation.
 type Snapshot struct {
-	Entries      []Entry     `json:"entries"`
-	Flows        []FlowEntry `json:"flows,omitempty"`
-	Lines        int64       `json:"lines"`
-	PartialLines int64       `json:"partial_lines"`
-	Health       Health      `json:"health"`
+	Entries      []Entry         `json:"entries"`
+	Protocols    []ProtocolEntry `json:"protocols,omitempty"`
+	Stories      []StoryEntry    `json:"stories,omitempty"`
+	StoryDropped int64           `json:"story_dropped,omitempty"`
+	Flows        []FlowEntry     `json:"flows,omitempty"`
+	FlowDropped  int64           `json:"flow_dropped,omitempty"`
+	Lines        int64           `json:"lines"`
+	PartialLines int64           `json:"partial_lines"`
+	Health       Health          `json:"health"`
 }
 
 // FlowEntry is one observed session transition (previous request -> next).
@@ -72,8 +86,26 @@ type FlowEntry struct {
 	Count int64  `json:"count"`
 }
 
-// maxFlowSessions bounds the per-generation session tracking map.
-const maxFlowSessions = 10000
+// StoryEntry is one observed request sequence grouped by an explicit scenario
+// label. Sessions is the number of pseudonymous sessions with this sequence.
+type StoryEntry struct {
+	Scenario string   `json:"scenario"`
+	Journey  []string `json:"journey"`
+	Sessions int64    `json:"sessions"`
+	Requests int64    `json:"requests"`
+}
+
+const (
+	// maxFlowSessions bounds the per-generation session tracking map.
+	maxFlowSessions    = 10000
+	maxFlowTransitions = 10000
+	maxFlowPageBytes   = 512
+	flowOverflowKey    = "(other)\x00(other)"
+	maxStorySessions   = 10000
+	maxStoryPages      = 10000
+	maxStorySteps      = 32
+	maxStories         = 20
+)
 
 type aggregateStat struct {
 	method, uri string
@@ -95,15 +127,35 @@ type aggregateStat struct {
 	ctype       map[string]int64
 }
 
+type protocolStat struct {
+	protocol  string
+	count     int64
+	latency   int64
+	status5xx int64
+	maxNS     int64
+	buckets   [numBuckets]int64
+}
+
+type storySession struct {
+	scenario string
+	journey  []string
+	requests int64
+}
+
 // Aggregator is a concurrency-safe bounded access-log aggregation table.
 type Aggregator struct {
-	mu           sync.Mutex
-	maxKeys      int
-	stats        map[string]*aggregateStat
-	lines        int64
-	partialLines int64
-	lastBySess   map[string]string
-	flows        map[string]int64
+	mu            sync.Mutex
+	maxKeys       int
+	stats         map[string]*aggregateStat
+	protocols     map[string]*protocolStat
+	lines         int64
+	partialLines  int64
+	lastBySess    map[string]string
+	flows         map[string]int64
+	flowDropped   int64
+	storySessions map[string]*storySession
+	storyPages    map[string]string
+	storyDropped  int64
 }
 
 // NewAggregator returns an empty table. A non-positive maxKeys selects the
@@ -113,10 +165,13 @@ func NewAggregator(maxKeys int) *Aggregator {
 		maxKeys = DefaultMaxKeys
 	}
 	return &Aggregator{
-		maxKeys:    maxKeys,
-		stats:      make(map[string]*aggregateStat),
-		lastBySess: make(map[string]string),
-		flows:      make(map[string]int64),
+		maxKeys:       maxKeys,
+		stats:         make(map[string]*aggregateStat),
+		protocols:     make(map[string]*protocolStat),
+		lastBySess:    make(map[string]string),
+		flows:         make(map[string]int64),
+		storySessions: make(map[string]*storySession),
+		storyPages:    make(map[string]string),
 	}
 }
 
@@ -125,19 +180,35 @@ func (a *Aggregator) Observe(rec Record) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.lines++
+	a.observeProtocol(rec)
+	a.observeStory(rec)
 	if rec.Partial {
 		a.partialLines++
 	}
-	if rec.Session != "" {
-		page := rec.Method + " " + rec.URI
+	if validSession(rec.Session) {
+		page := OverflowURI
+		if len(rec.Method)+1+len(rec.URI) <= maxFlowPageBytes {
+			page = rec.Method + " " + rec.URI
+		} else {
+			a.flowDropped++
+		}
 		if prev, ok := a.lastBySess[rec.Session]; ok && prev != page {
-			a.flows[prev+"\x00"+page]++
+			key := prev + "\x00" + page
+			if _, exists := a.flows[key]; !exists && len(a.flows) >= maxFlowTransitions {
+				key = flowOverflowKey
+				a.flowDropped++
+			}
+			a.flows[key]++
 		}
 		if len(a.lastBySess) < maxFlowSessions {
 			a.lastBySess[rec.Session] = page
 		} else if _, ok := a.lastBySess[rec.Session]; ok {
 			a.lastBySess[rec.Session] = page
+		} else {
+			a.flowDropped++
 		}
+	} else if rec.Session != "" {
+		a.flowDropped++
 	}
 	key := rec.Method + "\x00" + rec.URI
 	st := a.stats[key]
@@ -192,11 +263,134 @@ func (a *Aggregator) Observe(rec Record) {
 	}
 }
 
+func (a *Aggregator) observeStory(rec Record) {
+	if !validSession(rec.Session) || !validScenario(rec.Scenario) {
+		return
+	}
+	key := rec.Scenario + "\x00" + rec.Session
+	state := a.storySessions[key]
+	if state == nil {
+		if len(a.storySessions) >= maxStorySessions {
+			a.storyDropped++
+			return
+		}
+		state = &storySession{scenario: rec.Scenario}
+		a.storySessions[key] = state
+	}
+	state.requests++
+	page := OverflowURI
+	if len(rec.Method)+1+len(rec.URI) <= maxFlowPageBytes {
+		page = rec.Method + " " + rec.URI
+	} else {
+		a.storyDropped++
+	}
+	if len(state.journey) >= maxStorySteps {
+		if state.journey[maxStorySteps-1] == page {
+			return
+		}
+		if state.journey[maxStorySteps-1] != OverflowURI {
+			state.journey[maxStorySteps-1] = OverflowURI
+			a.storyDropped++
+		}
+		return
+	}
+	page = a.internStoryPage(page)
+	if len(state.journey) > 0 && state.journey[len(state.journey)-1] == page {
+		return
+	}
+	state.journey = append(state.journey, page)
+}
+
+func (a *Aggregator) internStoryPage(page string) string {
+	if page == OverflowURI {
+		return page
+	}
+	if interned, ok := a.storyPages[page]; ok {
+		return interned
+	}
+	if len(a.storyPages) >= maxStoryPages {
+		a.storyDropped++
+		return OverflowURI
+	}
+	a.storyPages[page] = page
+	return page
+}
+
+func (a *Aggregator) observeProtocol(rec Record) {
+	if rec.Protocol == "" {
+		return
+	}
+	protocol := canonicalProtocol(rec.Protocol)
+	st := a.protocols[protocol]
+	if st == nil {
+		if len(a.protocols) >= maxDimensions {
+			protocol = OverflowURI
+			st = a.protocols[protocol]
+		}
+		if st == nil {
+			st = &protocolStat{protocol: protocol}
+			a.protocols[protocol] = st
+		}
+	}
+	st.count++
+	if rec.Status >= 500 {
+		st.status5xx++
+	}
+	if rec.Status == 101 {
+		return
+	}
+	ns := rec.RequestTime.Nanoseconds()
+	st.latency++
+	if ns > st.maxNS {
+		st.maxNS = ns
+	}
+	st.buckets[durationBucket(ns)]++
+}
+
 // Snapshot returns rows sorted by total request time descending.
 func (a *Aggregator) Snapshot() Snapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	result := Snapshot{Lines: a.lines, PartialLines: a.partialLines, Entries: make([]Entry, 0, len(a.stats))}
+	result := Snapshot{Lines: a.lines, PartialLines: a.partialLines, FlowDropped: a.flowDropped, Entries: make([]Entry, 0, len(a.stats))}
+	result.StoryDropped = a.storyDropped
+	storyGroups := make(map[string]*StoryEntry)
+	for _, state := range a.storySessions {
+		groupKey := state.scenario + "\x00" + strings.Join(state.journey, "\x1f")
+		entry := storyGroups[groupKey]
+		if entry == nil {
+			entry = &StoryEntry{Scenario: state.scenario, Journey: append([]string(nil), state.journey...)}
+			storyGroups[groupKey] = entry
+		}
+		entry.Sessions++
+		entry.Requests += state.requests
+	}
+	for _, entry := range storyGroups {
+		result.Stories = append(result.Stories, *entry)
+	}
+	sort.Slice(result.Stories, func(i, j int) bool {
+		if result.Stories[i].Sessions != result.Stories[j].Sessions {
+			return result.Stories[i].Sessions > result.Stories[j].Sessions
+		}
+		if result.Stories[i].Scenario != result.Stories[j].Scenario {
+			return result.Stories[i].Scenario < result.Stories[j].Scenario
+		}
+		return strings.Join(result.Stories[i].Journey, "\x1f") < strings.Join(result.Stories[j].Journey, "\x1f")
+	})
+	if len(result.Stories) > maxStories {
+		result.Stories = result.Stories[:maxStories]
+	}
+	for _, st := range a.protocols {
+		result.Protocols = append(result.Protocols, ProtocolEntry{
+			Protocol: st.protocol, Count: st.count, Status5xx: st.status5xx,
+			RequestP95: time.Duration(protocolPercentile95(st)),
+		})
+	}
+	sort.Slice(result.Protocols, func(i, j int) bool {
+		if result.Protocols[i].Count != result.Protocols[j].Count {
+			return result.Protocols[i].Count > result.Protocols[j].Count
+		}
+		return result.Protocols[i].Protocol < result.Protocols[j].Protocol
+	})
 	for key, count := range a.flows {
 		from, to, _ := strings.Cut(key, "\x00")
 		result.Flows = append(result.Flows, FlowEntry{From: from, To: to, Count: count})
@@ -244,10 +438,15 @@ func (a *Aggregator) Snapshot() Snapshot {
 func (a *Aggregator) Reset() {
 	a.mu.Lock()
 	a.stats = make(map[string]*aggregateStat)
+	a.protocols = make(map[string]*protocolStat)
 	a.lines = 0
 	a.partialLines = 0
 	a.lastBySess = make(map[string]string)
 	a.flows = make(map[string]int64)
+	a.flowDropped = 0
+	a.storySessions = make(map[string]*storySession)
+	a.storyPages = make(map[string]string)
+	a.storyDropped = 0
 	a.mu.Unlock()
 }
 
@@ -281,6 +480,27 @@ func durationBucket(ns int64) int {
 }
 
 func percentile95(st *aggregateStat) int64 {
+	if st.latency == 0 {
+		return 0
+	}
+	target := (st.latency*95 + 99) / 100
+	var seen int64
+	for i, count := range st.buckets {
+		seen += count
+		if count > 0 && seen >= target {
+			if i == 0 {
+				return 0
+			}
+			if i == numBuckets-1 {
+				return st.maxNS
+			}
+			return int64(1) << uint(i)
+		}
+	}
+	return st.maxNS
+}
+
+func protocolPercentile95(st *protocolStat) int64 {
 	if st.latency == 0 {
 		return 0
 	}

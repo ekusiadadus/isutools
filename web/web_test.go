@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/dbinspect"
+	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
 )
 
@@ -21,6 +24,81 @@ func newTestHandler(t *testing.T) (http.Handler, *agg.Table) {
 	tbl.Observe("SELECT big", 100*time.Millisecond)
 	tbl.Observe("SELECT small", 1*time.Millisecond)
 	return NewHandler(Provider{SQL: tbl}), tbl
+}
+
+func TestApplyProtocolAdvicePrefersClientFacingAccessLog(t *testing.T) {
+	snap := Snapshot{
+		Advisor: []advisor.Check{{ID: "http3-server", Status: advisor.StatusOK}},
+		HTTP:    httpstats.Snapshot{{Protocol: "HTTP/1.1", Status: 200, Count: 100, P95: time.Millisecond}},
+		AccessLog: &accesslog.Snapshot{Protocols: []accesslog.ProtocolEntry{
+			{Protocol: "HTTP/3.0", Count: 80, Status5xx: 1, RequestP95: 20 * time.Millisecond},
+			{Protocol: "HTTP/2.0", Count: 20, RequestP95: 30 * time.Millisecond},
+		}},
+	}
+	applyProtocolAdvice(&snap)
+	var traffic advisor.Check
+	for _, check := range snap.Advisor {
+		if check.ID == "http3-traffic" {
+			traffic = check
+		}
+	}
+	if traffic.Status != advisor.StatusOK {
+		t.Fatalf("traffic = %#v", traffic)
+	}
+	if !strings.Contains(traffic.Detail, "source=proxy access log") || !strings.Contains(traffic.Detail, "HTTP/3.0=80") {
+		t.Errorf("traffic detail = %q", traffic.Detail)
+	}
+}
+
+func TestApplyProtocolAdviceDoesNotTreatOriginLogAsClientEvidence(t *testing.T) {
+	snap := Snapshot{AccessLog: &accesslog.Snapshot{Protocols: []accesslog.ProtocolEntry{
+		{Protocol: "HTTP/3.0", Count: 100, RequestP95: time.Millisecond},
+	}}}
+	applyProtocolAdviceWithSource(&snap, false)
+	if len(snap.Advisor) != 1 || snap.Advisor[0].Status != advisor.StatusInfo {
+		t.Errorf("advisor = %#v", snap.Advisor)
+	}
+}
+
+func TestApplyProtocolAdviceFallsBackToApplicationProtocol(t *testing.T) {
+	snap := Snapshot{HTTP: httpstats.Snapshot{{Protocol: "HTTP/2.0", Status: 503, Count: 5, P95: 10 * time.Millisecond}}}
+	applyProtocolAdvice(&snap)
+	if len(snap.Advisor) != 1 || !strings.Contains(snap.Advisor[0].Detail, "source=application middleware") {
+		t.Errorf("advisor = %#v", snap.Advisor)
+	}
+}
+
+func TestApplyQUICTelemetryReplacesStaticSkip(t *testing.T) {
+	snap := Snapshot{Advisor: advisor.WithQUICTelemetry(nil, nil, nil)}
+	applyQUICTelemetry(&snap, &advisor.QUICTelemetry{
+		PacketsSent: 100, PacketsRetransmitted: 10, UDPDatagramsDropped: 1,
+	}, nil)
+	if len(snap.Advisor) != 1 || snap.Advisor[0].Status != advisor.StatusWarn {
+		t.Errorf("advisor = %#v", snap.Advisor)
+	}
+}
+
+func TestApplyCacheTelemetryReplacesStaticSkip(t *testing.T) {
+	snap := Snapshot{Advisor: advisor.WithCacheTelemetry(nil, nil, nil)}
+	applyCacheTelemetry(&snap, &advisor.CacheTelemetry{
+		Hits: 900, Misses: 100, Evictions: 3,
+	}, nil)
+	if len(snap.Advisor) != 1 || snap.Advisor[0].Status != advisor.StatusWarn {
+		t.Errorf("advisor = %#v", snap.Advisor)
+	}
+}
+
+func TestScenarioStoriesRendered(t *testing.T) {
+	h := NewHandler(Provider{AccessLog: &fakeAccessLog{current: accesslog.Snapshot{
+		Stories: []accesslog.StoryEntry{{
+			Scenario: "login_and_browse", Journey: []string{"POST /login", "GET /"}, Sessions: 3, Requests: 6,
+		}},
+	}}})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/snapshot.html", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "login_and_browse") || !strings.Contains(rec.Body.String(), "POST /login") {
+		t.Errorf("scenario story not rendered: status=%d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestJSONSortedByTotal(t *testing.T) {
@@ -271,6 +349,131 @@ func TestSavePersistsAndDashboardLists(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/"+saved.File, nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("files status = %d", rec.Code)
+	}
+}
+
+func TestTwoImmediateSavesHaveDistinctRunIDs(t *testing.T) {
+	h, dir := newPersistentHandler(t)
+	files := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save?score=1", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("save %d status = %d: %s", i, rec.Code, rec.Body.String())
+		}
+		var saved struct {
+			File string `json:"file"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, saved.File)
+	}
+	if files[0] == files[1] {
+		t.Fatalf("same-second saves collided: %q", files[0])
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 4 {
+		t.Fatalf("saved files = %d, want two html/json pairs", len(entries))
+	}
+}
+
+type blockingAccessLog struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingAccessLog) Collect() error {
+	close(b.started)
+	<-b.release
+	return nil
+}
+func (*blockingAccessLog) Snapshot() accesslog.Snapshot { return accesslog.Snapshot{} }
+func (*blockingAccessLog) Reset() error                 { return nil }
+
+func TestConcurrentMutationFailsFastInsteadOfQueueing(t *testing.T) {
+	collector := &blockingAccessLog{started: make(chan struct{}), release: make(chan struct{})}
+	dir := t.TempDir()
+	h := NewHandler(Provider{AccessLog: collector, DataDir: dir})
+	collectDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/collect", nil))
+		collectDone <- rec.Code
+	}()
+	<-collector.started
+
+	saveDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+		saveDone <- rec.Code
+	}()
+	var code int
+	blocked := false
+	select {
+	case code = <-saveDone:
+	case <-time.After(100 * time.Millisecond):
+		blocked = true
+	}
+	close(collector.release)
+	if blocked {
+		code = <-saveDone
+	}
+	<-collectDone
+	if blocked || code != http.StatusConflict {
+		t.Fatalf("concurrent save blocked=%v status=%d, want immediate 409", blocked, code)
+	}
+}
+
+func TestSaveRejectsOversizedSnapshot(t *testing.T) {
+	tbl := agg.NewTable(agg.DefaultMaxKeys)
+	tbl.Observe(strings.Repeat("x", 33<<20), time.Millisecond)
+	h := NewHandler(Provider{SQL: tbl, DataDir: t.TempDir()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized save status = %d, want 413", rec.Code)
+	}
+}
+
+func TestSaveBoundsScoreFilenameComponent(t *testing.T) {
+	h, _ := newPersistentHandler(t)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save?score="+strings.Repeat("9", 1000), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("long score save status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatal(err)
+	}
+	if len(saved.File) > 240 {
+		t.Fatalf("saved filename is unbounded: %d bytes", len(saved.File))
+	}
+}
+
+func TestDBAndAdvisorInspectionReceiveDeadlines(t *testing.T) {
+	var dbDeadline, advisorDeadline bool
+	h := NewHandler(Provider{
+		DB: func(ctx context.Context) *dbinspect.Schema {
+			_, dbDeadline = ctx.Deadline()
+			return &dbinspect.Schema{}
+		},
+		Advisor: func(ctx context.Context) []advisor.Check {
+			_, advisorDeadline = ctx.Deadline()
+			return nil
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	if !dbDeadline || !advisorDeadline {
+		t.Fatalf("inspection deadlines: db=%v advisor=%v", dbDeadline, advisorDeadline)
 	}
 }
 

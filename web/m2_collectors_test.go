@@ -1,14 +1,18 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/counters"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/procstats"
@@ -19,6 +23,24 @@ type fakeAccessLog struct {
 	resets     int
 	collects   int
 	collectErr error
+}
+
+type contextAccessLog struct {
+	contextCalled bool
+	legacyCalled  bool
+	deadline      bool
+}
+
+func (f *contextAccessLog) Snapshot() accesslog.Snapshot { return accesslog.Snapshot{} }
+func (f *contextAccessLog) Reset() error                 { return nil }
+func (f *contextAccessLog) Collect() error {
+	f.legacyCalled = true
+	return nil
+}
+func (f *contextAccessLog) CollectContext(ctx context.Context) error {
+	f.contextCalled = true
+	_, f.deadline = ctx.Deadline()
+	return nil
 }
 
 func (f *fakeAccessLog) Snapshot() accesslog.Snapshot { return f.current }
@@ -52,6 +74,42 @@ func TestCollectEndpointCollectsAccessLogAndReportsFailure(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/collect", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("failed collect status=%d, want 503", rec.Code)
+	}
+}
+
+func TestSuccessfulCollectClearsRuntimeDegradation(t *testing.T) {
+	registry := health.NewRegistry()
+	collector := &fakeAccessLog{collectErr: errors.New("temporary failure")}
+	h := NewHandler(Provider{AccessLog: collector, Health: registry})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/collect", nil))
+	collector.collectErr = nil
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/collect", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("recovery collect status = %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	var payload jsonPayload
+	decodeJSON(t, rec, &payload)
+	for _, entry := range payload.Meta.Health {
+		if entry.Collector == "accesslog" && entry.Status != health.StatusOK {
+			t.Fatalf("recovered accesslog health is sticky: %#v", entry)
+		}
+	}
+}
+
+func TestCollectEndpointUsesContextAwareCollector(t *testing.T) {
+	collector := &contextAccessLog{}
+	h := NewHandler(Provider{AccessLog: collector, CollectTimeout: time.Second})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/collect", nil))
+	if rec.Code != http.StatusNoContent || !collector.contextCalled || collector.legacyCalled || !collector.deadline {
+		t.Fatalf("collect context used=%v legacy=%v deadline=%v status=%d",
+			collector.contextCalled, collector.legacyCalled, collector.deadline, rec.Code)
 	}
 }
 
@@ -113,7 +171,7 @@ func TestDashboardRendersM2SectionsAndHealth(t *testing.T) {
 	for _, want := range []string{
 		"<h2>Collector Health</h2>",
 		"<h2>HTTP</h2>",
-		"<h2>nginx Access Log</h2>",
+		"<h2>Proxy Access Log</h2>",
 		"<h2>Processes</h2>",
 		"one malformed line",
 	} {
@@ -148,6 +206,56 @@ func TestRuntimeCollectorHealthOverridesStartupOK(t *testing.T) {
 	if !found {
 		t.Fatalf("health = %#v", payload.Meta.Health)
 	}
+}
+
+func TestCounterAndFlowOverflowMarkSnapshotPartial(t *testing.T) {
+	registry := counters.NewRegistry()
+	for i := 0; i < counters.DefaultMaxNames+1; i++ {
+		registry.Add(fmt.Sprintf("counter-%d", i), 1)
+	}
+	h := NewHandler(Provider{
+		Counters:  registry,
+		AccessLog: &fakeAccessLog{current: accesslog.Snapshot{FlowDropped: 2}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	var payload jsonPayload
+	decodeJSON(t, rec, &payload)
+	if !payload.Meta.Partial {
+		t.Fatal("counter/flow overflow must mark the snapshot partial")
+	}
+	seen := map[string]bool{}
+	for _, entry := range payload.Meta.Health {
+		if entry.Status == health.StatusDegraded {
+			seen[entry.Collector] = true
+		}
+	}
+	if !seen["counters"] || !seen["accesslog"] {
+		t.Fatalf("overflow health = %#v", payload.Meta.Health)
+	}
+}
+
+func TestAccessLogOverflowHealthPreservesCollectorDiagnostics(t *testing.T) {
+	h := NewHandler(Provider{AccessLog: &fakeAccessLog{current: accesslog.Snapshot{
+		Health:       accesslog.Health{Status: accesslog.StatusPartial, Message: "one malformed line", Dropped: 2},
+		StoryDropped: 3,
+	}}})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	var payload jsonPayload
+	decodeJSON(t, rec, &payload)
+	for _, entry := range payload.Meta.Health {
+		if entry.Collector != "accesslog" {
+			continue
+		}
+		if entry.Status != health.StatusDegraded || entry.Dropped != 5 ||
+			!strings.Contains(entry.Message, "one malformed line") ||
+			!strings.Contains(entry.Message, "scenario-story limit exceeded") {
+			t.Fatalf("merged accesslog health = %#v", entry)
+		}
+		return
+	}
+	t.Fatal("accesslog health entry is missing")
 }
 
 func TestResetStoresCompletedM2GenerationInPrev(t *testing.T) {

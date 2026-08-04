@@ -170,6 +170,9 @@ func p95(s *stat) int64 {
 			if i == 0 {
 				return 0
 			}
+			if i == numBuckets-1 {
+				return s.max
+			}
 			return int64(1) << uint(i)
 		}
 	}
