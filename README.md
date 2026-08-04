@@ -20,7 +20,7 @@ history and diffs. Zero measured overhead (ABBA-verified).*
 - License: MIT / Runtime: Go 1.24+
 - 実績(dogfooding): private-isu を本モジュールの計測だけで1日チューニングし
   **score 0 → 541,650**(fail 0)。
-  [全記録はブログ記事に](https://ekusiadadus.com/writing/private-isu-0-to-540k-in-a-day)
+  [全記録はブログ記事に](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
 
 ## クイックスタート
 
