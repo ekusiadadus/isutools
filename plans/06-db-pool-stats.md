@@ -1,6 +1,6 @@
-# 06: DB プール統計(表示のみ)— 旧02 から分離
+# 06: DB プール統計(表示のみ)— 旧02 から分離(v3)
 
-種別: 機能 / 対象リリース: v1.2.x / 依存: 02(区間 baseline の契約) / 新規パッケージ: `dbpool`
+種別: 機能 / 対象リリース: v1.2.x / 依存: 01(TargetID)、02(区間 baseline の契約) / 新規パッケージ: `dbpool`
 
 ## 旧計画(旧02)からの変更点
 
@@ -24,23 +24,32 @@
 アプリが 1 行で `*sql.DB` を登録すると、ベンチ区間のプール統計が
 snapshot に表示される。判断は読者(+将来の advisor)に委ねる。
 
-## API
+## API(v3 修正)
 
 ```go
-// isutools パッケージ
-type DBStatser interface{ Stats() sql.DBStats }
-
-// WatchDBPool はプール統計の観測対象を登録する。
-// name 重複・nil statser はエラー。登録上限 16。
-func WatchDBPool(name string, s DBStatser) error
+// isutools パッケージ。第一引数は 01 の TargetID(同じ名前空間で
+// sqlrows / dbinspect / queryplan と結合する)。
+// 任意 interface は受けない(typed-nil / panic / blocking 実装の混入を
+// 防ぐため *sql.DB に限定。sqlx 等は .DB を渡す)。
+func WatchDBPool(targetID string, db *sql.DB) error   // 重複 ID・nil はエラー。上限 16
+func UnwatchDBPool(targetID string) error             // プール再作成時は Unwatch → Watch
 ```
 
 使用例(README の Minimal integration に追記):
 
 ```go
 db, _ := sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
-if err := isutools.WatchDBPool("main", db.DB); err != nil { log.Print(err) }
+if err := isutools.WatchDBPool("mysql-db1_3306-isuconp", db.DB); err != nil { log.Print(err) }
 ```
+
+ライフサイクル(v3 で定義):
+
+- **run 途中の Watch/Unwatch は run 状態自体を partial にする**
+  (entry の Partial だけでは「baseline が run 開始より遅い」ことが
+  run 全体の評価に伝わらないため。02 の coordinator に通知する)
+- Unwatch 済み ID の再 Watch は新しい baseline で開始
+- feature flag: `ISUTOOLS_DBPOOL=off` で登録を無効化(既定は
+  Watch された場合のみ有効)。機能単位 ABBA 用の kill-switch
 
 ## データモデル
 

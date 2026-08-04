@@ -33,10 +33,10 @@
 
 ## ゴール
 
-1. opt-in で mutex/block プロファイルを有効化できる(既定 off、
-   既定構成のオーバーヘッドはゼロのまま)
-2. reset / save の 2 点で mutex・block・heap を DataDir に保存し、
-   `/files/` から取得できる
+1. opt-in で mutex/block/heap プロファイルを有効化できる
+   (**3 種とも既定 off** — 既定構成のオーバーヘッドはゼロのまま)
+2. 有効時、reset / save の 2 点で mutex・block・heap を DataDir に
+   atomic に保存し、`/files/` から取得できる
 3. run 範囲の見方(diff_base)がドキュメント化されている
 
 ## 設計
@@ -58,11 +58,25 @@
   - save 時(snapshot 永続化と同じ場所)
 - 内容: `rpprof.Lookup("mutex"|"block"|"heap").WriteTo(f, 0)`
   - mutex/block は rate=0(無効)なら**書かない**
-  - heap は常に取得可能
+  - **heap も `ISUTOOLS_HEAP_PROFILE=1` の明示 opt-in・既定 off**
+    (v3 修正。大きな heap の WriteTo は initialize 遅延やメモリ/cache
+    状態へ影響し得るため、「既定構成のオーバーヘッドゼロ」と矛盾しない
+    ように既定 off にする)
+- **atomic publication**(v3 追加): `0600` の一時ファイル
+  (`.pprof.tmp` — 現行 files 一覧・配信の対象外拡張子)へ書き、
+  Close 成功後に `.pprof` へ rename する。失敗時は temp を削除。
+  未完成ファイルが一覧に出ることを構造的に防ぐ
+- **保持上限**(v3 追加): profile artifact は直近 20 run 分・
+  合計 512MiB を上限とし、超過分は古い run から削除する
+  (既存 snapshot html/json は対象外)。方針を INTEGRATION.md に明記
+- run manifest: snapshot の Meta に当該 run の artifact ファイル名一覧を
+  additive で記録する(完成した rename 済みファイルのみ)
 - 失敗は log + health degrade(fail-open)。DataDir 未設定なら全スキップ
-- ダッシュボード: 既存 files 一覧に載る(拡張子 .pprof のため追加実装
-  不要)。Runs 詳細に「Profiles」小節を足し、reset/save ペアと
-  diff_base コマンド例を表示する
+- ダッシュボード: files 一覧に載る。Runs 詳細に「Profiles」小節を足し、
+  reset/save ペアと diff_base コマンド例を表示する
+- **reset 所要時間の計測**(v3 追加): profile 無効時と有効時
+  (heap on / mutex on / block on)を分けて実測し、ABBA 結果とともに
+  README へ記録する(「数 ms」を仮定で書かない)
 
 ### capabilities / flag
 
@@ -84,7 +98,10 @@
 - unit: env 境界(0 / 負値 / 非数 → off)
 - integration: fraction>0 で reset→save 後に mutex の reset/save ペアが
   DataDir に存在し `/files/` で 200
-- integration: 既定(全 off)では heap のみ生成されること
+- integration: **既定(全 off)では artifact が一切生成されない**こと
+  (heap も off — v3 修正)
+- integration: 書き込み途中で失敗させ、`.pprof` が残らず temp が
+  削除されること / 保持上限超過で古い run の artifact だけが消えること
 
 ## リスク
 

@@ -72,11 +72,27 @@ WHERE SCHEMA_NAME = DATABASE() OR (SCHEMA_NAME IS NULL AND DIGEST IS NULL)
   **切り捨ては全件数と表示件数の両方を明示**(`shown=200 / total=1234`)
 - **NULL digest overflow 行**: デルタ > 0 なら
   health `sqlrows-overflow` を独立に記録し、「digests_size 不足により
-  一部の文が集約行へ落ちた(カバレッジ不完全)」と表示
-- **counter 後退**(いずれかの digest で current < baseline):
-  外部 TRUNCATE / 再起動 / instrument reset とみなし、
-  当該 target の区間を **partial** にする(値は current をそのまま表示し、
-  「絶対値は区間外を含む可能性」を明記)
+  一部の文が集約行へ落ちた(カバレッジ不完全)」と表示。
+  **NULL digest 行は instance-global** なので、同一 DB instance 上の
+  複数 schema / 複数 target に重複表示しない(server_uuid 単位で 1 件に
+  dedup する — v3 修正)
+
+### 区間の妥当性判定(v3 修正: counter 後退だけでは不十分)
+
+counter 後退のみの検出では、(a) TRUNCATE 後に同数以上実行された digest、
+(b) baseline から消えた digest を見逃し、区間外値を valid として扱って
+しまう。以下を**組み合わせて**判定する:
+
+- baseline / snapshot の両時点で `@@server_uuid` と
+  `SHOW GLOBAL STATUS LIKE 'Uptime'` を取得:
+  server_uuid 変化または Uptime 減少 → **DB 再起動**として区間 partial
+- **baseline keyset の消失**: baseline に存在した digest が current に
+  1 つでも無い → 外部 TRUNCATE / instrument reset として区間 partial
+- いずれかの digest の counter 後退 → 区間 partial
+- **検出限界の契約明記**: 「TRUNCATE 後に全 baseline digest が同数以上
+  再実行された」ケースは原理的に検出できない。INTEGRATION.md に
+  『run 中に performance_schema を外部から TRUNCATE しない』を
+  運用前提として明記し、判定は best-effort であることを契約に含める
 
 ### 文種分離と比率
 

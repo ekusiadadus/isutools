@@ -1,162 +1,160 @@
-# 10: 複数台横断計測 — ADR からの再設計
+# 10: 複数台横断計測 — v3(ADR 前提)
 
 種別: アーキテクチャ変更 / 対象リリース: v1.4.0 以降 /
-依存: 01(registry)、02(coordinator)、03(hoststats/identity)、05(network)
-規模: **2〜3 週間**(旧見積もり 4.5 日を撤回)
+依存: 01(TargetID)、02(二段階境界 + run 契約)、03(hoststats/identity)、05(network)
+規模: **2〜3 週間**
 
-## 位置づけの訂正(レビュー反映)
+## v3 での変更点(レビュー差し戻し対応)
 
-旧 06 は本件を「実装コスト大の機能追加」として扱ったが、実際には
-**分散計測プロトコル・世代境界・ホスト識別・名前空間・SSH トンネル運用を
-新設するアーキテクチャ変更**である。したがって:
-
-1. 実装前に **ADR(Architecture Decision Record)を作成し承認を得る**。
-   本書は ADR に先立つ要件と設計方針の整理である
-2. 目標を「Netdata 代替」と誤認させない。提供するのは
-   **ベンチ区間に限定した、証拠(run_id・区間時刻・identity)付きの
-   横断 snapshot** である
-3. 3 段階(agent protocol → hub → distributed reset)に分割し、
-   各段階を独立に出荷・検証する
+1. **[CRITICAL] 終了バリア(FinishRun)の追加**。v2 は開始 reset しか
+   同期しておらず、live snapshot を順に fetch すると各 peer の計測終了
+   時刻が最大 5 秒以上ずれ、fetch 中のバックグラウンド処理も混入する。
+   accesslog の collect も伝播されない。
+   → **ResetRun / FinishRun の 2 バリア**と immutable run snapshot を導入
+2. **[CRITICAL] required peer の不適合は reset 前に invalid**。v2 の
+   「protocol 不一致 peer は接続するが取り込まない」は
+   「全 required peer の ACK が揃った場合のみ valid」と矛盾していた。
+   → required peer は接続・protocol・schema・必須 capability の
+   いずれか不適合で **reset 前に invalid + 503**。optional のみ partial 継続
+3. **[HIGH] 配布から `go run @latest` を廃止**(再現不能・ネットワーク
+   制限に弱い・version skew の自作)。→ tag/commit 固定の
+   事前 build 済み単一 binary + checksum を標準配布経路に
+4. **[MEDIUM] wire DTO の分離**。`PeerSnapshot.Snapshot *Snapshot` は
+   schema v4 で Snapshot 自身に Peers が加わると再帰する。
+   → Peers/Prev を含まない `LocalSnapshot` DTO を新設
+5. **[MEDIUM] 容量 budget の決定則**。hub 自身の分を先に確保し、
+   required 超過は invalid、optional は partial という決定的優先順位を定義
+6. ホスト間 skew は時計比較をやめ、**hub 観測の送信/ACK 区間**で
+   不確実性として表現する(02 の方針と整合)
 
 ## ゴール
 
-1. アプリを載せないホスト(DB/DNS/proxy)でも hoststats(03)+
-   network(05)+ advisor + sqlrows(04)を計測できる agent を提供する
-2. hub(アプリ側 isutools)が全ホストの snapshot を取り込み、
-   **ホスト別に並べて**表示する(合算はしない)。
-   app peer については SQL / HTTP / accesslog / connections / counters を
-   **全て**取り込む(旧計画の proc/advisor/sqlrows 限定は不足 —
-   レビュー指摘どおり「ホスト別に並べる」機能が必要)
-3. reset を全 required peer に伝播し、**全 peer の ACK が揃った場合のみ**
-   run を valid とする。欠落があれば run は invalid(計測不成立)
+1. アプリ非搭載ホスト(DB/DNS/proxy)で hoststats + network + advisor +
+   sqlrows を計測できる agent
+2. hub が全ホストの **同一 run** の snapshot をホスト別に並べて表示
+   (app peer は SQL/HTTP/accesslog/connections/counters を全て含む。
+   合算はしない)
+3. run の開始と終了が全 required peer で揃っていることを**証拠付き**で
+   保証し、揃わない run は invalid として保存する
 
-## Phase A: agent とプロトコル
+## run プロトコル(protocol_version = 1)
 
-### agent(`cmd/isutools-agent`)
+```
+GET  /peer/info                     handshake(識別・互換性・capability)
+POST /peer/runs                     ResetRun {run_id, nonce}    → ResetResult
+POST /peer/runs/{run_id}/finish     FinishRun                   → FinishResult
+GET  /peer/runs/{run_id}            immutable run snapshot 取得(LocalSnapshot)
+```
 
-- 既存パッケージの配線のみ(新規依存ゼロ):
-  hoststats + network + procstats + advisor(+ `ISUTOOLS_AGENT_DSN` が
-  あれば sqlrows/dbinspect)+ 既存 admin サーバ
-- 配布: `go run github.com/ekusiadadus/isutools/cmd/isutools-agent@latest`
-- bind は loopback 限定(既存の SSH-only 決定に従う)
+### handshake(v2 から維持 + 判定変更)
 
-### handshake(`GET /peer/info`)
+`PeerInfo{schema_version, protocol_version, capabilities, identity(03),
+agent_version, started_at}`。**required peer** は次のいずれかで
+**preflight 失敗 = run を開始せず invalid**:
+接続不可 / protocol_version 不一致 / schema_version 非互換 /
+hub が要求する capability の欠如。optional peer は partial 記録で継続。
+重複 identity(machine_id+boot_id+NetNS 一致)は設定エラー。
 
-互換性判定は revision ではなく schema/protocol/capabilities で行う
-(レビュー指摘。README 共通契約 4):
+### ResetRun(開始バリア)
+
+1. hub の Controller が run_id を発番(02)し、preflight(handshake 再検証)
+2. 全 required peer へ `POST /peer/runs` を並列送信。peer は 02 の
+   `Reset(WaitDrain:true)` を実行し、自身の ResetResult を ACK として返す
+3. **全 required ACK が揃ってから** hub の `POST /reset` が応答する
+   (bench 開始 = 全ホスト境界確定後)。1 つでも失敗 → **503 + invalid**
+   (bench を開始させない)。optional の失敗は partial
+4. hub は peer ごとに送信時刻と ACK 受信時刻を記録し、
+   **boundary uncertainty = [送信, ACK] 区間**として snapshot に保存する
+   (ホスト間の時計は比較しない。NTP 同期は前提にしない)
+
+### FinishRun(終了バリア — v3 新設)
+
+1. hub の `POST /save`(または `POST /collect`)が起点。まず hub 自身の
+   collector を freeze(02 の BeginBoundary で世代を閉じ、accesslog を
+   flush → snapshot を確定)
+2. 全 peer へ `POST /peer/runs/{run_id}/finish` を並列送信。peer は
+   accesslog collect の flush → 全 collector の境界確定 →
+   **LocalSnapshot を run_id 付きで immutable に保存**し、FinishResult
+   (各 collector の境界時刻)を ACK として返す
+3. required peer の finish 失敗 → run を invalid で保存(データは
+   得られた範囲で保持し、欠落 peer と理由を記録)。optional → partial
+4. hub は ACK 後に `GET /peer/runs/{run_id}` で取得する。応答内の
+   run_id を検証し、不一致は protocol error として invalid
+5. 各 peer の計測区間は「その peer の ResetResult / FinishResult の
+   境界時刻」で表示する(fetch 遅延はもはや区間に影響しない)
+
+## wire DTO と容量 budget
 
 ```go
-type PeerInfo struct {
-    SchemaVersion   int      `json:"schema_version"`
-    ProtocolVersion int      `json:"protocol_version"` // 本計画で 1 を定義
-    Capabilities    []string `json:"capabilities"`     // "hoststats","netstats","sqlrows",...
-    Identity        hoststats.Identity `json:"identity"` // hostname/machine-id hash/boot-id hash/ns/role
-    AgentVersion    string   `json:"agent_version"`
-    StartedAt       time.Time `json:"started_at"`
+// LocalSnapshot: peer が保存・返却する自ホスト分のみの DTO。
+// Peers / Prev を含まない(再帰なし)。schema v4 で hub 側 Snapshot が
+// Peers map[string]*PeerResult を持つ。
+type PeerResult struct {
+    Info        PeerInfo      `json:"info"`
+    Reset       ResetResult   `json:"reset"`             // ResetRun の ACK(immutable)
+    Finish      FinishResult  `json:"finish"`
+    BoundarySendAck [2]time.Time `json:"boundary_send_ack"` // hub 観測の不確実性区間
+    Err         string        `json:"err,omitempty"`
+    Dropped     []string      `json:"dropped,omitempty"`
+    Local       *LocalSnapshot `json:"local,omitempty"`
 }
 ```
 
-- **重複 peer 検出**: machine_id_hash + boot_id_hash + NetNS が一致する
-  peer が複数指定されたら設定エラー(同一ホストの二重計上防止)
-- hub は protocol_version 不一致の peer を「接続はするが取り込まない」
-  状態にし、run を invalid にはしない(handshake 失敗として表示)
+budget(32MiB snapshot キャップ内、決定的優先順):
 
-## Phase B: hub(peer 取り込み)
+1. **hub 自身の snapshot 分を最初に確保**(実測サイズ。上限 16MiB)
+2. 残りを required peer に等分(per-peer 上限、既定 4MiB)。
+   セクション drop の優先順(accesslog 詳細 → HTTP 詳細 → …)で
+   縮小してもなお超過する required peer は **invalid**(取り込み失敗は
+   計測不成立)
+3. optional peer は残量の範囲で取り込み、超過は Dropped 記録 + partial
 
-### 設定と fetch 制約(レビューの資源・セキュリティ指摘を全数反映)
+## agent と配布(v3 変更)
 
-```bash
-export ISUTOOLS_PEERS="db1=127.0.0.1:29191,dns=127.0.0.1:29192"
-export ISUTOOLS_PEERS_REQUIRED="db1"     # reset ACK 必須の peer(既定: 全 peer)
-```
+- `cmd/isutools-agent`: 既存パッケージの配線のみ。
+  複数 DB target は `ISUTOOLS_AGENT_TARGETS="name=dsn;name2=dsn2"`
+  (01 の TargetID と同一の名前空間)
+- 配布: **リリース tag 固定の事前 build 済み単一 binary + SHA-256
+  checksum** を GitHub Releases に添付(make target で linux/amd64,
+  arm64 を cross-build)。hub と agent は**同一 binary バージョン**を
+  配布する運用を標準とし、INTEGRATION.md に scp 手順を記載。
+  `go run @latest` は例示にも使わない
+- bind は loopback 限定。peer 指定は literal loopback IP のみ
+  (SSH トンネル強制)。redirect 禁止・Proxy 無効の専用 Transport・
+  header/body/展開後サイズ上限・並行度 4・per-peer 2s / total 5s
+  deadline・peer 数上限 8・重複 endpoint 拒否(v2 から維持)
 
-- peer は **literal loopback IP のみ**(hostname 不可 → DNS rebinding 排除)。
-  旧計画にあった非 loopback opt-in は**削除**(SSH-only の一貫性)
-- peer 数上限 8。同一 endpoint の重複指定はエラー
-- 専用 `http.Transport`: `Proxy: nil`(環境変数無視)、redirect 禁止
-  (`CheckRedirect` で拒否)、`MaxResponseHeaderBytes` 制限、
-  接続再利用は peer ごとに固定
-- body は `io.LimitReader`(per-peer 上限。既定 4MiB、設定可)。
-  展開後サイズも同上限で検査(圧縮爆弾対策)
-- 並行度上限 4、per-peer 2 秒、**total fetch deadline 5 秒**
-- 総量: peers 合計が snapshot 32MiB キャップを超える場合、
-  超過 peer を Err 記録で除外(silent drop しない)
+## E2E マトリクス(v2 から維持 + 追加)
 
-### PeerSnapshot(全セクション + 証拠)
-
-```go
-type PeerSnapshot struct {
-    Info      PeerInfo  `json:"info"`
-    FetchedAt time.Time `json:"fetched_at"`
-    Err       string    `json:"err,omitempty"`
-    Dropped   []string  `json:"dropped,omitempty"` // サイズ超過で落としたセクション名
-    // peer の Snapshot 全体(SQL/HTTP/accesslog/connections/counters/
-    // proc/host/network/advisor/sqlrows)。合算はせずホスト別に描画
-    Snapshot  *Snapshot `json:"snapshot,omitempty"`
-}
-```
-
-- schema_version は **4 に bump**(トップレベル `peers` の追加は additive
-  だが、「複数ホストの run を 1 つの snapshot が表す」という
-  **意味の変更**を伴うため。README 共通契約 4 の基準に従う)
-- 表示: 「Hosts」セクション(役割・CPU busy・iowait・PSI・TIME_WAIT・
-  NIC・メモリの行列)+ ホスト別タブで各 peer の全セクションを描画。
-  diff ビューの peer 対応は本計画のスコープ外(将来課題として明記)
-
-## Phase C: distributed reset(レビューの CRITICAL に対応)
-
-旧計画の「degraded で継続・世代独立のまま」を撤回し、02 の契約を拡張する:
-
-1. hub の `POST /reset` は coordinator が run_id を発番後、
-   全 peer の `POST /reset`(run_id 付き)を並行呼び出しする
-2. 各 peer は自分の ResetResult(reset_started_at / reset_completed_at /
-   peer generation)を応答で返す(ACK)
-3. **全 required peer の ACK が揃ってから** hub の reset 応答を返す。
-   これにより「ベンチ開始は reset 応答後」という既存の運用契約
-   (02 で明文化)がそのまま**全ホストの世代確定後**を意味する
-4. required peer の ACK が得られない場合、run は **invalid**:
-   - hub の応答は 503 + 理由(bench を開始させない)
-   - それでも保存された snapshot には invalid と欠落 peer が記録される
-5. snapshot には各 peer の ResetResult を **immutable** に保存し、
-   reset の最大 skew(全ホストの reset_completed_at の最大差)と
-   各ホストの実測区間を表示する
-6. optional peer(`REQUIRED` 外)の失敗は partial として記録し
-   run は継続する
-
-## E2E マトリクス(レビュー要求の全項目)
-
-構成 3 種 × 障害シナリオ:
-
-- 構成: (a) bare metal / systemd、(b) Docker + host PID/network namespace、
-  (c) Docker 別 namespace — (c) では agent から mysqld や物理 NIC が
-  **見えないことを確認し**、identity の namespace 情報で判別できることを検証
+- 構成: bare metal/systemd、Docker host namespace、Docker 別 namespace
+  (別 namespace では mysqld・物理 NIC が見えないことを確認し、
+  identity で判別できることを検証)
 - トポロジ: app+DB / app×2+DB / app+DB×4(shard)
 - 障害: peer 再起動、SSH トンネル切断、fetch timeout、version skew、
-  reset 中の peer 障害と復旧、duplicate/入れ替わった peer identity、
-  32MiB 総上限到達、最大 peer 数超過
-- 検証項目: 同一 run の全 peer interval 一致(skew 表示)、
-  invalid run で bench が開始されないこと(bench スクリプト側の確認手順)
-- 運用手順: SSH トンネルの張り方・teardown・reconnect を
-  INTEGRATION.md に手順化
+  reset 中の peer 障害、**finish 中の peer 障害と復旧**、
+  duplicate identity、32MiB 総上限、peer 数超過
+- 検証: 同一 run の全 peer 区間表示(境界時刻 + uncertainty)、
+  invalid run で bench が開始されないこと、
+  **fetch 遅延が計測区間に影響しないこと**(FinishRun 後に故意に
+  遅延させて取得)
 
 ## 実装ステップ
 
-1. **ADR 作成・承認**(プロトコル、schema v4、invalid run 契約、
-   セキュリティモデル)— 2 日
-2. Phase A: agent + handshake + identity(03 依存)— 3 日
-3. Phase B: fetch 制約付き hub + Hosts 表示 — 4 日
-4. Phase C: distributed reset(02 拡張)— 3 日
-5. E2E マトリクス + docs — 3 日
+1. **ADR 作成・承認**(run プロトコル 2 バリア、invalid 契約、
+   LocalSnapshot/schema v4、budget 決定則、配布方式)— 2 日
+2. Phase A: agent binary + handshake + 複数 target — 3 日
+3. Phase B: ResetRun バリア(503/invalid 含む)— 3 日
+4. Phase C: FinishRun バリア + immutable run 取得 + budget — 4 日
+5. E2E マトリクス + 配布(cross-build/checksum)+ docs — 3 日
 
-計 **15 日程度(2〜3 週間)**。Phase A 単体でも
-「DB ホストで agent を立てて個別に見る」価値があるため、
-段階ごとに出荷判断する。
+計 **15 日程度**。ADR は上記の分散終了契約(FinishRun)まで要件に
+含めた上でレビューに回す。
 
 ## リスク
 
 | リスク | 対策 |
 |---|---|
-| スコープ肥大 | ADR で境界を固定。diff の peer 対応等は明示的に将来課題へ |
-| namespace による不可視 | E2E (c) で挙動を確定し、identity 表示で利用者が判別可能にする |
-| ベンチ規約(外部持ち込み) | go run 1 コマンド・全計測が自ホスト内で完結する設計を維持 |
-| 32MiB キャップとの衝突 | per-peer 上限 + Dropped 記録(silent drop なし) |
+| バリア 2 回分の運用複雑化 | bench.sh 例を提供(reset→bench→save だけは従来どおり。バリアは hub 内部) |
+| peer の immutable 保存領域 | run 1 つ分のみ保持(新 run で置換)。DataDir 不要の in-memory + サイズ上限 |
+| namespace 不可視 | E2E で確定し identity 表示で判別可能にする |
+| 32MiB との衝突 | budget 決定則(hub 優先・required invalid・optional partial) |

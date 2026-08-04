@@ -1,103 +1,144 @@
-# 01: DB target registry(FirstConn の置換)
+# 01: DB target registry(FirstConn の置換)— v3
 
 種別: 基盤 / 対象リリース: v1.2.0 / 変更箇所: `sqlstats`, `dbinspect`, `advisor`, `isutools.go`
 
-## 背景(レビュー指摘)
+## v3 での変更点(レビュー差し戻し対応)
 
-`sqlstats.FirstConn`(sqlstats/sqlstats.go:26 付近)は**最初に開かれた
-1 本の DSN をグローバル保持**し、生の DSN 文字列を呼び出し側へ返す。
-
-- ISUCON12 の user-shard 4 DB のような複数 DSN 構成を扱えない
-  (2 本目以降は観測から漏れる)
-- credential 入りの DSN が advisor / dbinspect へ渡り、今後
-  04(sqlrows)・09(explain)・10(agent)が増えるたびに保持箇所が増える
-
-04/09/10 がすべてこの API に依存するため、先行して置き換える。
+1. **[HIGH] 接続順 `dbN` 命名の廃止**。並行・lazy 接続する 4 shard では
+   再起動ごとに名前が入れ替わり、06 の pool 名とも対応しない。
+   → **安定した TargetID を第一 API** にする:
+   - 既定 ID は接続順ではなく **DSN の構造化パースから決定的に導出**
+     (driver + host:port + database。例: `mysql-db1_3306-isuconp`)。
+     再起動・接続順に依存しない
+   - 明示命名 API `isutools.RegisterDBTarget(id, dsn)` を提供し、
+     衝突(同一 endpoint+db の別用途)や短い別名が必要な場合に使う。
+     自動導出は fallback
+   - sqlrows(04)・dbinspect・queryplan(09)・DB pool(06)・
+     agent(10 の `ISUTOOLS_AGENT_TARGETS="name=dsn;..."`)は
+     **同じ TargetID 名前空間**で結合する
+2. **[MEDIUM] Inspect の接続所有権**。呼ぶたびに `sql.Open` する v2 案は
+   04/09 のファンアウトで接続プールを大量生成し、callback が
+   `*sql.DB` を保持できてしまう。
+   → registry が **target ごとに MaxOpenConns(1) の inspector を 1 つ所有**
+   して再利用し、callback には raw `*sql.DB` ではなく**制限付き query
+   interface** を渡す
+3. **[MEDIUM] redaction の構造化**。文字列規則では escaped userinfo や
+   driver 固有構文で漏れる。→ **driver 公式 parser(mysql.ParseDSN 等)で
+   構造化し、allowlist 項目のみから表示文字列を再構築**。未知パラメータは
+   原則非表示
+4. `HasDSNParam(name, param) bool` の 3 値問題(false / 未設定 /
+   解析失敗が区別不能)→ typed struct + `(value, known)` 形式へ変更
+5. wrapper が `DriverContext` / `OpenConnector` を維持することを要件化
 
 ## ゴール
 
-1. 観測された**全ての** DSN を named target として登録・列挙できる
-2. DSN 文字列を registry の外に出さずに、raw 接続を使う検査を実行できる
-3. 既存の `FirstConn` 利用箇所(dbinspect / advisor / isutools.go)を移行する
-
-## 非ゴール
-
-- 複数 target への検査ファンアウトそのもの(04 で実施)
-- PostgreSQL 対応の拡張(registry は driver 名を保持するだけで中立)
+1. 全 DSN を**安定した TargetID** で登録・列挙できる(shard 対応)
+2. DSN 文字列(credential)を registry の外に出さない
+3. 04/06/09/10 が同一 TargetID で結合できる
+4. 既存の FirstConn 利用箇所を移行する
 
 ## 設計
 
-### registry(sqlstats 内に追加)
+### TargetID
 
 ```go
-// TargetInfo は credential を含まない公開情報。
-type TargetInfo struct {
-    Name     string // "db1", "db2", ... 登録順の自動命名
-    Driver   string // "mysql" など(base driver 名)
-    Redacted string // user/password を除去した DSN(host/db/主要パラメータのみ)
-}
+// 既定: 構造化 DSN から決定的に導出(接続順非依存)
+//   mysql tcp(db1:3306)/isuconp  →  "mysql-db1_3306-isuconp"
+// 同一 ID になる DSN は同一 target として dedup。
+// 導出不能(パース失敗)は "unparsed-<sha256(dsn)[:8]>"(安定・非可逆)。
 
-func Targets() []TargetInfo
-
-// Inspect は名前で指定した target への短命 raw 接続を開いて fn に渡す。
-// DSN は返さない。fn 完了後に必ず Close する。MaxOpenConns(1)。
-func Inspect(ctx context.Context, name string, fn func(context.Context, *sql.DB) error) error
-
-// HasDSNParam は DSN 文字列を晒さずにパラメータ有無だけを答える
-// (advisor の interpolateParams check 用)。
-func HasDSNParam(name, param string) bool
+// 明示命名(第一 API)。SQLDriverName より前に呼ぶ。
+func RegisterDBTarget(id, dsn string) error   // id 重複・空はエラー
 ```
 
-- 登録: 既存の Open hook(接続確立時)で DSN を正規化キーに dedup し、
-  未知なら `dbN` として登録。上限 16 target(超過は health に記録)
-- 明示命名(任意): `isutools.NameDB(dsnSubstring, "shard1")` は
-  **導入しない**。自動名 + Redacted 表示で判別可能であり、API を増やさない
-  (必要になったら別途検討)
-- redact 規則: `user:pass@` の除去、DSN パラメータのうち既知の
-  credential 系(password 等)の除去。driver ごとの形式差は
-  go-sql-driver 形式と URL 形式の 2 種をサポートし、パース不能なら
-  `"(unparsed dsn)"` として**全体を伏せる**(安全側)
+### registry API
+
+```go
+type TargetInfo struct {
+    ID       string // 安定 TargetID
+    Driver   string
+    Display  string // allowlist 再構築の表示文字列(下記)
+}
+func Targets() []TargetInfo
+
+// Features は公式 parser による typed な DSN 属性。known=false は
+// 「パースできず不明」を表す(false と区別される)。
+type DSNFeatures struct {
+    InterpolateParams bool
+    ParseTime         bool
+    MultiStatements   bool
+}
+func Features(id string) (f DSNFeatures, known bool)
+
+// Inspect: target 所有の inspector(MaxOpenConns(1)、再利用)で fn を実行。
+// fn には制限付き interface を渡す。*sql.DB は渡さない。
+type Querier interface {
+    QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
+    QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
+}
+func Inspect(ctx context.Context, id string, fn func(context.Context, Querier) error) error
+```
+
+- inspector 接続は idle timeout(30s)で閉じ、次回 Inspect で再接続
+  (ベンチ区間中に常時接続を残さない)
+- 09 用に「inspector の接続構成は元 DSN から multiStatements を
+  引き継がない」ことを registry 側の契約にする(09 の要件を基盤で保証)
+- 登録上限 16 target(超過は health 記録)
+
+### Display(redaction)の構造化
+
+- `mysql.ParseDSN` で構造化 → **allowlist(Net, Addr, DBName)のみ**から
+  `tcp(db1:3306)/isuconp` 形式を再構築。credential・未知パラメータは
+  一切含めない(「credential 系を除外」ではなく「allowlist 以外非表示」)
+- URL 形式(pgx 等)は url.Parse → host/path のみ。パース失敗は
+  `"(unparsed dsn)"`
+- テストで Display に user/password/クエリパラメータが**構造的に
+  含まれ得ない**ことを保証(allowlist 再構築なので文字列検査は補助)
+
+### driver wrapper の維持要件
+
+- 既存の proxy 登録は `driver.DriverContext` / `OpenConnector` を
+  実装するドライバでその経路を維持する(go-sql-proxy の対応確認を
+  受け入れ条件に含める)。DSN の観測点(OpenConnector/Open)で
+  TargetID 導出・登録を行う
 
 ### 利用箇所の移行
 
 | 現状 | 移行後 |
 |---|---|
-| `dbinspect.Collect(ctx, name, dsn)` | `sqlstats.Inspect(ctx, target, func(ctx, db) { schema = collect(db) })` |
-| advisor `Options.DSN` の interpolateParams check | `HasDSNParam(target, "interpolateParams=true")` の結果を `Options` に事前評価して渡す |
-| advisor `Options.DB`(raw 接続) | `Inspect` の callback 内で `Collect` を呼ぶ形に isutools.go 側を変更(advisor パッケージの `Options.DB *sql.DB` 自体は維持し、所有権コメントを更新) |
-| `FirstConn` | Deprecated として 1 リリース維持(先頭 target を返す)。v1.3.0 で削除 |
-
-### snapshot 表示
-
-- DB Schema セクションのヘッダに target 名と Redacted DSN を表示
-  (複数 target 時の判別)。v1.2.0 では検査対象は先頭 target のまま、
-  複数 target への拡大は 04 と同時に行う
+| `dbinspect.Collect(ctx, name, dsn)` | `Inspect(ctx, id, ...)` + Querier 版 Collect |
+| advisor interpolateParams check | `Features(id)` の typed 値を Options に事前評価 |
+| advisor MySQL check の `Options.DB` | isutools.go 側で Inspect callback 内から実行 |
+| `FirstConn` | Deprecated(先頭 target 相当を返す互換 shim)。v1.3.0 で削除 |
 
 ## 実装ステップ(TDD)
 
-1. redact のテスト先行(go-sql-driver 形式 / URL 形式 / パース不能 /
-   password パラメータ)
-2. registry(dedup・自動命名・上限・並行登録)のテスト
-3. `Inspect` / `HasDSNParam` + FirstConn の deprecated 化
-4. dbinspect / advisor / isutools.go の移行(既存テストが回帰検知)
-5. docs: INTEGRATION.md の「DSN の扱い」節(credential が snapshot に
-   出ないことの明記)
+1. TargetID 導出(mysql 形式 / URL 形式 / パース不能 / dedup /
+   RegisterDBTarget 優先)のテスト先行
+2. Display の allowlist 再構築(credential 非含有の構造的保証)
+3. Features(known 3 値)・Inspect(inspector 再利用・接続数 1 の検証・
+   idle close)
+4. wrapper の DriverContext/OpenConnector 維持確認
+5. dbinspect / advisor / isutools.go の移行(既存テスト回帰)
+6. docs: INTEGRATION.md「DSN と TargetID」節(shard 構成の例)
 
 ## テスト計画
 
-- unit: 同一 DSN の再接続で target が増えないこと
-- unit: 17 本目の DSN で health 記録 + 16 本までは全登録
-- unit: Redacted に user/password が含まれないこと(文字列検査)
-- integration: 既存の advisor / dbinspect のテストが移行後も green
+- unit: 同一 endpoint の並行初回接続 → 単一 target
+- unit: RegisterDBTarget 済み DSN の自動導出スキップ
+- unit: Inspect 並行呼び出しで接続が 1 本を超えないこと
+- unit: Features: interpolateParams あり / なし / パース不能の 3 値
+- integration: 4 DSN(shard 想定)で TargetID が再起動相当
+  (registry 再構築)後も一致
 
 ## リスク
 
 | リスク | 対策 |
 |---|---|
-| redact 漏れ(未知 DSN 形式) | パース不能は全伏せ。既知形式のみ部分表示 |
-| FirstConn 利用の外部コード | Deprecated 期間を 1 リリース確保 |
-| 登録経路(接続 hook)の競合 | 既存 connMu の粒度を registry に流用 |
+| 同一 endpoint+db を用途別に分けたい構成 | RegisterDBTarget の明示命名で解決 |
+| driver 差(pgx の DSN 形式) | driver ごとの parser 分岐。未対応 driver は unparsed 扱い(安全側) |
+| inspector 経由のクエリが計測に混入 | inspector は素の接続(プロキシ非経由)を使用 |
 
 ## 見積もり
 
-1.5 日(移行含む)。
+2 日(v2 の 1.5 日から増。TargetID 導出と Querier 化を含む)。

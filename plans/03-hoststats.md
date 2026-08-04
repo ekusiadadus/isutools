@@ -37,7 +37,23 @@ DB ホストの診断に必要な以下が**存在しない**:
 | `/proc/diskstats` | device 別 read/write セクタ(×512B)・IO 時間 ms・加重 IO 時間(キュー) | 区間デルタ(仕様: docs.kernel.org/admin-guide/iostats.html) |
 | `/proc/pressure/{cpu,memory,io}` | some/full の avg10・avg60(点観測)+ total(区間デルタ) | 両方(仕様: docs.kernel.org/accounting/psi.html)。カーネル非対応(<4.20 / 無効)は skip |
 | `statfs` | `/` と DataDir の使用率 | 点観測 |
-| `/sys/fs/cgroup` | cpu.max(既存 advisor と共用)、memory.max / memory.current | 点観測。v1/v2 階層差は v2 のみ対応、v1 は skip |
+| cgroup(下記) | cpu.max、memory.max / memory.current | 点観測。v2 階層のみ対応、v1 は skip |
+
+### cgroup の解決(v3 修正)
+
+`/sys/fs/cgroup` 直下(root)を固定で読むと、systemd service / container
+では**自プロセスの実 cgroup ではなく cgroup root** を測ってしまう。
+さらに agent と mysqld が別 cgroup の場合、agent の limit を DB の limit と
+誤読する危険がある。対応:
+
+- `/proc/self/cgroup` + `/proc/self/mountinfo` から**自プロセスの実 cgroup
+  パスを解決**して読む
+- snapshot に `cgroup_scope: "host" | "agent-cgroup" | "configured-cgroup"`
+  を必ず記録する(root と実パスが同一なら host)
+- `ISUTOOLS_CGROUP_PATH` で対象 cgroup(例: mysqld の service cgroup)を
+  明示指定できる(scope=configured-cgroup)。指定パスが読めない場合は skip
+- 表示は scope を併記し、「agent の limit ≠ 観測対象サービスの limit」で
+  あり得ることを注記する
 
 ### identity
 

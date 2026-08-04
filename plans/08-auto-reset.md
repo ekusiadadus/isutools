@@ -1,110 +1,103 @@
-# 08: 計測開始の自動化 — 再設計版
+# 08: 計測開始の自動化 — v3
 
-種別: 機能 / 対象リリース: v1.3.0 / 依存: 02(ResetCoordinator) / 変更箇所: `isutools.go`, `httpstats`(observer hook)
+種別: 機能 / 対象リリース: v1.3.0 / 依存: 02(二段階境界 + nonce) / 変更箇所: `isutools.go`, `httpstats`(observer hook)
 
-## 旧計画(旧04)からの変更点
+## v3 での変更点(レビュー差し戻し対応)
 
-レビューの CRITICAL/HIGH 指摘を反映:
+**[CRITICAL] 自己デッドロックの解消**。v2 は「initialize handler 末尾で
+ResetNow を同期実行」としたが、ResetNow が旧世代の in-flight 完了を待つ
+設計(v2 の 02)では、**呼び出し元の initialize リクエスト自身が
+in-flight** のため永遠に待つ(middleware は handler 開始時に in-flight を
+増やし終了時に減らす — httpstats/httpstats.go:213, :328)。
 
-1. **既定 async の廃止**。/initialize のレスポンスを受けたベンチマーカーは
-   直ちに本負荷を開始できるため、非同期 reset はその先頭リクエスト群と
-   競合し計測境界を保証しない。「既存の手動運用でも同じ」は誤り
-   (正式運用は POST /reset の**応答を待って**からベンチ開始)
-2. **「Flush してから reset」の削除**。Flush した時点でクライアントは
-   レスポンスを受信でき、本負荷を開始できる。逆だった
-3. **HTTP 自己呼び出しの全廃**。0.0.0.0 bind 構成で実 bound address への
-   自己呼び出しが Host 検査に拒否され得るうえ、timeout・proxy 環境変数・
-   response body close の契約も不足していた。
-   → HTTP handler と公開 API が**共通の内部 `ResetCoordinator.Reset(ctx)`
-   を直接呼ぶ**(02 で導入済みの経路)
-4. **同期 API を主軸に、middleware 検知は best-effort に格下げ**
-5. **二重 responseWriter の廃止**。現行 wrapper は Flusher / Hijacker /
-   ReaderFrom / Unwrap の透過契約と回帰テストを持つ。新しい軽量 wrapper を
-   重ねる代わりに、**既存 httpstats wrapper の内部から observer へ
-   status を通知**する
-6. **5 秒 debounce の廃止**。短時間の正当な再ベンチを抑止してしまう。
-   initialize リクエスト単位の一意性で扱う
+v3 の 02 で導入した二段階境界により解消する:
+
+- `ResetNow` = **BeginBoundary(同期・非ブロッキング)+ Drain(非同期)**
+- 呼び出し元の initialize リクエストは境界前に開始しているため
+  **旧世代に計上**され、Drain は initialize handler の終了(= in-flight
+  減少)後に自然に完了する。デッドロックは構造的に起きない
+- 応答時点で境界は確定済みなので、initialize 応答後に始まる本負荷は
+  すべて新世代に入る(pprotein と同等の境界保証は維持)
 
 ## モード設計
 
 ### 推奨(正確): 明示同期 API
 
 ```go
-// アプリの initialize handler 末尾、レスポンス送信前に呼ぶ:
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
     // ... DB 再構築など ...
-    if runID, err := isutools.ResetNow(r.Context()); err == nil {
-        log.Printf("isutools run %s", runID)
-    }
-    w.WriteHeader(http.StatusOK)  // reset 完了後に応答
-    // ...
+    runID, err := isutools.ResetNow(r.Context())  // 境界確定して返る(Drainは非同期)
+    if err != nil { log.Printf("isutools: reset: %v", err) }
+    w.WriteHeader(http.StatusOK)                  // 境界確定後に応答
 }
 ```
 
-- `ResetNow` は 02 の coordinator を直接呼ぶ同期実行。
-  応答がクライアントへ届く前に世代が切り替わるため、
-  **本負荷の先頭から新世代で計測される**(pprotein と同等の保証)
-- snapshot の run に `reset_trigger: "api"` を記録
+- `ResetNow` は 02 の process-wide Controller を直接呼ぶ
+  (HTTP 自己呼び出しは存在しない。admin 無効でも動作)
+- run に `reset_trigger: "api"` を記録
+- **ErrResetInProgress** を受けた場合(同時 initialize 等)はエラーを
+  返す。handler 側は log して処理を続行してよい(直前の reset が
+  境界を張っているため)
+
+### 冪等化(02 の nonce を使用)
+
+- `ResetNow` は内部で initialize リクエストごとに一意の nonce を発番する
+  (`ResetNowWithNonce(ctx, nonce)` も公開し、ベンチ側が nonce を
+  制御できるようにする)
+- ベンチマーカーの initialize リトライ(別リクエスト)は別 nonce =
+  新 run。最後の initialize が有効になる(正しい挙動として文書化)。
+  v2 にあった「5 秒 debounce」は導入しない(時刻ではなくリクエスト
+  単位の一意性で扱う)
 
 ### 補助(best-effort): middleware 検知
 
-- `ISUTOOLS_RESET_ON_INITIALIZE=besteffort` で有効化(既定 off)。
-  対象: `ISUTOOLS_INITIALIZE_PATH`(既定 `/initialize`)への POST が
-  status < 400 で完了したとき
-- 実装: httpstats の既存 responseWriter に **observer callback**
-  (パッケージ変数でなく Middleware オプション)を追加し、
-  isutools.go 側でパス・メソッド・status を判定して
-  coordinator.Reset を**非同期**に呼ぶ
-- **保証しないことを明示する**: 先頭数リクエストが前世代に混入し得る。
-  run に `reset_trigger: "initialize-besteffort"` を記録し、
-  ダッシュボードの run ヘッダに「境界非保証」バッジを表示する
-  (汚染された run を後から識別できることが要件)
-- 用途: アプリ改修が一切できない状況の暫定手段。INTEGRATION.md では
-  同期 API を第一に案内する
+v2 から変更なしの方針(既存 responseWriter への observer callback、
+二重 wrapper なし)+ v3 の修正:
 
-### 多重発火の扱い
-
-- coordinator は直列化済み(02)。同一 initialize リクエストからの発火は
-  構造上 1 回
-- ベンチマーカーの initialize リトライ(=複数リクエスト)は
-  それぞれ新しい run を開始する(最後の initialize が有効になる。
-  正しい挙動としてドキュメント化)
-- 進行中の Reset と重なった場合は coordinator の直列化に従う
-  (coalesce しない。run_id はそれぞれ発番される)
+- `ISUTOOLS_RESET_ON_INITIALIZE=besteffort` で有効化(既定 off)
+- 発火は応答完了後・**非同期**。`Controller.Reset(WaitDrain:false)` を
+  リクエスト固有 nonce 付きで呼ぶ(HTTP 経由ではない)
+- 先頭数リクエストの前世代混入があり得ることを明示し、run に
+  `reset_trigger: "initialize-besteffort"` + ダッシュボードに
+  「境界非保証」バッジ
+- observer 有効状態でも Flusher / Hijacker / ReaderFrom / Unwrap の
+  透過契約テストを全通しする(既存回帰テストに observer 有効ケースを追加)
 
 ### multi-app / multi-host
 
-- 複数アプリインスタンス・複数ホストへの reset 伝播は 10 の
-  distributed reset で扱う(本計画は単一プロセスの境界のみ)
+複数インスタンス・複数ホストへの伝播は 10 の distributed reset
+(ResetRun/FinishRun バリア)で扱う。本計画は単一プロセスのみ。
 
 ## 実装ステップ(TDD)
 
-1. httpstats: observer オプション追加(既存の透過契約テストを
-   observer 有効状態でも全通しする回帰テストを含む)
-2. `ResetNow`(02 の公開のみ。実体は coordinator)+ reset_trigger 記録
-3. besteffort モード判定(パス・メソッド・status・既定 off)
-4. template: 境界非保証バッジ
-5. docs: INTEGRATION.md を「同期 API(推奨)/ besteffort(暫定)」の
-   二段構成で記載。examples の initialize handler 例を追加
+1. `ResetNow` / `ResetNowWithNonce`(02 の Controller 公開)
+2. **デッドロック回帰テスト**: 計測 middleware 配下の initialize handler
+   内から ResetNow → タイムアウトなしで返り、世代が進み、
+   initialize リクエストが旧世代に計上されること(02 と共通のテストを
+   本計画の受け入れ条件にも設定)
+3. httpstats observer オプション + 透過契約回帰
+4. besteffort モード判定(パス・メソッド・status・既定 off)+ バッジ
+5. docs: INTEGRATION.md「同期 API(推奨)/ besteffort(暫定)」、
+   examples の initialize handler 例、ErrResetInProgress の扱い
 
 ## テスト計画
 
-- unit: POST /initialize 200 → coordinator.Reset 呼び出し 1 回
-  (fake coordinator で検証)
-- unit: GET / 別パス / 500 / モード off → 呼ばれない
-- unit: ResetNow が同期で世代を進めること(呼び出し完了時点で
-  generation が +1)
-- integration: besteffort run の snapshot に trigger 種別が出ること
-- 回帰: httpstats の Flusher/Hijacker/ReaderFrom/Unwrap テスト全通し
+- unit: POST /initialize 200 → Controller.Reset 呼び出し 1 回(fake)
+- unit: 別パス / GET / 500 / モード off → 呼ばれない
+- unit: 同時 initialize 2 本 → 片方が ErrResetInProgress、
+  世代は 1 回だけ進む
+- integration: ResetNow 完了時点で generation +1、以後のリクエストが
+  新世代、呼び出し元リクエストは旧世代
+- 回帰: httpstats 透過契約(observer 有効/無効の両方)
 
 ## リスク
 
 | リスク | 対策 |
 |---|---|
-| ResetNow の呼び忘れ・呼び場所誤り | INTEGRATION.md に「レスポンス送信前」を強調した例。besteffort が保険 |
-| initialize の応答遅延(同期 reset 分) | reset は数 ms オーダー(実測を doc に記録)。initialize 制限時間(20-30s)に対して無視可能 |
-| besteffort の誤用(正式計測に使う) | run へのトリガー記録とバッジで判別可能にする |
+| ResetNow の呼び場所誤り(応答送信後) | INTEGRATION.md で「WriteHeader 前」を強調。besteffort が保険 |
+| Drain 非同期化により prev 確定が遅れる | 02 の仕様どおり snapshot/save 側で Drain 待ち(タイムアウト付き) |
+| besteffort の誤用 | trigger 記録とバッジで run を判別可能にする |
 
 ## 見積もり
 
-1 日 + docs 0.5 日。
+1 日 + docs 0.5 日(02 完了が前提)。

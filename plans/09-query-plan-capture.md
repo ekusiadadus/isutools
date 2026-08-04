@@ -53,20 +53,37 @@
 
 1. 04 の delta 結果から SUM_TIMER_WAIT 降順で上位
    `ISUTOOLS_EXPLAIN_TOP`(既定 10)の SELECT digest を選ぶ
-2. 各 digest について registry(01)の `Inspect` で raw 接続を開き:
-   - `SELECT QUERY_SAMPLE_TEXT FROM ... WHERE DIGEST = ?` で取得
-   - 取得した文字列で `EXPLAIN <sample>` を実行
-   - **sample 文字列はこの関数スコープ限りで破棄**(構造体へ保存しない)
-3. 結果(digest キー + プラン行のみ)を run 単位でキャッシュし、
-   snapshot / GET はキャッシュを描画する
+2. 各 digest について registry(01)の `Inspect` で:
+   - `SELECT QUERY_SAMPLE_TEXT, QUERY_SAMPLE_SEEN FROM ... WHERE DIGEST = ?`
+     で取得(**QUERY_SAMPLE_SEEN を必ず取得** — v3 修正)
+   - **鮮度判定**: QUERY_SAMPLE_SEEN が run 区間(02 の境界〜collect
+     時刻)の外なら、そのサンプルは過去 run のもの。リテラル値で実行計画が
+     変わり得るため **advisor 判定から除外**し、表示は `stale`
+     (取得時刻付き)としてグレー表示する
+   - 区間内なら `EXPLAIN <sample>` を実行。
+     **sample 文字列はこの関数スコープ限りで破棄**(構造体へ保存しない)
+   - **エラー整形**: driver エラーを Plan.Err に入れる際、エラー文字列に
+     sample が埋まっていないことを検査し、digest とエラー種別のみに
+     置き換える(raw sample のエラー経由漏洩防止 — v3 追加)
+3. 結果(digest キー + プラン行 + SampleSeen/Stale)を run 単位で
+   キャッシュし、snapshot / GET はキャッシュを描画する
 4. タイムアウト: 1 digest 250ms・全体 2 秒。超過分は Err 記録でスキップ
+5. 接続は 01 の registry 契約により **multiStatements を引き継がない**
+   (基盤側で保証。本計画では受け入れテストのみ)
+6. EXPLAIN 結果の `key` / `possible_keys` 等は **NULL になり得る**。
+   `sql.NullString` で受け、表示は空欄(パース失敗にしない)
+
+機能全体の master flag は `ISUTOOLS_EXPLAIN=1`(**明示 opt-in・既定 off**。
+EXPLAIN は DB への追加クエリを伴うため。機能単位 ABBA の対象)。
 
 ```go
 type Plan struct {
-    Digest string    `json:"digest"`
-    Query  string    `json:"query"` // 04 と同じ DIGEST_TEXT(正規化済・512B)のみ
-    Rows   []PlanRow `json:"rows"`
-    Err    string    `json:"err,omitempty"`
+    Digest     string    `json:"digest"`
+    Query      string    `json:"query"` // 04 と同じ DIGEST_TEXT(正規化済・512B)のみ
+    SampleSeen time.Time `json:"sample_seen"`      // QUERY_SAMPLE_SEEN(v3 追加)
+    Stale      bool      `json:"stale,omitempty"`  // run 区間外サンプル(advisor 対象外)
+    Rows       []PlanRow `json:"rows"`
+    Err        string    `json:"err,omitempty"`    // digest とエラー種別のみ(sample 非含有)
 }
 type PlanRow struct {
     SelectType   string `json:"select_type"`
@@ -114,7 +131,7 @@ type PlanRow struct {
 
 | リスク | 対策 |
 |---|---|
-| sample が古い(過去の実行例) | QUERY_SAMPLE_SEEN を併記し「いつの例か」を表示 |
+| sample が古い(過去の実行例) | SampleSeen の区間判定で advisor 対象から除外 + stale 表示(データモデルに組み込み済み) |
 | 8.0.17 未満・MariaDB | probe で skip(v1 スコープ外を明示) |
 | EXPLAIN 負荷 | 上位 10・collect/save 時のみ・250ms/2s 上限 |
 | リテラル漏洩 | サンプル文字列の非保存 + 出力の文字列検査テスト |
