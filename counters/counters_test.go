@@ -1,6 +1,7 @@
 package counters
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -47,5 +48,23 @@ func TestConcurrentAdd(t *testing.T) {
 	wg.Wait()
 	if got := r.Snapshot()[0].Count; got != 8000 {
 		t.Errorf("count = %d, want 8000", got)
+	}
+}
+
+func TestRegistryBoundsDistinctNamesAndReportsDrops(t *testing.T) {
+	r := NewRegistry()
+	for i := 0; i < 2000; i++ {
+		r.Add(fmt.Sprintf("dynamic-%d", i), 1)
+	}
+	entries := r.Snapshot()
+	if len(entries) > 1025 { // 1024 identities plus the overflow row.
+		t.Fatalf("counter identities are unbounded: %d", len(entries))
+	}
+	if r.Dropped() == 0 {
+		t.Error("overflowed identities must be reported")
+	}
+	r.Reset()
+	if r.Dropped() != 0 {
+		t.Error("Reset must clear the dropped count")
 	}
 }

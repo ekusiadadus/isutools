@@ -22,6 +22,26 @@ func TestNormalize(t *testing.T) {
 			want: "[getIndex] SELECT ? FROM dual",
 		},
 		{
+			name: "drops non allowlisted tag and every ordinary comment",
+			in:   "SELECT /* user@example.com */ 1 /* password=secret */ FROM dual -- bearer token\n",
+			want: "SELECT ? FROM dual",
+		},
+		{
+			name: "masks postgres dollar quoted literals",
+			in:   "SELECT $$super-secret$$, $memo$private value$memo$ FROM users WHERE id = 42",
+			want: "SELECT ?, ? FROM users WHERE id = ?",
+		},
+		{
+			name: "masks hexadecimal and binary literals",
+			in:   "SELECT 0xdeadbeef, X'cafebabe', B'101010'",
+			want: "SELECT ?, ?, ?",
+		},
+		{
+			name: "masks decimal and scientific literals",
+			in:   "SELECT 1.25e+10, .5, 42e-3",
+			want: "SELECT ?, ?, ?",
+		},
+		{
 			name: "masks numeric literals",
 			in:   "SELECT * FROM posts LIMIT 20 OFFSET 100",
 			want: "SELECT * FROM posts LIMIT ? OFFSET ?",
@@ -58,6 +78,13 @@ func TestNormalize(t *testing.T) {
 				t.Errorf("normalize(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeNeverExceedsMaximumLengthIncludingTag(t *testing.T) {
+	got := normalize("/* safe-tag */ SELECT " + strings.Repeat("x", maxQueryLen*2))
+	if len(got) > maxQueryLen {
+		t.Fatalf("normalized length = %d, want <= %d", len(got), maxQueryLen)
 	}
 }
 

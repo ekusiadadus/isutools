@@ -200,7 +200,7 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 </table>
 {{else}}<p class="empty">no counters (アプリで isutools.Count("cache_hit") 等を呼ぶとここに出ます)</p>{{end}}
 
-<h2>nginx Access Log</h2>
+<h2>Proxy Access Log</h2>
 {{if .Snapshot.AccessLog}}
 <p class="meta">status {{.Snapshot.AccessLog.Health.Status}} &middot; lines {{.Snapshot.AccessLog.Lines}} &middot; dropped {{.Snapshot.AccessLog.Health.Dropped}} &middot; {{.Snapshot.AccessLog.Health.Message}}</p>
 {{if .Snapshot.AccessLog.Entries}}<table>
@@ -212,9 +212,20 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 <td class="l">{{.Method}}</td><td class="l">{{.URI}}</td>
 </tr>{{end}}</tbody>
 </table>{{else}}<p class="empty">no access-log observations in this generation</p>{{end}}
-{{else}}<p class="empty">not configured (set ISUTOOLS_NGINX_LOG)</p>{{end}}
+{{else}}<p class="empty">not configured (set ISUTOOLS_ACCESS_LOG)</p>{{end}}
 
-<h2>User Flow <span class="meta">(セッション毎のページ遷移 上位20。nginx ログの sess: フィールドが必要)</span></h2>
+<h2>Scenario Stories <span class="meta">(明示scenarioラベル別の実測request列。疑似sessが必要)</span></h2>
+{{if and .Snapshot.AccessLog .Snapshot.AccessLog.Stories}}
+<table>
+<thead><tr><th>sessions</th><th>requests</th><th>scenario</th><th>observed journey</th></tr></thead>
+<tbody>{{range .Snapshot.AccessLog.Stories}}<tr>
+<td data-v="{{.Sessions}}">{{.Sessions}}</td><td data-v="{{.Requests}}">{{.Requests}}</td><td class="l">{{.Scenario}}</td>
+<td class="l">{{range $i, $step := .Journey}}{{if $i}} &rarr; {{end}}{{$step}}{{end}}</td>
+</tr>{{end}}</tbody>
+</table>
+{{else}}<p class="empty">no scenario story data (proxy logに安全なsess:とscenario:を追加)</p>{{end}}
+
+<h2>User Flow <span class="meta">(セッション毎のページ遷移 上位20。proxy ログの sess: フィールドが必要)</span></h2>
 {{if and .Snapshot.AccessLog .Snapshot.AccessLog.Flows}}
 <table>
 <thead><tr><th>count</th><th>from</th><th></th><th>to</th></tr></thead>
@@ -222,7 +233,7 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 <td data-v="{{.Count}}">{{.Count}}</td><td class="l">{{.From}}</td><td>&rarr;</td><td class="l">{{.To}}</td>
 </tr>{{end}}</tbody>
 </table>
-{{else}}<p class="empty">no flow data (nginx の log_format に sess: を追加すると「ユーザーがどうアプリを使っているか」が見えます)</p>{{end}}
+{{else}}<p class="empty">no flow data (proxy log に sess: を追加すると「ユーザーがどうアプリを使っているか」が見えます)</p>{{end}}
 
 <h2>Processes</h2>
 {{if .Snapshot.Proc}}

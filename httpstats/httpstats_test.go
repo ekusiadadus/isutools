@@ -242,6 +242,14 @@ func TestResetWaitsForInflightRequestAndReturnsOldGeneration(t *testing.T) {
 	}
 }
 
+func TestP95SaturatedBucketUsesObservedMaximum(t *testing.T) {
+	s := &stat{count: 1, max: int64(20 * time.Minute)}
+	s.buckets[numBuckets-1] = 1
+	if got := time.Duration(p95(s)); got != 20*time.Minute {
+		t.Fatalf("saturated p95 = %v, want observed maximum", got)
+	}
+}
+
 type plainWriter struct {
 	header http.Header
 	status int
@@ -272,7 +280,7 @@ func (w *allFeaturesWriter) Push(string, *http.PushOptions) error {
 	return nil
 }
 func (w *allFeaturesWriter) ReadFrom(r io.Reader) (int64, error) {
-	return io.Copy(&w.plainWriter.body, r)
+	return io.Copy(&w.body, r)
 }
 
 type readerOnly struct{ io.Reader }

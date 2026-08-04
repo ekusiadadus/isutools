@@ -24,9 +24,10 @@ const DriverSuffix = ":isutools"
 var Default = NewStore(agg.DefaultMaxKeys)
 
 var (
-	connMu    sync.Mutex
-	firstName string
-	firstDSN  string
+	connMu     sync.Mutex
+	registerMu sync.Mutex
+	firstName  string
+	firstDSN   string
 )
 
 // FirstConn returns the base driver name and DSN of the first connection
@@ -58,6 +59,8 @@ func (d dsnCapturingDriver) Open(dsn string) (driver.Conn, error) {
 // measuring variant under name+DriverSuffix. Calling it again for the same
 // name is a no-op.
 func Register(names ...string) error {
+	registerMu.Lock()
+	defer registerMu.Unlock()
 	for _, name := range names {
 		if err := register(name); err != nil {
 			return err

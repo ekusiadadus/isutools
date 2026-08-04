@@ -44,6 +44,15 @@ func TestObserveResultCountsErrors(t *testing.T) {
 	}
 }
 
+func TestP95SaturatedBucketUsesObservedMaximum(t *testing.T) {
+	tbl := NewTable(DefaultMaxKeys)
+	tbl.Observe("long", 20*time.Minute)
+	entry := tbl.Snapshot()[0]
+	if entry.P95 != entry.Max || entry.P95 != 20*time.Minute {
+		t.Fatalf("saturated p95=%v max=%v, want observed maximum", entry.P95, entry.Max)
+	}
+}
+
 func TestSnapshotSortedByTotalDesc(t *testing.T) {
 	tbl := NewTable(DefaultMaxKeys)
 	tbl.Observe("small", 1*time.Millisecond)

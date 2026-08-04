@@ -66,7 +66,7 @@ func Collect(ctx context.Context, driverName, dsn string) *Schema {
 		s.Error = err.Error()
 		return s
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 
 	ctx, cancel := context.WithTimeout(ctx, collectTimeout)
@@ -90,7 +90,7 @@ func collectMySQLTables(ctx context.Context, db *sql.DB) ([]Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	byName := map[string]*Table{}
 	names := []string{}
@@ -116,7 +116,7 @@ func collectMySQLTables(ctx context.Context, db *sql.DB) ([]Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer idxRows.Close()
+	defer func() { _ = idxRows.Close() }()
 
 	for idxRows.Next() {
 		var tableName, indexName, columns string

@@ -16,8 +16,13 @@ const (
 	StatusPartial = "partial"
 	StatusError   = "error"
 
-	defaultMaxLineBytes = 1 << 20
+	defaultMaxLineBytes    = 1 << 20
+	defaultMaxCollectBytes = 64 << 20
 )
+
+// ErrCollectLimit means one collection pass reached its configured byte cap.
+// A later pass resumes from the retained offset.
+var ErrCollectLimit = errors.New("accesslog: per-collect byte limit reached")
 
 // Health exposes collection failures without making them fatal to the host
 // application. Counters apply to the current generation.
@@ -85,6 +90,15 @@ func WithMaxLineBytes(n int) Option {
 	}
 }
 
+// WithMaxCollectBytes bounds bytes read in one Collect/CollectContext call.
+func WithMaxCollectBytes(n int64) Option {
+	return func(c *Collector) {
+		if n > 0 {
+			c.maxCollectBytes = n
+		}
+	}
+}
+
 // WithMaxKeys bounds distinct method/path aggregates.
 func WithMaxKeys(n int) Option {
 	return func(c *Collector) {
@@ -99,11 +113,12 @@ func WithMaxKeys(n int) Option {
 type Collector struct {
 	mu sync.Mutex
 
-	path         string
-	fs           FileSystem
-	sameFile     func(fs.FileInfo, fs.FileInfo) bool
-	maxLineBytes int
-	agg          *Aggregator
+	path            string
+	fs              FileSystem
+	sameFile        func(fs.FileInfo, fs.FileInfo) bool
+	maxLineBytes    int
+	maxCollectBytes int64
+	agg             *Aggregator
 
 	file     File
 	offset   int64
@@ -118,7 +133,8 @@ type Collector struct {
 func New(path string, opts ...Option) *Collector {
 	c := &Collector{
 		path: path, fs: osFileSystem{}, sameFile: os.SameFile,
-		maxLineBytes: defaultMaxLineBytes, agg: NewAggregator(DefaultMaxKeys),
+		maxLineBytes: defaultMaxLineBytes, maxCollectBytes: defaultMaxCollectBytes,
+		agg:    NewAggregator(DefaultMaxKeys),
 		health: Health{Status: StatusOK},
 	}
 	for _, opt := range opts {
@@ -135,8 +151,17 @@ func New(path string, opts ...Option) *Collector {
 // Collect consumes all currently available complete lines. It returns only I/O
 // failures; malformed records are dropped and reported through Health.
 func (c *Collector) Collect() error {
+	return c.CollectContext(context.Background())
+}
+
+// CollectContext is Collect with cancellation between bounded file reads.
+func (c *Collector) CollectContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	remaining := c.maxCollectBytes
 	if c.closed {
 		return errors.New("accesslog: collector is closed")
 	}
@@ -159,7 +184,15 @@ func (c *Collector) Collect() error {
 	}
 
 	if !c.sameFile(heldInfo, pathInfo) {
-		if err := c.readToEOFLocked(); err != nil {
+		if err := c.readToEOFLocked(ctx, &remaining); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			if errors.Is(err, ErrCollectLimit) {
+				c.health.LastError = err.Error()
+				c.recordPartialLocked("per-collect byte limit reached while draining rotated log")
+				return err
+			}
 			c.recordErrorLocked(fmt.Errorf("drain rotated %s: %w", c.path, err))
 			return err
 		}
@@ -184,10 +217,19 @@ func (c *Collector) Collect() error {
 		c.recordPartialLocked("copytruncate observed; loss or duplication is possible")
 	}
 
-	if err := c.readToEOFLocked(); err != nil {
+	if err := c.readToEOFLocked(ctx, &remaining); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if errors.Is(err, ErrCollectLimit) {
+			c.health.LastError = err.Error()
+			c.recordPartialLocked("per-collect byte limit reached; call collect again to continue")
+			return err
+		}
 		c.recordErrorLocked(fmt.Errorf("read %s: %w", c.path, err))
 		return err
 	}
+	c.recordSuccessLocked()
 	return nil
 }
 
@@ -197,7 +239,7 @@ func (c *Collector) Collect() error {
 // ordinary Collect.
 func (c *Collector) CollectUntilStable(ctx context.Context, quietFor, pollEvery time.Duration) error {
 	if quietFor <= 0 {
-		return c.Collect()
+		return c.CollectContext(ctx)
 	}
 	if pollEvery <= 0 {
 		pollEvery = quietFor / 4
@@ -205,7 +247,7 @@ func (c *Collector) CollectUntilStable(ctx context.Context, quietFor, pollEvery 
 			pollEvery = time.Millisecond
 		}
 	}
-	if err := c.Collect(); err != nil {
+	if err := c.CollectContext(ctx); err != nil {
 		return err
 	}
 	last := c.progressMarker()
@@ -217,7 +259,7 @@ func (c *Collector) CollectUntilStable(ctx context.Context, quietFor, pollEvery 
 		case <-ctx.Done():
 			return fmt.Errorf("accesslog: wait for buffered log flush: %w", ctx.Err())
 		case now := <-ticker.C:
-			if err := c.Collect(); err != nil {
+			if err := c.CollectContext(ctx); err != nil {
 				return err
 			}
 			current := c.progressMarker()
@@ -312,11 +354,22 @@ func (c *Collector) openLocked(baselineEOF bool) error {
 	return nil
 }
 
-func (c *Collector) readToEOFLocked() error {
+func (c *Collector) readToEOFLocked(ctx context.Context, remaining *int64) error {
 	buf := make([]byte, 32<<10)
 	for {
-		n, err := c.file.Read(buf)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if *remaining <= 0 {
+			return ErrCollectLimit
+		}
+		readBuf := buf
+		if int64(len(readBuf)) > *remaining {
+			readBuf = readBuf[:*remaining]
+		}
+		n, err := c.file.Read(readBuf)
 		if n > 0 {
+			*remaining -= int64(n)
 			c.offset += int64(n)
 			c.consumeLocked(buf[:n])
 		}
@@ -394,6 +447,16 @@ func (c *Collector) recordErrorLocked(err error) {
 	if c.health.Message == "" {
 		c.health.Message = "access-log collection failed; application execution is unaffected"
 	}
+}
+
+func (c *Collector) recordSuccessLocked() {
+	c.health.LastError = ""
+	if c.health.Dropped > 0 || c.health.Partial > 0 || c.health.Rotations > 0 || c.health.CopyTruncates > 0 {
+		c.health.Status = StatusPartial
+		return
+	}
+	c.health.Status = StatusOK
+	c.health.Message = ""
 }
 
 type progress struct {

@@ -27,21 +27,27 @@ export default function () {
   // 1. login (accounts from the initial dataset)
   const n = 1 + (__VU % 999);
   const account = `user${String(n).padStart(4, "0")}`;
+  // Synthetic, non-secret story labels. One ID per iteration keeps repeated
+  // VU journeys separate. The authentication cookie is deliberately not logged.
+  const params = { headers: {
+    "X-Isutools-Session": `k6-vu-${__VU}-iter-${__ITER}`,
+    "X-Isutools-Scenario": "login_and_browse",
+  } };
   let res = http.post(`${BASE}/login`, {
     account_name: account,
     password: account,
-  });
+  }, params);
   check(res, { "login succeeded": (r) => r.status === 200 });
 
   // 2. timeline
-  res = http.get(`${BASE}/`);
+  res = http.get(`${BASE}/`, params);
   check(res, { "timeline 200": (r) => r.status === 200 });
   sleep(0.5);
 
   // 3. one post detail (follow a link the way a reader would)
   const m = res.body && res.body.match(/href="\/posts\/(\d+)"/);
   if (m) {
-    res = http.get(`${BASE}/posts/${m[1]}`);
+    res = http.get(`${BASE}/posts/${m[1]}`, params);
     check(res, { "post detail 200": (r) => r.status === 200 });
     sleep(0.5);
   }
@@ -49,7 +55,7 @@ export default function () {
   // 4. an author page
   const u = res.body && res.body.match(/href="\/@([0-9a-zA-Z_]+)"/);
   if (u) {
-    res = http.get(`${BASE}/@${u[1]}`);
+    res = http.get(`${BASE}/@${u[1]}`, params);
     check(res, { "user page 200": (r) => r.status === 200 });
   }
   sleep(1);

@@ -2,6 +2,7 @@ package accesslog
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +17,9 @@ const (
 )
 
 func TestParseNginxLTSV(t *testing.T) {
-	rec, err := ParseNginxLTSV(strings.TrimSpace(strings.Replace(lineA, "uri:/posts/1", `uri:/posts/1?q=secret`, 1)))
+	line := strings.Replace(lineA, "uri:/posts/1", `uri:/posts/1?q=secret`, 1)
+	line = strings.TrimSpace(line) + "\tproto:HTTP/3.0"
+	rec, err := ParseNginxLTSV(line)
 	if err != nil {
 		t.Fatalf("ParseNginxLTSV: %v", err)
 	}
@@ -26,11 +29,37 @@ func TestParseNginxLTSV(t *testing.T) {
 	if rec.Status != 200 || rec.RequestTime != 250*time.Millisecond || rec.Bytes != 4096 {
 		t.Fatalf("response fields = %#v", rec)
 	}
+	if rec.Protocol != "HTTP/3.0" {
+		t.Fatalf("protocol = %q", rec.Protocol)
+	}
 	if rec.UpstreamRaw != "0.120, 0.030 : 0.010" || rec.UpstreamAttempts != 3 || rec.UpstreamTotal != 160*time.Millisecond {
 		t.Fatalf("upstream fields = %#v", rec)
 	}
 	if !rec.UpstreamValid || !rec.UpstreamComplete || rec.NoUpstreamTiming {
 		t.Fatalf("upstream validity = %#v", rec)
+	}
+}
+
+func TestAggregatorProtocolBreakdown(t *testing.T) {
+	a := NewAggregator(100)
+	for i := 0; i < 3; i++ {
+		a.Observe(Record{Method: "GET", URI: "/", Protocol: "HTTP/3.0", Status: 200, RequestTime: time.Duration(i+1) * time.Millisecond})
+	}
+	a.Observe(Record{Method: "GET", URI: "/", Protocol: "HTTP/2.0", Status: 503, RequestTime: 10 * time.Millisecond})
+	snap := a.Snapshot()
+	if len(snap.Protocols) != 2 {
+		t.Fatalf("protocols = %#v", snap.Protocols)
+	}
+	if got := snap.Protocols[0]; got.Protocol != "HTTP/3.0" || got.Count != 3 || got.Status5xx != 0 || got.RequestP95 == 0 {
+		t.Errorf("HTTP/3 aggregate = %#v", got)
+	}
+	if got := snap.Protocols[1]; got.Protocol != "HTTP/2.0" || got.Count != 1 || got.Status5xx != 1 {
+		t.Errorf("HTTP/2 aggregate = %#v", got)
+	}
+
+	a.Reset()
+	if got := a.Snapshot().Protocols; len(got) != 0 {
+		t.Errorf("protocols must reset with generation: %#v", got)
 	}
 }
 
@@ -269,6 +298,30 @@ func TestCollectorCollectUntilStableWaitsForBufferedAppend(t *testing.T) {
 	<-done
 	if snap := c.Snapshot(); snap.Lines != 1 {
 		t.Fatalf("buffered append was not collected: %#v", snap)
+	}
+}
+
+func TestCollectContextHonorsCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "access.log")
+	writeFile(t, path, "")
+	c := New(path)
+	t.Cleanup(c.Close)
+	appendFile(t, path, lineA)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.CollectContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CollectContext error = %v, want context.Canceled", err)
+	}
+}
+
+func TestCollectBoundsBytesPerCall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "access.log")
+	writeFile(t, path, "")
+	c := New(path, WithMaxCollectBytes(int64(len(lineA))))
+	t.Cleanup(c.Close)
+	appendFile(t, path, lineA+lineB)
+	if err := c.Collect(); !errors.Is(err, ErrCollectLimit) {
+		t.Fatalf("Collect error = %v, want ErrCollectLimit", err)
 	}
 }
 

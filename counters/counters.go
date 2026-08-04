@@ -5,7 +5,17 @@ package counters
 
 import (
 	"sort"
+	"strings"
 	"sync"
+)
+
+const (
+	// DefaultMaxNames bounds dynamic counter identities per generation.
+	DefaultMaxNames = 1024
+	// MaxNameBytes bounds the retained memory for each identity.
+	MaxNameBytes = 128
+	// OverflowName receives observations outside either bound.
+	OverflowName = "(other)"
 )
 
 // Entry is one counter value in a snapshot.
@@ -16,8 +26,9 @@ type Entry struct {
 
 // Registry is a concurrency-safe named counter set.
 type Registry struct {
-	mu     sync.Mutex
-	counts map[string]int64
+	mu      sync.Mutex
+	counts  map[string]int64
+	dropped uint64
 }
 
 // Default is the registry the facade helpers write into.
@@ -31,8 +42,23 @@ func NewRegistry() *Registry {
 // Add increments a named counter by delta.
 func (r *Registry) Add(name string, delta int64) {
 	r.mu.Lock()
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > MaxNameBytes {
+		name = OverflowName
+		r.dropped++
+	} else if _, exists := r.counts[name]; !exists && len(r.counts) >= DefaultMaxNames {
+		name = OverflowName
+		r.dropped++
+	}
 	r.counts[name] += delta
 	r.mu.Unlock()
+}
+
+// Dropped returns how many observations were merged into OverflowName.
+func (r *Registry) Dropped() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dropped
 }
 
 // Snapshot returns entries sorted by count descending (ties by name).
@@ -56,5 +82,6 @@ func (r *Registry) Snapshot() []Entry {
 func (r *Registry) Reset() {
 	r.mu.Lock()
 	r.counts = map[string]int64{}
+	r.dropped = 0
 	r.mu.Unlock()
 }

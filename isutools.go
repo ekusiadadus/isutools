@@ -18,13 +18,14 @@ package isutools
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,6 +104,13 @@ func resolveAdminAddr(getenv func(string) string) string {
 	}
 }
 
+func resolveAccessLogPath(getenv func(string) string) string {
+	if path := getenv("ISUTOOLS_ACCESS_LOG"); path != "" {
+		return path
+	}
+	return getenv("ISUTOOLS_NGINX_LOG")
+}
+
 // startAdmin starts the admin HTTP server once. Failures are logged and
 // otherwise ignored: the report becomes unavailable, the app is unaffected.
 func startAdmin() {
@@ -112,18 +120,17 @@ func startAdmin() {
 			collectorHealth.Set("admin", health.StatusDisabled, "disabled by ISUTOOLS_ADDR")
 			return
 		}
-		token := os.Getenv("ISUTOOLS_TOKEN")
 		allowUnauthenticated := os.Getenv("ISUTOOLS_ALLOW_UNAUTHENTICATED") == "1"
-		if !isLoopbackAdminAddr(addr) && token == "" && !allowUnauthenticated {
-			err := errors.New("non-loopback admin bind requires ISUTOOLS_TOKEN or explicit ISUTOOLS_ALLOW_UNAUTHENTICATED=1")
+		if !isLoopbackAdminAddr(addr) && !allowUnauthenticated {
+			err := errors.New("non-loopback admin bind requires explicit ISUTOOLS_ALLOW_UNAUTHENTICATED=1 and external SSH/firewall isolation")
 			collectorHealth.Set("admin", health.StatusFailed, err.Error())
 			log.Printf("isutools: admin server disabled: %v", err)
 			return
 		}
 		unprotectedNonLoopback := !isLoopbackAdminAddr(addr) && allowUnauthenticated
 		if unprotectedNonLoopback {
-			message := "unauthenticated non-loopback admin bind explicitly enabled; restrict host publishing to 127.0.0.1"
-			collectorHealth.Set("admin", health.StatusDegraded, message)
+			message := "SECURITY WARNING: non-loopback admin bind enabled; restrict host publishing to 127.0.0.1 and use SSH"
+			collectorHealth.Set("admin", health.StatusOK, message)
 			log.Printf("isutools: warning: %s", message)
 		}
 		ln, err := net.Listen("tcp", addr)
@@ -139,14 +146,19 @@ func startAdmin() {
 		adminBind = ln.Addr().String()
 		adminMu.Unlock()
 		log.Printf("isutools: admin server on http://%s", ln.Addr())
-		handler, err := protectAdmin(addr, token, allowUnauthenticated, Handler())
+		handler, err := protectAdmin(addr, allowUnauthenticated, Handler())
 		if err != nil {
 			_ = ln.Close()
 			collectorHealth.Set("admin", health.StatusFailed, err.Error())
 			return
 		}
 		go func() {
-			_ = http.Serve(ln, handler)
+			server := &http.Server{
+				Handler:           handler,
+				ReadHeaderTimeout: 5 * time.Second,
+				IdleTimeout:       60 * time.Second,
+			}
+			_ = server.Serve(ln)
 		}()
 	})
 }
@@ -171,45 +183,42 @@ func isLoopbackAdminAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// adminCookieName carries browser sessions authenticated once via ?token=.
-const adminCookieName = "isutools_token"
-
-func protectAdmin(addr, token string, allowUnauthenticated bool, next http.Handler) (http.Handler, error) {
-	if isLoopbackAdminAddr(addr) || allowUnauthenticated {
-		return next, nil
-	}
-	if token == "" {
-		return nil, errors.New("non-loopback admin bind requires authentication or explicit unauthenticated opt-in")
-	}
-	want := sha256.Sum256([]byte("Bearer " + token))
-	matches := func(bearer string) bool {
-		got := sha256.Sum256([]byte(bearer))
-		return subtle.ConstantTimeCompare(got[:], want[:]) == 1
+func protectAdmin(addr string, allowUnauthenticated bool, next http.Handler) (http.Handler, error) {
+	if !isLoopbackAdminAddr(addr) && !allowUnauthenticated {
+		return nil, errors.New("non-loopback admin bind requires explicit external-isolation opt-in")
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authorized := matches(r.Header.Get("Authorization"))
-		// Browsers cannot send Authorization headers to a plain URL, so a
-		// one-time ?token= grants an HttpOnly session cookie for the UI.
-		if !authorized {
-			if q := r.URL.Query().Get("token"); q != "" && matches("Bearer "+q) {
-				authorized = true
-				http.SetCookie(w, &http.Cookie{
-					Name: adminCookieName, Value: q, Path: "/", HttpOnly: true,
-				})
-			}
-		}
-		if !authorized {
-			if c, err := r.Cookie(adminCookieName); err == nil && matches("Bearer "+c.Value) {
-				authorized = true
-			}
-		}
-		if !authorized {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="isutools"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if !isLoopbackRequestHost(r.Host) || strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") ||
+			!sameAdminOrigin(r.Header.Get("Origin"), r.Host) || !sameAdminOrigin(r.Header.Get("Referer"), r.Host) {
+			http.Error(w, "forbidden by SSH-only admin policy", http.StatusForbidden)
 			return
 		}
 		next.ServeHTTP(w, r)
 	}), nil
+}
+
+func isLoopbackRequestHost(hostport string) bool {
+	host := hostport
+	if parsed, _, err := net.SplitHostPort(hostport); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func sameAdminOrigin(value, requestHost string) bool {
+	if value == "" {
+		return true
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || !isLoopbackRequestHost(parsed.Host) {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, requestHost)
 }
 
 // RegisterSQL wraps the named drivers ("mysql", "pgx", ...) and registers
@@ -293,8 +302,20 @@ func Handler() http.Handler {
 		Advisor:  collectAdvice,
 		Counters: counters.Default,
 	}
+	trafficClientFacing := os.Getenv("ISUTOOLS_HTTP3_EDGE") == ""
+	provider.ProtocolTrafficClientFacing = &trafficClientFacing
+	if path := os.Getenv("ISUTOOLS_HTTP3_QUIC_METRICS"); path != "" {
+		provider.QUICTelemetry = func() (*advisor.QUICTelemetry, error) {
+			return readQUICTelemetryFile(path)
+		}
+	}
+	if path := os.Getenv("ISUTOOLS_CACHE_METRICS"); path != "" {
+		provider.CacheTelemetry = func() (*advisor.CacheTelemetry, error) {
+			return readCacheTelemetryFile(path)
+		}
+	}
 	collectorHealth.Set("http", health.StatusOK, "")
-	if path := os.Getenv("ISUTOOLS_NGINX_LOG"); path != "" {
+	if path := resolveAccessLogPath(os.Getenv); path != "" {
 		collector := accesslog.New(path)
 		provider.AccessLog = collector
 		provider.AccessLogQuiet = 100 * time.Millisecond
@@ -307,7 +328,7 @@ func Handler() http.Handler {
 			collectorHealth.Set("accesslog", health.StatusDegraded, state.Message)
 		}
 	} else {
-		collectorHealth.Set("accesslog", health.StatusDisabled, "ISUTOOLS_NGINX_LOG is not configured")
+		collectorHealth.Set("accesslog", health.StatusDisabled, "ISUTOOLS_ACCESS_LOG is not configured")
 	}
 	if runtime.GOOS == "linux" {
 		collector := procstats.New()
@@ -334,7 +355,7 @@ func collectAdvice(ctx context.Context) []advisor.Check {
 	if name, dsn, ok := sqlstats.FirstConn(); ok {
 		opts.DriverName, opts.DSN = name, dsn
 		if db, err := sql.Open(name, dsn); err == nil {
-			defer db.Close()
+			defer func() { _ = db.Close() }()
 			db.SetMaxOpenConns(1)
 			opts.DB = db
 			return collectAdviceWithConf(ctx, opts)
@@ -344,15 +365,88 @@ func collectAdvice(ctx context.Context) []advisor.Check {
 }
 
 func collectAdviceWithConf(ctx context.Context, opts advisor.Options) []advisor.Check {
-	if path := os.Getenv("ISUTOOLS_NGINX_CONF"); path != "" {
-		opts.NginxConf = readNginxConf(path)
+	return collectAdviceWithEnv(ctx, opts, os.Getenv)
+}
+
+func collectAdviceWithEnv(ctx context.Context, opts advisor.Options, getenv func(string) string) []advisor.Check {
+	path := getenv("ISUTOOLS_PROXY_CONF")
+	kind := strings.ToLower(strings.TrimSpace(getenv("ISUTOOLS_PROXY_KIND")))
+	legacyNginx := false
+	if path == "" {
+		path = getenv("ISUTOOLS_NGINX_CONF")
+		legacyNginx = path != ""
 	}
+	if kind == "" {
+		if legacyNginx {
+			kind = "nginx"
+		} else {
+			kind = inferProxyKindFromPath(path)
+		}
+	}
+	if path != "" {
+		config := readProxyConf(path)
+		opts.Protocol.ProxyConfig = config
+		opts.Protocol.ProxyKind = kind
+		if kind == "nginx" {
+			opts.NginxConf = config
+		}
+	}
+	opts.Protocol.UDP443Reachable = advisor.ParseEvidence(getenv("ISUTOOLS_HTTP3_UDP443"))
+	opts.Protocol.EdgeName = strings.TrimSpace(getenv("ISUTOOLS_HTTP3_EDGE"))
+	opts.Protocol.EdgeHTTP3 = advisor.ParseEvidence(getenv("ISUTOOLS_HTTP3_EDGE_ENABLED"))
 	return advisor.Collect(ctx, opts)
 }
 
-// readNginxConf reads a conf file, or concatenates nginx.conf and *.conf
-// files when path is a directory (best effort).
-func readNginxConf(path string) []byte {
+func readQUICTelemetryFile(path string) (*advisor.QUICTelemetry, error) {
+	var telemetry advisor.QUICTelemetry
+	if err := readTelemetryJSON(path, &telemetry); err != nil {
+		return nil, err
+	}
+	return &telemetry, nil
+}
+
+func readCacheTelemetryFile(path string) (*advisor.CacheTelemetry, error) {
+	var telemetry advisor.CacheTelemetry
+	if err := readTelemetryJSON(path, &telemetry); err != nil {
+		return nil, err
+	}
+	return &telemetry, nil
+}
+
+func readTelemetryJSON(path string, out any) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	const maxTelemetryBytes = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(file, maxTelemetryBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxTelemetryBytes {
+		return errors.New("telemetry exceeds 64 KiB")
+	}
+	return json.Unmarshal(data, out)
+}
+
+func inferProxyKindFromPath(path string) string {
+	name := strings.ToLower(filepath.Base(path))
+	switch {
+	case name == "caddyfile" || strings.Contains(name, "caddy"):
+		return "caddy"
+	case strings.Contains(name, "envoy"):
+		return "envoy"
+	case strings.Contains(name, "nginx"):
+		return "nginx"
+	default:
+		return ""
+	}
+}
+
+// readProxyConf reads a config file, or concatenates *.conf files when path is
+// an nginx-style directory (best effort). Caddy/Envoy should pass a file.
+func readProxyConf(path string) []byte {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil
