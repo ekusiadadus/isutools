@@ -48,40 +48,79 @@ GET  /peer/runs/{run_id}            immutable run snapshot 取得(LocalSnapshot)
 
 ### handshake(v2 から維持 + 判定変更)
 
-`PeerInfo{schema_version, protocol_version, capabilities, identity(03),
-agent_version, started_at}`。**required peer** は次のいずれかで
-**preflight 失敗 = run を開始せず invalid**:
+`PeerInfo{schema_version, protocol_version, capabilities, agent_id,
+identity(03), role, agent_version, started_at}`。**required peer** は
+次のいずれかで **preflight 失敗 = run を開始せず invalid**:
 接続不可 / protocol_version 不一致 / schema_version 非互換 /
 hub が要求する capability の欠如。optional peer は partial 記録で継続。
-重複 identity(machine_id+boot_id+NetNS 一致)は設定エラー。
 
-### ResetRun(開始バリア)
+**identity の 2 層分離(v4 修正)**: v3 の
+「machine_id+boot_id+NetNS 一致 = 重複拒否」は、同一ホスト・同一 netns 上の
+複数 app プロセスという正当な構成を拒否してしまう。
 
-1. hub の Controller が run_id を発番(02)し、preflight(handshake 再検証)
-2. 全 required peer へ `POST /peer/runs` を並列送信。peer は 02 の
-   `Reset(WaitDrain:true)` を実行し、自身の ResetResult を ACK として返す
-3. **全 required ACK が揃ってから** hub の `POST /reset` が応答する
-   (bench 開始 = 全ホスト境界確定後)。1 つでも失敗 → **503 + invalid**
-   (bench を開始させない)。optional の失敗は partial
-4. hub は peer ごとに送信時刻と ACK 受信時刻を記録し、
-   **boundary uncertainty = [送信, ACK] 区間**として snapshot に保存する
-   (ホスト間の時計は比較しない。NTP 同期は前提にしない)
+- **host identity**(machine_id/boot_id hash): hoststats の
+  **host 単位 dedup に使う**(同一 host の複数 peer から hoststats を
+  二重計上しない)。拒否はしない
+- **agent instance identity**(`agent_id`: 起動時に生成し DataDir に
+  永続化する UUID + role/process 情報): **peer の識別に使う**。
+  同一 agent_id の二重指定のみ設定エラー
 
-### FinishRun(終了バリア — v3 新設)
+### participant モデル(v4 修正)
 
-1. hub の `POST /save`(または `POST /collect`)が起点。まず hub 自身の
-   collector を freeze(02 の BeginBoundary で世代を閉じ、accesslog を
-   flush → snapshot を確定)
-2. 全 peer へ `POST /peer/runs/{run_id}/finish` を並列送信。peer は
-   accesslog collect の flush → 全 collector の境界確定 →
-   **LocalSnapshot を run_id 付きで immutable に保存**し、FinishResult
-   (各 collector の境界時刻)を ACK として返す
-3. required peer の finish 失敗 → run を invalid で保存(データは
-   得られた範囲で保持し、欠落 peer と理由を記録)。optional → partial
-4. hub は ACK 後に `GET /peer/runs/{run_id}` で取得する。応答内の
-   run_id を検証し、不一致は protocol error として invalid
-5. 各 peer の計測区間は「その peer の ResetResult / FinishResult の
-   境界時刻」で表示する(fetch 遅延はもはや区間に影響しない)
+v3 は「hub を先に freeze してから peer へ送る」「hub は boundary→flush、
+peer は flush→boundary」と、hub と peer の扱い・順序が非対称だった。
+v4 では **run_id の発番とローカル reset を分離し、hub 自身を
+participant #0 として peer と同一のコードパス・同一の順序で扱う**:
+
+- participant = hub-local + 各 peer。Start/Finish は全 participant へ
+  **並列に**発行する(hub-local は関数呼び出し、peer は HTTP)
+- 各バリアで participant ごとに送信/ACK 時刻を記録し、
+  **uncertainty = [送信, ACK] 区間**として保存する(hub-local は
+  実行区間そのもの)。ホスト間の時計は比較しない
+
+### StartRun バリア
+
+1. hub の Controller が run_id を発番し、preflight(handshake 再検証)。
+   required 不適合 → **reset を開始せず invalid + 503**
+2. 全 participant へ StartRun(run_id, nonce) を並列発行。各 participant は
+   02 の StartRun(世代スワップ + baseline 同期採取)を実行し、
+   StartResult を ACK として返す
+3. **全 required ACK が揃ってから** hub の `POST /reset` が応答する。
+   required 失敗 → 503 + invalid(bench を開始させない)。optional → partial
+
+### FinishRun バリア(v4: 全 participant で同一順序)
+
+各 participant は**同じ順序**で終了処理を行う:
+
+1. **freeze point の固定(高速・同期)**: HTTP 世代スワップ +
+   accesslog の EOF offset 記録。この時点が計測終了境界
+2. **固定点までの Drain(非同期可)**: 記録した offset までの
+   accesslog collect、旧世代 in-flight の確定
+3. **LocalSnapshot を run_id 付きで immutable に保存**し、FinishResult
+   (freeze point 実測時刻)を ACK として返す
+
+hub は `POST /save` / `POST /collect` を起点に全 participant へ
+FinishRun(run_id) を並列発行し、required の ACK が揃ってから
+`GET /peer/runs/{run_id}` で取得する(run_id 不一致は protocol error)。
+required の finish 失敗 → invalid(得られた範囲は保持)。optional → partial。
+各 participant の計測区間は自身の StartResult / FinishResult の
+実測境界時刻で表示し、fetch 遅延は区間に影響しない。
+
+### participant 状態機械と再試行(v4 新設)
+
+```
+idle → started(StartRun 済) → finished(freeze+保存済) → acknowledged(hub 取得済)
+```
+
+- **冪等な再送**: 同一 run_id+nonce の StartRun / FinishRun 再送は
+  保存済みの同じ不変結果を返す(再実行しない)
+- **競合**: 別 run_id の StartRun が started/finished 中に来たら 409
+  (hub 側で先行 run を invalid にしてから明示的に新 run を開始する)。
+  finished 後の同一 run への StartRun 再送も 409
+- **保持**: LocalSnapshot は hub の ACK(acknowledged)または
+  TTL(10 分)まで保持し、**直近 2 run 分**を持つ(hub 障害後の
+  再取得を可能にする。v3 の「1 run のみ・即置換」を撤回)
+- nonce は「直近 1 件」ではなく **TTL 付き履歴**(10 分)で照合する
 
 ## wire DTO と容量 budget
 
@@ -104,16 +143,34 @@ budget(32MiB snapshot キャップ内、決定的優先順):
 
 1. **hub 自身の snapshot 分を最初に確保**(実測サイズ。上限 16MiB)
 2. 残りを required peer に等分(per-peer 上限、既定 4MiB)。
-   セクション drop の優先順(accesslog 詳細 → HTTP 詳細 → …)で
-   縮小してもなお超過する required peer は **invalid**(取り込み失敗は
-   計測不成立)
+   縮小は 2 段階を区別する(v4 修正 — 「drop して収めたら valid に
+   見える」問題の解消):
+   - **行数の top-N 縮小**(SQL/HTTP 表の下位行を削る): 許容。
+     縮小した事実を Dropped に記録するのみ(run 状態は不変)
+   - **セクション全欠落**(accesslog 全体を落とす等): required peer では
+     **最低でも partial**。hub が必須と宣言した capability に対応する
+     セクションの欠落は **invalid**
+   - top-N 縮小でもなお per-peer 上限を超える required peer は invalid
 3. optional peer は残量の範囲で取り込み、超過は Dropped 記録 + partial
 
 ## agent と配布(v3 変更)
 
 - `cmd/isutools-agent`: 既存パッケージの配線のみ。
-  複数 DB target は `ISUTOOLS_AGENT_TARGETS="name=dsn;name2=dsn2"`
-  (01 の TargetID と同一の名前空間)
+  複数 DB target は **JSON ファイル**で宣言する(v4 修正 — DSN には
+  driver が含まれず `name=dsn` 形式では driver を特定できないため。
+  区切り文字が DSN と衝突する問題も回避):
+
+  ```bash
+  export ISUTOOLS_AGENT_TARGETS_FILE=/etc/isutools/targets.json
+  ```
+  ```json
+  [
+    {"id": "shard1", "driver": "mysql", "dsn": "user:pass@tcp(127.0.0.1:3306)/isuconp"},
+    {"id": "shard2", "driver": "mysql", "dsn": "user:pass@tcp(127.0.0.1:3307)/isuconp"}
+  ]
+  ```
+
+  `driver` は必須項目。id は 01 の TargetID と同一の名前空間
 - 配布: **リリース tag 固定の事前 build 済み単一 binary + SHA-256
   checksum** を GitHub Releases に添付(make target で linux/amd64,
   arm64 を cross-build)。hub と agent は**同一 binary バージョン**を
@@ -155,6 +212,6 @@ budget(32MiB snapshot キャップ内、決定的優先順):
 | リスク | 対策 |
 |---|---|
 | バリア 2 回分の運用複雑化 | bench.sh 例を提供(reset→bench→save だけは従来どおり。バリアは hub 内部) |
-| peer の immutable 保存領域 | run 1 つ分のみ保持(新 run で置換)。DataDir 不要の in-memory + サイズ上限 |
+| peer の immutable 保存領域 | 直近 2 run 分を ACK/TTL(10 分)まで保持(状態機械の項)。in-memory + サイズ上限 |
 | namespace 不可視 | E2E で確定し identity 表示で判別可能にする |
 | 32MiB との衝突 | budget 決定則(hub 優先・required invalid・optional partial) |

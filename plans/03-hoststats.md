@@ -48,8 +48,16 @@ DB ホストの診断に必要な以下が**存在しない**:
 
 - `/proc/self/cgroup` + `/proc/self/mountinfo` から**自プロセスの実 cgroup
   パスを解決**して読む
-- snapshot に `cgroup_scope: "host" | "agent-cgroup" | "configured-cgroup"`
-  を必ず記録する(root と実パスが同一なら host)
+- snapshot に `cgroup_scope: "visible-root" | "agent-cgroup" |
+  "configured-cgroup" | "host"` を必ず記録する。
+  **「root と実パスが同一なら host」とは判定しない**(v4 修正):
+  cgroup namespace 内では /proc/self/cgroup と mountinfo の見え方自体が
+  仮想化され、コンテナ内の現在 cgroup が `/` に見える
+  (cgroup_namespaces(7))。既定は **visible-root** とし、
+  `host` は明示設定(`ISUTOOLS_CGROUP_SCOPE=host`)または初期 cgroup
+  namespace であることの外部証拠がある場合に限定する
+- identity(前節)に **CgroupNS**(`/proc/self/ns/cgroup`)を追加し、
+  scope の解釈材料として常に併記する
 - `ISUTOOLS_CGROUP_PATH` で対象 cgroup(例: mysqld の service cgroup)を
   明示指定できる(scope=configured-cgroup)。指定パスが読めない場合は skip
 - 表示は scope を併記し、「agent の limit ≠ 観測対象サービスの limit」で
@@ -65,6 +73,7 @@ type Identity struct {
     PIDNS        string `json:"pid_ns"`   // readlink /proc/self/ns/pid
     NetNS        string `json:"net_ns"`
     MntNS        string `json:"mnt_ns"`
+    CgroupNS     string `json:"cgroup_ns"` // cgroup_scope の解釈材料(v4)
     Role         string `json:"role,omitempty"` // ISUTOOLS_ROLE=app|db|dns|proxy(自由記述)
     AgentVersion string `json:"agent_version"`  // buildinfo
 }

@@ -59,9 +59,13 @@ FROM performance_schema.events_statements_summary_by_digest
 WHERE SCHEMA_NAME = DATABASE() OR (SCHEMA_NAME IS NULL AND DIGEST IS NULL)
 ```
 
-  - **LIMIT なし**(全 digest)。1 行 ≈ 100B、上限は
-    `performance_schema_digests_size`(既定 ~1 万)なので
-    baseline のメモリは高々 ~1MiB/target
+  - **LIMIT なし**(全 digest)。行数上限は
+    `performance_schema_digests_size`(既定 ~1 万)。
+    メモリ見積もりは「1 行 100B」のような楽観値を仮定しない(v4 修正:
+    Go の map bucket・string・object overhead を含むと数倍になり、
+    16 target では GC 影響も無視できない)。
+    **allocation benchmark(`-benchmem`)で 1 万 digest × 16 target の
+    実測上限を受け入れ条件にし、実測値を docs に記録する**
   - baseline には DIGEST_TEXT を**含めない**(メモリ節約)。
     表示対象に決まった上位 200 についてのみ、Snapshot 時に
     `WHERE DIGEST IN (...)` で DIGEST_TEXT(512B に切り詰め)を追加取得
@@ -96,8 +100,10 @@ counter 後退のみの検出では、(a) TRUNCATE 後に同数以上実行さ�
 
 ### 文種分離と比率
 
-- DIGEST_TEXT 先頭トークンで SELECT / DML(INSERT・UPDATE・DELETE・
-  REPLACE)/ その他に分類
+- DIGEST_TEXT の先頭トークンで SELECT / DML(INSERT・UPDATE・DELETE・
+  REPLACE)/ その他に分類する。ただし **`WITH ... SELECT`(CTE)は
+  SELECT として扱う**(v4 修正: 先頭トークンのみでは Other に落ちる。
+  WITH 開始の場合は本体の文種まで読み進める。CTE fixture をテストに含める)
 - 比率列(`examined_per_sent`)は **SELECT かつ RowsSent > 0 のみ**算出。
   それ以外は N/A 表示。DML は RowsAffected 列を主表示にする
 
@@ -120,8 +126,12 @@ counter 後退のみの検出では、(a) TRUNCATE 後に同数以上実行さ�
 
 ### feature flag
 
-`ISUTOOLS_SQLROWS=off` で無効(既定 on)。単独 ABBA:
-flag off ↔ on で Reset/Snapshot 時の 2 クエリのみの差であることを実測。
+`ISUTOOLS_SQLROWS=off` で無効(既定 on)。実クエリ数を正確に記載する
+(v4 修正 — 「2 クエリのみ」は不正確):
+Reset 時 = probe 2(performance_schema / setup_consumers、初回のみ)+
+server_uuid/Uptime 1 + digest 全件 1。Snapshot 時 = server_uuid/Uptime 1 +
+digest 全件 1 + 上位 200 の DIGEST_TEXT 取得 1。
+単独 ABBA は flag off ↔ on で境界時のこれらのクエリ差のみであることを実測。
 
 ## 実装ステップ(TDD)
 

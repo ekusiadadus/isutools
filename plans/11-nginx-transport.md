@@ -35,33 +35,42 @@ isutools v1.1.0 は `os-somaxconn`(1024 未満 warn / 4096 推奨)と
 
 `opts.NginxConf`(既存入力)の静的解析:
 
-- `proxy_pass` / upstream `server` の宛先が **loopback TCP**
-  (`127.0.0.1:*` / `localhost:*`)→ **info**:
+- 対象は **`http://` の loopback TCP 宛先のみ**(`127.0.0.1:*` /
+  `localhost:*`)→ **info**:
   「同一ホスト内通信は UNIX domain socket に置き換え可能
   (app 側 listen を `/tmp/webapp.sock` へ、nginx は
   `server unix:/tmp/webapp.sock;`)。ephemeral port 消費と
   TCP 処理を回避(ISUCON 本 9-8)」
+- **`https://` 宛先は対象外**(v4 修正: UDS 化すると TLS を失う。
+  loopback への TLS は意図的な構成であり提案しない)
 - 既に `unix:` 宛先 → ok
 - 宛先が loopback 以外(別ホスト・コンテナのサービス名)→ skip
   (「対象外: upstream が同一ホストではない」)。
   **コンテナ分離構成(例: private-isu の compose)では発火しない**のが
-  正しい挙動(UDS には socket ファイルの共有 volume が必要なため、
-  推奨文言には含めない)
+  正しい挙動
+- 推奨文言に前提条件を明記する(v4): (a) app が UDS listen に変更
+  できること、(b) nginx と app が socket ファイルの filesystem を
+  共有できること(localhost 宛でも別 mount namespace では不可)、
+  (c) 同一ホスト間で TLS が不要であること
 - 重大度は info 固定(defect ではなく機会の提示。キャッシュ検査の
   `nginx-proxy-cache` と同じ整理)
 
 ### `nginx-listen-backlog`(新規 check)
 
 - 前提: FS から somaxconn が読めていること(読めなければ skip)
-- `listen` directive に `backlog=` がなく、somaxconn ≥ 4096 → **info**:
+- **解析単位は「有効な listen endpoint(address:port)」**(v4 修正:
+  backlog は server ブロックではなく listen socket の属性。nginx 仕様では
+  socket parameter は同一 address:port につき 1 箇所の listen にのみ
+  指定できる)。conf 全体から listen directive を address:port で
+  グルーピングし、endpoint ごとに backlog 指定の有無・値を判定する
+- endpoint に `backlog=` がなく、somaxconn ≥ 4096 → **info**:
   「nginx の listen backlog は既定 511。somaxconn=%d を活かすには
-  `listen 80 backlog=8192;` 等の明示が必要(同一 ip:port の backlog は
+  `listen 80 backlog=8192;` 等の明示が必要(同一 address:port では
   1 箇所の listen にのみ指定可)」
 - `backlog=N` があり N < somaxconn/2 → info(値の乖離を提示)
-- `backlog=` 指定あり(妥当)→ ok
-- 判定は server ブロック横断の存在確認に留める(nginx の
-  「同一 ip:port で backlog 重複指定は起動エラー」制約があるため、
-  推奨文言に注意書きを含める)
+- endpoint 単位で妥当な `backlog=` あり → ok
+- 動的・変数を含む listen や解析不能な形式は当該 endpoint を skip
+  (保守的に。誤検知で起動エラーを誘発する提案をしない)
 
 ### `go-pgo`(新規 check・小)
 
@@ -105,7 +114,8 @@ speed と同じ sysfs 注入経路のため実装は 05 に含める(本計画�
 
 ## テスト計画
 
-- unit: `proxy_pass https://localhost:8443;`(TLS 付き loopback)も info
+- unit: `proxy_pass https://localhost:8443;`(TLS 付き loopback)は
+  **info を出さない**(https は対象外 — v4)
 - unit: コメントアウトされた listen/proxy_pass を無視(stripComments 済み)
 - unit: 複数 server ブロックの混在(unix と loopback 併存 → info を出す)
 

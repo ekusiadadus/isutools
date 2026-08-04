@@ -1,15 +1,17 @@
-# 計測ギャップ解消 実装計画 v3(2026-08-04 第2回レビュー反映版)
+# 計測ギャップ解消 実装計画 v4(2026-08-04 第3回レビュー反映版)
 
-初版(5fbe54c)は第1回レビューで再構成を指示され、v2(a3d26d9)で
-基盤 3 計画 + 機能 7 計画へ分割した。v2 は第2回レビューで
-「多くは解消、ただし **02→08→10 の run 境界契約に CRITICAL 3 件**が残る」
-として差し戻された。本 v3 は指示された修正順序
-(02 → 08 → 10 → 01 → 04/07/09 補強)に従って改訂したものである。
+初版(5fbe54c)→ v2(a3d26d9、基盤+機能へ再構成)→ v3(0a0c6ec、
+run 境界契約の導入)と改訂し、v3 も第3回レビューで CRITICAL 4 件により
+差し戻された。本 v4 は指示された修正順序
+(02 → 08 → 10 → 01 → 03/09 → 04/07/11 → README)に従う改訂である。
 
-v3 の中核変更: **二段階境界(BeginBoundary/Drain)**、並行 reset の
-**409 拒否 + nonce 冪等化**、process-wide **singleton Controller**、
-分散プロトコルへの **FinishRun 終了バリア**と immutable run 取得、
-**安定 TargetID** の第一 API 化。
+v4 の中核変更: 02 を **generation collector(世代スワップ)と
+baseline collector(基準値同期採取)の 2 契約**へ書き直し
+(新 run 冒頭の欠落を排除)、**遷移状態機械(Drain 完了まで 409)**、
+**不変 StartResult / PreviousRunResult の分離**、08 の
+**409 握り潰し禁止(待機 + 自 nonce 再 reset、失敗は 500)**、10 の
+**participant モデル(hub = participant #0、freeze point 固定 →
+固定点まで Drain の統一順序、状態機械 + TTL 保持)**。
 
 ## 調査根拠(レビューでの事実訂正を反映)
 
@@ -44,35 +46,32 @@ v3 の中核変更: **二段階境界(BeginBoundary/Drain)**、並行 reset の
 | [10](./10-multi-host.md) | 複数台横断計測 | 旧06 | **ADR からやり直し**。agent protocol / hub / distributed reset の 3 段階、2〜3 週間規模 |
 | [11](./11-nginx-transport.md) | nginx transport / ランタイム | 新規 | ISUCON 本 9-8/9-9 由来: UNIX domain socket 機会・`listen backlog=`・PGO の静的検査 + MTU 表示(05 に委譲)。依存なし・即実装可 |
 
-## 依存関係(「06 以外は独立」の撤回)
+## 依存関係(v4: 依存種別を明示)
+
+**02 は全計画の実装順依存**である点に注意(v3 の図は 06/08/10 のみを
+02 依存としており、02 自身の「全 collector 移行」要求と矛盾していた)。
+
+| 依存元 | 依存先 | 種別 |
+|---|---|---|
+| 04 sqlrows / 09 explain / 10 multi-host / 06 dbpool | 01 registry | **API 依存**(TargetID / Inspect / Features) |
+| 03 / 04 / 05 / 06(BaselineCollector)、08 / 10(StartRun・nonce) | 02 coordinator | **実装順依存**(collector 契約への移行が前提) |
+| 07 profiles | 02 | **artifact 参照**(run_id をファイル名に使用)+ 設定箇所(singleton runtime 初期化) |
+| 09 explain | 04 | API 依存(digest delta と DB 側 UTC 境界時刻) |
+| 10 multi-host | 03(identity/hoststats)・05(観測項目)・01・02 | 実装順依存 |
+| 11 nginx-transport | 05 | **実装委譲**(MTU 列は 05 の実装に含める。静的検査 2 件と go-pgo は独立) |
+| 03/05 | (相互)| FS 注入設計(procfs/sysfs 分離)の共有 |
+
+## リリース対応(見積もり v4 改訂: 全計画を計上 + buffer 数値化)
 
 ```
-01 registry ──→ 04 sqlrows ──→ 09 explain
-      │                              │
-      └──────────→ 10 multi-host ←───┘
-02 coordinator ─→ 08 auto-reset ─→ 10
-      └──────────→ 06 dbpool(区間デルタの baseline 契約)
-03 hoststats ───→ 10(peer identity / DB ホスト観測)
-05 network ─────→ 10(agent の観測項目)
-07 profiles: 01/02 と独立(artifact 保存のみ 02 の run_id を使用)
+v1.2.0: 01(2日) + 02(4日) + 04(2.5日)            = 実装 8.5 日 → +30% ≈ 11 日
+v1.2.x: 03(2日) + 05(1.75日※) + 06(1日) + 11(1日) = 実装 5.75 日 → +30% ≈ 7.5 日
+v1.3.0: 07(2日) + 08(1.5日) + 09(2.5日)           = 実装 6 日 → +30% ≈ 8 日
+v1.4.0: 10                                        = 15 日 → +30% ≈ 19.5 日
+※ 05 は 11 から委譲された MTU 列 +0.25 日を含む
 ```
 
-- 01/04/09/10 は DSN 保持の一元化(registry)を共有する
-- 02/08/10 は reset 契約を共有する
-- 03/05/10 は FS 注入(procfs と sysfs の分離)と Provider/health 表示を共有する
-
-## リリース対応(見積もり v3 改訂: 個別計画の単純合計 + buffer)
-
-```
-v1.2.0: 01(2日) + 02(3日) + 04(2.5日)  = 実装 7.5 日
-v1.2.x: 03(2日) + 05(1.5日) + 06(1日)  = 実装 4.5 日
-v1.3.0: 07(2日) + 08(1.5日) + 09(2.5日) = 実装 6 日
-v1.4.0: 10                              = 15 日(ADR 2 日を含む)
-```
-
-上記は実装のみの単純合計。各リリースには **統合・機能単位 ABBA・
-ドキュメント・レビュー対応の buffer として +30%** を見込む
-(v1.2.0 ≈ 10 日、v1.2.x ≈ 6 日、v1.3.0 ≈ 8 日)。
+buffer(+30%)は統合・機能単位 ABBA・ドキュメント・レビュー対応分。
 
 ## 全計画共通の契約
 
@@ -85,6 +84,10 @@ v1.4.0: 10                              = 15 日(ADR 2 日を含む)
    `ISUTOOLS_BLOCK_RATE_NS` / `ISUTOOLS_HEAP_PROFILE`(07・**既定off**)、
    `ISUTOOLS_RESET_ON_INITIALIZE`(08・既定off)、
    `ISUTOOLS_EXPLAIN`(09・**既定off**)。
+   **例外(v4 で明文化)**: 設定ファイル・buildinfo の読み取りだけで
+   完結する静的 advisor check(11 の 3 check、既存の nginx/OS check 類)は
+   ランタイムコストがゼロのため専用 flag を要求しない。ランタイム観測・
+   追加クエリ・追加 I/O を伴う機能のみ flag 必須とする。
 3. **機能単位 ABBA**: `examples/abba.sh` を拡張し、
    (a) 全機能 off vs 全機能 on、(b) baseline vs 単一機能 on、の両モードを
    サポートする。リリース tag 前に対象機能の (b) を必ず実施する。
@@ -142,3 +145,26 @@ v1.4.0: 10                              = 15 日(ADR 2 日を含む)
 | [MEDIUM] PeerSnapshot の再帰 / budget 未定義 | 10: LocalSnapshot DTO(Peers/Prev なし)+ hub 優先の決定的 budget |
 | [MEDIUM] artifact の atomic publication / 保持 | 07: 0600 tmp→rename、保持上限、run manifest |
 | [LOW] 見積もり不整合 / 06・09 の flag 欠如 | 本書: 単純合計 + 30% buffer に修正。flag 一覧に ISUTOOLS_DBPOOL / ISUTOOLS_EXPLAIN を追加 |
+
+## 第3回レビュー指摘(差し戻し)→ v4 対応の対応表
+
+| 指摘(要約) | 対応 |
+|---|---|
+| [CRITICAL] baseline を非同期 Drain に置くと新 run 冒頭が欠落 | 02: generation/baseline の 2 契約に分離。baseline は StartRun 内で同期採取、BoundaryAt は実測時刻。冒頭欠落の回帰テストを受け入れ条件化 |
+| [CRITICAL] Drain に世代 token なし・遷移が BeginBoundary までで終わる | 02: 遷移状態機械(idle/starting/draining)。Drain 完了まで 409、世代 handle 付き Drain、Drain 上限 10s |
+| [CRITICAL] 同時 initialize の 409 握り潰しで先行 run が汚染 | 08: 待機(上限 15s)→ 自 nonce で再 reset。失敗はエラー返却で initialize を 500 に。log-and-continue を禁止事項として明記 |
+| [CRITICAL] 分散バリアの非対称(hub 先行 freeze・順序逆) | 10: hub = participant #0。全 participant が「freeze point 固定 → 固定点まで Drain」の同一順序。両バリアに送信/ACK 不確実性区間 |
+| [HIGH] ResetResult の可変性 / request context の background 波及 | 02: 不変 StartResult + PreviousRunResult 分離。background は WithoutCancel + 内部 timeout |
+| [HIGH] RegisterDBTarget(id, dsn) で driver 不明 | 01: RegisterDBTarget(id, driverName, dsn)。10: agent は driver 必須の JSON targets ファイル |
+| [HIGH] unparsed-sha256[:8] の不安定・衝突・照合器化 | 01: hash fallback 廃止。パース不能 DSN は明示登録必須(未登録は target 化せず health 記録) |
+| [HIGH] SAMPLE_SEEN をアプリ時計と比較 / schema 条件欠落 | 09: session UTC 固定 + DB 側 UTC_TIMESTAMP(6) だけで鮮度判定。WHERE SCHEMA_NAME=DATABASE() AND DIGEST=? |
+| [HIGH] cgroup namespace で「root=実パス→host」が偽 | 03: 既定 scope=visible-root、host は明示設定のみ。identity に CgroupNS 追加 |
+| [HIGH] 分散 run の再試行・保持の状態機械なし | 10: idle→started→finished→acknowledged、run_id+nonce 冪等再送、競合 409、直近 2 run を ACK/TTL まで保持、nonce は TTL 付き履歴 |
+| [HIGH] profile 設定が startAdmin / initialize 後半の混入 | 07: singleton runtime 初期化へ移動、env 未設定時は既存 rate を上書きしない、process-wide cumulative と取得不確実性を明示 |
+| [HIGH] required peer の section drop が valid に見える | 10: top-N 行縮小(許容・記録)とセクション全欠落(required は partial、必須 capability は invalid)を分離 |
+| [MEDIUM] メモリ楽観値 / クエリ数不正確 / CTE 分類 | 04: allocation benchmark を受け入れ条件化、実クエリ数を明記、WITH…SELECT を SELECT 扱い + fixture |
+| [MEDIUM] Querier の *sql.Rows が接続を pin | 01: 追跡 wrapper Rows(Inspect 終了時に強制 Close) |
+| [MEDIUM] 重複 peer 判定が同一ホスト複数プロセスを拒否 | 10: host identity(hoststats dedup)と agent_id(peer 識別)の 2 層分離 |
+| [MEDIUM] backlog の解析単位 / https UDS 提案 | 11: listen endpoint(address:port)単位の保守的解析。https:// は UDS 対象外、前提条件 3 点を文言化 |
+| [MEDIUM] 依存図と 02 契約の不一致 | 本書: 依存種別(API / 実装順 / artifact 参照)付きの表へ書き換え |
+| [LOW] 見積もりに 11/MTU 欠落・buffer 非数値化・flag 例外未定義 | 本書: v1.2.x に 11+MTU を計上、全リリースの +30% を数値化(v1.4.0 ≈ 19.5 日)、静的 check の flag 例外を明文化 |

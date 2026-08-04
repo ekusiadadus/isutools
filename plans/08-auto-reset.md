@@ -10,14 +10,16 @@ ResetNow を同期実行」としたが、ResetNow が旧世代の in-flight 完
 in-flight** のため永遠に待つ(middleware は handler 開始時に in-flight を
 増やし終了時に減らす — httpstats/httpstats.go:213, :328)。
 
-v3 の 02 で導入した二段階境界により解消する:
+02(v4)の contract により解消する:
 
-- `ResetNow` = **BeginBoundary(同期・非ブロッキング)+ Drain(非同期)**
+- `ResetNow` = **StartRun(世代スワップ + baseline 同期採取。
+  旧世代 in-flight の完了待ちを含まない)+ DrainPrevious(非同期)**
 - 呼び出し元の initialize リクエストは境界前に開始しているため
-  **旧世代に計上**され、Drain は initialize handler の終了(= in-flight
-  減少)後に自然に完了する。デッドロックは構造的に起きない
-- 応答時点で境界は確定済みなので、initialize 応答後に始まる本負荷は
-  すべて新世代に入る(pprotein と同等の境界保証は維持)
+  **旧世代に計上**され、DrainPrevious は initialize handler の終了
+  (= in-flight 減少)後に自然に完了する。デッドロックは構造的に起きない
+- StartRun には baseline 採取(bounded I/O)が含まれるため、
+  応答時点で境界と基準値の両方が確定済み。initialize 応答後に始まる
+  本負荷は冒頭から新世代に全量計上される(v4 の冒頭欠落修正と整合)
 
 ## モード設計
 
@@ -26,18 +28,42 @@ v3 の 02 で導入した二段階境界により解消する:
 ```go
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
     // ... DB 再構築など ...
-    runID, err := isutools.ResetNow(r.Context())  // 境界確定して返る(Drainは非同期)
-    if err != nil { log.Printf("isutools: reset: %v", err) }
+    runID, err := isutools.ResetNow(r.Context())  // 境界+baseline 確定して返る(Drainは非同期)
+    if err != nil {
+        // 境界を確定できないまま計測を続けてはいけない(v4)。
+        // 500 を返せばベンチマーカーは initialize をリトライする。
+        http.Error(w, "isutools reset failed: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
     w.WriteHeader(http.StatusOK)                  // 境界確定後に応答
+    _ = runID
 }
 ```
 
 - `ResetNow` は 02 の process-wide Controller を直接呼ぶ
   (HTTP 自己呼び出しは存在しない。admin 無効でも動作)
 - run に `reset_trigger: "api"` を記録
-- **ErrResetInProgress** を受けた場合(同時 initialize 等)はエラーを
-  返す。handler 側は log して処理を続行してよい(直前の reset が
-  境界を張っているため)
+
+### 同時 initialize の扱い(v4 修正)
+
+v3 の「409 は log して処理継続してよい」は誤りだった: initialize A が
+境界を張った後、initialize B が DB 再構築を続けてから 409 を握り潰すと、
+**A の run が B の初期化処理後半で汚染されたまま valid になる**。
+
+v4 の `ResetNow` セマンティクス:
+
+1. `ErrResetInProgress`(進行中の遷移がある)を受けたら、
+   **進行中の遷移完了を bounded に待ち(上限 15s = StartRun budget +
+   Drain 上限)、自分固有の nonce で再 reset する**。
+   これにより最後の initialize が必ず新しいクリーンな境界を張る
+   (先行 run は短い完結した世代として残り、上書きされない)
+2. 待機 timeout・再 reset 失敗時は**エラーを返す**。呼び出し側の
+   規範は上記例のとおり initialize を 500 で失敗させること。
+   **「log だけして正常応答」をドキュメント・example に書かない**
+   (禁止事項として明記する)
+3. `ResetNow` 内部の待機・再試行は request context ではなく
+   内部 timeout 付き context で行う(02 の返却値分離と同じ方針。
+   クライアント切断で境界処理が中途停止しない)
 
 ### 冪等化(02 の nonce を使用)
 

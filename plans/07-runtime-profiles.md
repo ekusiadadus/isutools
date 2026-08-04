@@ -48,14 +48,24 @@
 - `ISUTOOLS_BLOCK_RATE_NS`(既定 0 = off。README 推奨値と
   「累積 block 時間 r ns あたり 1 サンプル」の正しい説明、
   低い値ほど高コストである旨)
-- 設定箇所は `startAdmin()`。設定値は health(`profile`)に記録し
-  snapshot の meta.health で確認できる
+- 設定箇所は **02 の process-wide singleton runtime の初期化**
+  (v4 修正: `startAdmin()` では admin 無効時に設定されず、
+  singleton Controller 方針と矛盾していた)。設定値は health(`profile`)に
+  記録し snapshot の meta.health で確認できる
+- **env 未設定時はアプリ自身が設定した既存の profile rate を
+  上書きしない**(v4 追加の契約): env が空なら
+  SetMutexProfileFraction / SetBlockProfileRate を一切呼ばない
 
 ### PR-b: artifact 保存
 
 - 取得点:
   - reset 完了直後(02 coordinator の post-reset hook)
   - save 時(snapshot 永続化と同じ場所)
+- **区間の意味の明示**(v4 追加): profile は**プロセス全体の累積**であり
+  HTTP 世代と厳密には一致しない。特に ResetNow(08)経由の reset 時
+  profile には**まだ実行中の initialize handler 後半が混入する**。
+  表示・docs に「process-wide cumulative(HTTP 世代 profile ではない)」と
+  取得タイミングの不確実性を明記する
 - 内容: `rpprof.Lookup("mutex"|"block"|"heap").WriteTo(f, 0)`
   - mutex/block は rate=0(無効)なら**書かない**
   - **heap も `ISUTOOLS_HEAP_PROFILE=1` の明示 opt-in・既定 off**

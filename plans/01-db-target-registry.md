@@ -45,11 +45,21 @@
 // 既定: 構造化 DSN から決定的に導出(接続順非依存)
 //   mysql tcp(db1:3306)/isuconp  →  "mysql-db1_3306-isuconp"
 // 同一 ID になる DSN は同一 target として dedup。
-// 導出不能(パース失敗)は "unparsed-<sha256(dsn)[:8]>"(安定・非可逆)。
 
 // 明示命名(第一 API)。SQLDriverName より前に呼ぶ。
-func RegisterDBTarget(id, dsn string) error   // id 重複・空はエラー
+// driverName は必須引数(v4 修正: MySQL DSN に driver 種別は含まれず、
+// driver 名は sql.Open の別引数であり DSN から特定できないため)。
+func RegisterDBTarget(id, driverName, dsn string) error   // id 重複・空・未知 driver はエラー
 ```
+
+**パース不能 DSN の扱い(v4 修正)**: v3 の
+`unparsed-<sha256(dsn)[:8]>` 自動 ID は廃止する
+(credential 変更だけで ID が変わり安定でない・32bit 公開 hash は
+衝突しやすく、既知 DSN 形式への弱い credential のオフライン照合器にも
+なり得るため)。パース不能な DSN は**自動登録しない**:
+`RegisterDBTarget` による明示登録を必須とし、未登録のまま観測された
+場合は health に「unparsed DSN — RegisterDBTarget が必要」を記録して
+当該接続を target 化しない(fail-open)。
 
 ### registry API
 
@@ -72,9 +82,12 @@ func Features(id string) (f DSNFeatures, known bool)
 
 // Inspect: target 所有の inspector(MaxOpenConns(1)、再利用)で fn を実行。
 // fn には制限付き interface を渡す。*sql.DB は渡さない。
+// v4 修正: 素の *sql.Rows を返すと callback 外へ保持でき、唯一の接続を
+// 恒久的に pin できてしまう。Rows は追跡 wrapper で返し、Inspect の
+// return 時に未 Close の Rows を強制 Close する(以後の操作はエラー)。
 type Querier interface {
-    QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error)
-    QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row
+    QueryContext(ctx context.Context, q string, args ...any) (Rows, error) // 追跡 wrapper
+    QueryRowContext(ctx context.Context, q string, args ...any) Row
 }
 func Inspect(ctx context.Context, id string, fn func(context.Context, Querier) error) error
 ```
@@ -136,7 +149,7 @@ func Inspect(ctx context.Context, id string, fn func(context.Context, Querier) e
 | リスク | 対策 |
 |---|---|
 | 同一 endpoint+db を用途別に分けたい構成 | RegisterDBTarget の明示命名で解決 |
-| driver 差(pgx の DSN 形式) | driver ごとの parser 分岐。未対応 driver は unparsed 扱い(安全側) |
+| driver 差(pgx の DSN 形式) | driver ごとの parser 分岐。未対応 driver は明示登録必須(自動登録しない — 安全側) |
 | inspector 経由のクエリが計測に混入 | inspector は素の接続(プロキシ非経由)を使用 |
 
 ## 見積もり

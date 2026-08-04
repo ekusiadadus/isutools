@@ -54,12 +54,19 @@
 1. 04 の delta 結果から SUM_TIMER_WAIT 降順で上位
    `ISUTOOLS_EXPLAIN_TOP`(既定 10)の SELECT digest を選ぶ
 2. 各 digest について registry(01)の `Inspect` で:
-   - `SELECT QUERY_SAMPLE_TEXT, QUERY_SAMPLE_SEEN FROM ... WHERE DIGEST = ?`
-     で取得(**QUERY_SAMPLE_SEEN を必ず取得** — v3 修正)
-   - **鮮度判定**: QUERY_SAMPLE_SEEN が run 区間(02 の境界〜collect
-     時刻)の外なら、そのサンプルは過去 run のもの。リテラル値で実行計画が
-     変わり得るため **advisor 判定から除外**し、表示は `stale`
-     (取得時刻付き)としてグレー表示する
+   - inspector session は `SET time_zone = '+00:00'` で **UTC に固定**する
+     (v4 修正: TIMESTAMP 取得値は session time zone の影響を受ける)
+   - `SELECT QUERY_SAMPLE_TEXT, QUERY_SAMPLE_SEEN FROM ...
+     WHERE SCHEMA_NAME = DATABASE() AND DIGEST = ?` で取得
+     (v4 修正: digest table の主キーは (SCHEMA_NAME, DIGEST)。
+     DIGEST 単独条件では別 schema のサンプルを取り得る)
+   - **鮮度判定は DB 側時計だけで行う**(v4 修正: アプリプロセスの
+     BoundaryAt と比較しない。DB 専用ホストでは時計が異なる)。
+     04 の baseline 時と本 collect 時に DB 側の `UTC_TIMESTAMP(6)` を
+     取得しておき、`QUERY_SAMPLE_SEEN` が [baseline時のDB時刻,
+     collect時のDB時刻] に入るかで判定する。区間外は過去 run のサンプル。
+     リテラル値で実行計画が変わり得るため **advisor 判定から除外**し、
+     表示は `stale`(取得時刻付き)としてグレー表示する
    - 区間内なら `EXPLAIN <sample>` を実行。
      **sample 文字列はこの関数スコープ限りで破棄**(構造体へ保存しない)
    - **エラー整形**: driver エラーを Plan.Err に入れる際、エラー文字列に
