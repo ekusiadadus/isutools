@@ -180,7 +180,7 @@ func TestSwapDoesNotBlockAndSealedWaitHonoursContext(t *testing.T) {
 	// A nil context is a caller mistake measurement must survive rather than
 	// panic on: it waits for the work itself.
 	nilWait := make(chan error, 1)
-	go func() { nilWait <- sealed.Wait(nil) }()
+	go func() { nilWait <- sealed.Wait(nil) }() //nolint:staticcheck // explicitly verifies the documented nil-context fallback
 	select {
 	case err := <-nilWait:
 		t.Fatalf("Wait(nil) returned %v while a lease was still live", err)
@@ -387,7 +387,7 @@ func TestSwapAndSnapshotContextHonoursTheCallersDeadline(t *testing.T) {
 
 	// A nil context is a caller mistake measurement must survive.
 	m.SetCompatWait(20 * time.Millisecond)
-	if frozen := m.SwapAndSnapshotContext(nil); frozen.Generation != 3 {
+	if frozen := m.SwapAndSnapshotContext(nil); frozen.Generation != 3 { //nolint:staticcheck // explicitly verifies the documented nil-context fallback
 		t.Fatalf("frozen = %#v, want generation 3", frozen)
 	}
 }

@@ -38,6 +38,18 @@ func TestDisabledDoesNotMakeSnapshotPartial(t *testing.T) {
 	}
 }
 
+func TestInfoDoesNotMakeSnapshotPartial(t *testing.T) {
+	r := NewRegistry()
+	r.Set("dbpool", StatusInfo, "WatchDBPool was not called")
+	got, partial := r.Snapshot()
+	if partial {
+		t.Fatal("informational health must not make the measurement partial")
+	}
+	if len(got) != 1 || got[0].Status != StatusInfo {
+		t.Fatalf("snapshot = %#v", got)
+	}
+}
+
 func TestDroppedMakesOKCollectorPartialAndCanReset(t *testing.T) {
 	r := NewRegistry()
 	r.Set("http", StatusOK, "")

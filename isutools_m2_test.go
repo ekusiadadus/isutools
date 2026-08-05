@@ -41,17 +41,19 @@ type fixedHandler struct{}
 func (*fixedHandler) ServeHTTP(http.ResponseWriter, *http.Request) {}
 
 func TestHandlerUsesAtomicSQLGenerationAndHTTP(t *testing.T) {
-	sqlstats.Default.Reset()
-	httpstats.Default.Reset()
-	t.Cleanup(func() {
-		sqlstats.Default.Reset()
-		httpstats.Default.Reset()
-	})
+	h := Handler()
+	// The stores are run-generation managed, so /reset owns the rotation: a
+	// raw Store.Reset here would advance the store past the coordinator's
+	// epoch and the reset below would then publish the stale generation. Open
+	// a run through the handler instead — it also clears the process-wide prev
+	// that an earlier test's saved run leaves behind.
+	postReset(t, h)
+	t.Cleanup(func() { postReset(t, h) })
+
 	sqlstats.Default.Observe("SELECT old", time.Millisecond)
 	HTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/old", nil))
-	h := Handler()
 
 	reset := httptest.NewRecorder()
 	h.ServeHTTP(reset, httptest.NewRequest(http.MethodPost, "/reset", nil))

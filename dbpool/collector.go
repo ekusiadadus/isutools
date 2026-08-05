@@ -84,6 +84,9 @@ type Collector struct {
 	run      *runSamples
 	notes    []string
 	noteSeen map[string]struct{}
+	// everWatched distinguishes a missing WatchDBPool integration from an
+	// intentional empty watch set after every pool was unwatched.
+	everWatched bool
 
 	// now is the clock, injectable so tests can assert that a farewell sample
 	// is stamped earlier than the closing boundary.
@@ -144,6 +147,7 @@ func (c *Collector) watchStats(targetID, display string, stats func() sql.DBStat
 		return fmt.Errorf("%w: %q was not added, the limit is %d", ErrTooManyPools, targetID, MaxPools)
 	}
 	c.watch[targetID] = watched{display: display, stats: stats}
+	c.everWatched = true
 	if c.midRunLocked() {
 		if _, active := c.run.active[targetID]; !active {
 			c.noteLocked(fmt.Sprintf("%s: %q joined after the run started; it is measured from the next reset onwards",

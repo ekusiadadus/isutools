@@ -1,9 +1,10 @@
 # Implementation and verification status
 
-Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.1.0**
+Updated: 2026-08-05 (Asia/Tokyo) — current release: **v1.2.0**
 
-`v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1); the
-“post-release hardening” work below shipped in that tag.
+`v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1). v1.2.0 is
+the `feat/v1.2.0-foundation` tree; every number under
+[Test evidence](#test-evidence) was measured on that tree, not copied forward.
 
 ## Implemented and released
 
@@ -29,7 +30,6 @@ Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.1.0**
   convention) rendered in the Processes section; JSON access-log lines
   auto-detected, accepting both isutools keys and alp defaults
   (`body_bytes` / `response_time`)
-
 - **v0.6.0**: advisor — detects unconfigured ISUCON-critical settings
   (DSN interpolateParams, MySQL sizing, nginx gzip/keepalive/etc via
   ISUTOOLS_NGINX_CONF, kernel somaxconn/port-range/nofile, GOMAXPROCS vs
@@ -49,21 +49,201 @@ Updated: 2026-08-04 (Asia/Tokyo) — current release: **v1.1.0**
   Go 1.24 compat CI job. The DESIGN.md §7 on-target ABBA gate was
   **explicitly waived** for this tag (recorded in the tag annotation);
   the remote multi-block rerun remains pending
+- **v1.2.0**: run lifecycle coordinator, DB target registry, four new
+  measurement packages (`sqlrows` / `hoststats` / `netstats` / `dbpool`),
+  EXPLAIN capture, six new advisor checks and six new dashboard sections
+  — detailed below
+
+## v1.2.0 contents
+
+Verified against the source on this tree; the flag column is what the code
+that parses the variable actually does, not what the plans proposed.
+
+| area | what shipped | flag (default) | platform |
+|---|---|---|---|
+| `internal/runctl` | run lifecycle `Controller`: `StartRun` / `FinishRun` / `AbortRun` / `Ack` / `AckBy` / `Await` / `Status` / `SnapshotOf` / `Sweep`; 9 `RunState` values, 3 `Validity` values, monotonic `Epoch` fencing, nonce idempotency, preempt, `SerializeInitialize` | — (always on) | any |
+| `internal/runctl` budgets | one authority for the time hierarchy: `StartRunBudget`/`FinishSyncBudget` 6s > `PhaseStartBaselineBudget`/`PhaseFinishFinalBudget` 5s > `PerCollectorBaselineBudget` 3.5s > `PerTargetBudget` 1s; generation side 500ms > 100ms; `DrainBudget` 10s, `SnapshotBuildBudget` 5s, `EnrichBudget` 2s, `FinishLease` 20s. `Budgets.Validate` rejects an inverted table at registration | — | any |
+| `sqlstats/registry.go` | DB target registry: stable auto `TargetID` (`<alias>-<26-char base32 of sha256[:16] of the canonical driver+net+addr+database tuple>`), `Purpose` = `app`/`stats`/`explain`, `RegisterDBTarget` / `RegisterDBInspector` / `Inspect` / `Targets` / `Target` / `TargetIDForDSN` / `Features` / `Notes` / `CloseDBInspectors`, `MaxTargets` = 16 | — | any |
+| `sqlrows` | per-digest rows examined vs rows sent over the run, from `performance_schema.events_statements_summary_by_digest` sampled at both boundaries; `DigestTextFetchLimit` = 200 (delta computed over every digest, truncated after subtraction) | `ISUTOOLS_SQLROWS` (on) | any (needs MySQL performance_schema) |
+| `hoststats` | memory / disk / PSI / cgroup v2 limits / host identity, from procfs + sysfs + cgroup2, with the cgroup scope always reported alongside the numbers | `ISUTOOLS_HOSTSTATS` (on), `ISUTOOLS_ROLE`, `ISUTOOLS_CGROUP_SCOPE`, `ISUTOOLS_CGROUP_PATH` | Linux only — `New` returns `ErrUnsupportedOS` elsewhere and the collector is not registered |
+| `netstats` | TCP socket summary (point observation at the closing boundary), per-NIC interval byte/packet/error/drop deltas + Mbit/s rates, link speed and MTU. Display-only: no value feeds an advisor threshold | `ISUTOOLS_NETSTATS` (on) | Linux only — registration is skipped with "/proc/net is only available on Linux" |
+| `dbpool` | `database/sql` pool statistics per registered target via `WatchDBPool(targetID, *sql.DB)`; `MaxPools` = 16; only registry-known `TargetID`s are accepted (`ErrUnknownTarget`). Display-only, deliberately no threshold | `ISUTOOLS_DBPOOL` (on) | any |
+| `queryplan` | EXPLAIN of the run's top digests using MySQL's own `QUERY_SAMPLE_TEXT`; runs once per run inside `runctl.EnrichBudget` (2s), never on a dashboard GET; `SessionBudget` 300ms / `SampleBudget` 100ms / `PerDigestBudget` 250ms | `ISUTOOLS_EXPLAIN` (**off** — opt-in), `ISUTOOLS_EXPLAIN_TOP` (10, capped at 200), `ISUTOOLS_EXPLAIN_DSN` / `ISUTOOLS_EXPLAIN_DRIVER` (`mysql`) | MySQL 8.0.17+ only; older MySQL and MariaDB report `CodeUnsupported` |
+| `advisor` | `nginx-upstream-uds`, `nginx-listen-backlog`, `go-pgo` — opportunities rather than defects, so they emit `StatusInfo`/`StatusSkip` and never warn — plus `plan-full-scan` / `plan-filesort` / `plan-temporary`, which do warn, fed from the query-plan section | existing conf/env inputs | any |
+| `web` | five new measurement sections — `SQL 行効率`, `Query Plans`, `DB Pool`, `Host`, `Network` — plus a `Profiles` section for the runtime profile pairs | — | any |
+| `isutools` | `ResetNow` / `ResetNowWithNonce` / `ResetNowOpts` / `SerializeInitialize`; runtime profile pairs (mutex / block / heap) captured at both boundaries with `go tool pprof -diff_base` commands and a measured residual | `ISUTOOLS_MUTEX_FRACTION`, `ISUTOOLS_BLOCK_RATE_NS`, `ISUTOOLS_HEAP_PROFILE` (all **off**) | any |
+
+Two properties of the registry are load-bearing enough to state separately,
+because the row-efficiency numbers are only trustworthy if they hold:
+
+- a `PurposeStats` / `PurposeExplain` connection is rebuilt **without a default
+  database**, so MySQL attributes the collector's own statements to a NULL
+  schema, and the target schema is a bound parameter (`WHERE SCHEMA_NAME = ?`)
+  rather than `DATABASE()`
+- that is verified rather than assumed. A URL-form DSN cannot be rebuilt, so
+  the connection keeps the application's schema; `sqlrows` probes
+  `performance_schema.threads` on its own connection and **skips** such a
+  target with `inspector-default-db` instead of publishing contaminated numbers
+
+**`PurposeExplain` never falls back.** A target without an explain credential
+is skipped and the reason recorded; the application credential is not used as a
+substitute. The privileges are verified on the very connection EXPLAIN will run
+on — `SET ROLE NONE`, `CURRENT_ROLE()` read back, every granted role expanded
+with `SHOW GRANTS ... USING` and judged against a closed allowlist.
 
 ## Test evidence
 
-v1.1.0 (`f4e7c3c`) verification (2026-08-04, Go 1.26.5): `go vet ./...` PASS,
-`go test -race -shuffle=on -coverprofile=... ./...` PASS (14 packages), aggregate
-coverage **85.0%**. Package coverage is not uniformly 80%; CI enforces the
-documented **aggregate** 80% gate, runs the `examples/abba.sh` script contract
-test, and separately runs `go test ./...` on Go 1.24.x. Recorded on the
-pre-merge hardening tree (not rerun at the tag): `golangci-lint run ./...`
-0 issues, `govulncheck ./...` no known vulnerabilities, access-log parser
-10-second fuzz run (~761k executions) without a failure, `BenchmarkObserve`
-153.2 ns/op, 0 B/op, 0 allocs/op on Apple M3.
+v1.2.0 verification (2026-08-05, Go 1.26.5, darwin/arm64, on the
+`feat/v1.2.0-foundation` tree):
 
-A real TLS HTTP/2 listener, HTTP/3 listener, deployed target, and physical/remote
-benchmark are not implied by those local results.
+| check | command | result |
+|---|---|---|
+| vet | `go vet ./...` | PASS (exit 0, no output) |
+| race + shuffle | `go test -race -shuffle=on ./...` | PASS, **20 packages**, all `ok` |
+| coverage | `go test -race -coverprofile=/tmp/c.out ./...` then `go tool cover -func` | aggregate **93.1%** |
+
+Per-package coverage is not uniform and is not claimed to be: the highest are
+`dbpool`, `netstats` and `internal/generation` at 100.0%, the lowest is
+`internal/sysinfo` at 81.8%. CI enforces the documented **aggregate** 80% gate.
+Aggregate coverage rose from 85.0% (v1.1.0, 14 packages) to 93.1% (v1.2.0,
+20 packages).
+
+CI (`.github/workflows/ci.yml`) additionally runs, and these are enforced
+rather than reported:
+
+- `go test ./...` on Go 1.24.x (the module's declared minimum)
+- the `examples/abba.sh` script contract test (`examples/abba_test.sh`)
+- a **MySQL 8.4 service job** running `go test -tags=integration ./sqlrows -run
+  '^TestNoSelfContamination'` — the self-contamination property above is
+  therefore checked against a real server on every push, not only reasoned about
+- `internal/agg` benchmarks, informational only
+
+Not rerun on this tree: `golangci-lint`, `govulncheck`, the access-log parser
+fuzz run and `BenchmarkObserve`. The v1.1.0 figures for those (0 issues, no
+known vulnerabilities, ~761k fuzz executions, 153.2 ns/op / 0 allocs/op on
+Apple M3) were recorded on the pre-merge hardening tree and are **not** claimed
+for v1.2.0.
+
+A real TLS HTTP/2 listener, an HTTP/3 listener, a deployed target and a
+physical/remote benchmark are not implied by any of the local results above.
+
+## Review evidence
+
+The v1.2.0 implementation went through four adversarial review rounds against
+the code (as opposed to the five review rounds the plan set went through
+against the documents):
+
+| round | findings | outcome |
+|---|---|---|
+| 1 | 8 | all addressed |
+| 2 | 7 | all addressed |
+| 3 | 6 | all addressed |
+| 4 | **0** | clean |
+
+Separately, a security round on plan 09 (EXPLAIN) **blocked the feature**: the
+privilege check failed open. An empty `SHOW GRANTS` result — a proxy stripping
+the result set, a driver returning nothing for a form it did not recognise —
+yielded no roles to expand and passed the allowlist vacuously, which would have
+let EXPLAIN run on a credential whose privileges were never established. It is
+fixed by construction: `parseGrants` rejects empty output outright, on the
+reasoning that every MySQL account has at least `GRANT USAGE ON *.*`, so zero
+lines means the read did not happen. The security matrix in
+`queryplan/security_test.go` pins that case together with role-granted DML,
+non-neutralisable roles, nested roles and non-closing role graphs.
+
+## Field verification (private-isu, v1.2.0)
+
+Measured on private-isu with the v1.2.0 tree:
+
+- the benchmark **passed** with the full collector set enabled
+- `hoststats`, `netstats` and `sqlrows` produced real data (not empty sections,
+  not `partial` placeholders)
+- the collector's own queries were **confirmed absent** from the measured
+  schema's digest table — the design property above, observed on a live server
+  rather than inferred
+
+## v1.2.0 ABBA overhead observation (not a passed §7 gate)
+
+Recorded on private-isu, 2 blocks / 8 runs:
+
+```text
+off avg: 556196 / on avg: 546150
+```
+
+Read honestly, this is a **1.81% score cost for running isutools**, not a
+gain: `examples/abba.sh` defines score overhead as `(off − on) / off`, and
+`(556196 − 546150) / 556196 = +1.81%`. The last comparable observation is
+v1.0.0's **−0.58%**, where the "on" runs scored *higher* than the "off" runs —
+the opposite sign. (v1.1.0 has no ABBA number of its own; its §7 gate was
+waived.) So the honest reading is that **v1.2.0 costs measurably more than
+v1.0.0 did**, which is unsurprising given four new collectors, and that it sits
+just under the DESIGN.md §7 2% ceiling with almost no margin.
+
+This observation cannot satisfy the §7 gate, for a reason that is mechanical
+rather than a matter of judgement: **2 blocks is below `examples/abba.sh`'s own
+minimum of 3**, which the script enforces by exiting 2 (`ABBA_BLOCKS must be
+>= 3 for a confidence interval`). With two blocks no paired 95% confidence
+interval can be formed, so "+1.81% < 2%" is a point estimate with no interval
+attached. §7 requires the interval. The gate therefore remains **pending**, as
+it has since v1.1.0, and the honest summary of the number is: closer to the
+ceiling than any previous release, and not yet bounded.
+
+## Not verified at v1.2.0
+
+Stated explicitly so it is not read out of the sections above:
+
+- **ISUCON14 verification was still in progress** when v1.2.0 was cut. No
+  ISUCON14 result is claimed.
+- **EXPLAIN has no live-MySQL integration test.** `queryplan` is covered at
+  94.7% entirely by fakes: a scripted `sqlstats.Querier` and a `database/sql`
+  driver returning canned rows. The CI MySQL job covers `sqlrows`
+  self-contamination only. So the statement *sequence* EXPLAIN issues is pinned,
+  but its behaviour against a real server — actual `SHOW GRANTS` dialects, real
+  `QUERY_SAMPLE_TEXT` truncation, real EXPLAIN output shapes — is not.
+- The §7 ABBA gate, as above.
+
+## Known limitations (v1.2.0)
+
+1. **The first run after an application restart cannot pair `sqlrows`.** A DB
+   target enters the registry when the proxy driver opens its first connection
+   (`observeDSN` in `dsnCapturingDriver.Open`), and `database/sql` opens
+   lazily. If the opening boundary is taken before any query has run, the
+   target exists only at the closing boundary and the row is published with
+   `unpaired-boundary` / "the target was only present at the closing boundary",
+   degrading the run to `partial`. Calling `RegisterDBTarget` at startup avoids
+   it.
+2. **`dbinspect` and `advisor` inspection queries still land in the measured
+   schema.** Both open a raw connection from `sqlstats.FirstConn()` — the
+   application's own DSN, default database included — so their statements are
+   attributed to the application schema in `performance_schema`. They are run
+   *before* `StartRun` (`captureDB()` in the reset path), so they stay outside
+   the measured interval; they are not outside the measured schema. Only the
+   registry's `PurposeStats` / `PurposeExplain` connections get the
+   no-default-database treatment.
+3. **A runtime profile pair approximates the run, and includes a post-finish
+   tail.** mutex/block/heap profiles are process-cumulative, so a run is the
+   difference of two captures. The opening capture happens slightly after the
+   boundary is fixed (`HeadLossNs`, excluded from the difference) and the
+   closing capture slightly after the freeze returns (`TailExcessNs`, included
+   in it). `ApproxErrorNs = HeadLossNs + TailExcessNs` is displayed on every
+   pair together with an unconditional notice — unconditional on purpose, since
+   a reader who sees the notice only on bad runs would read its absence as
+   "this one is exact", which no pair ever is.
+4. **`nginx-listen-backlog` reads a concatenation, not an include tree.** The
+   check analyses the `.conf` text it was given and does not resolve `include`
+   relationships, so a disabled fragment that still ends in `.conf` can be
+   counted as live configuration. The check says so in its own output
+   (`解析対象: 連結された nginx conf(include 関係は未解決)`) rather than
+   presenting the verdict as authoritative.
+
+## Not implemented
+
+- **Multi-host / peer protocol (plan 10): single host only.** There is no
+  `PeerHandler`, no `cmd/isutools-agent`, no `ISUTOOLS_PEER`, and no wire
+  protocol in the tree. `runctl` reserves three constants for it
+  (`AckedByHub`, `AckedByLease`, `ReasonHubAbort`) and nothing more. Every number isutools
+  reports describes the host the library is linked into. `plans/10-multi-host.md`
+  is the remaining design document.
 
 ## Field verification (private-isu, WSL2 Docker, 2026-08-03..04)
 
@@ -99,11 +279,12 @@ therefore useful historical evidence but cannot establish “zero overhead” or
 satisfy the release-gate contract in DESIGN.md §7. Also, the evidence commit
 `9924ddc` is 11 minutes newer than tag `v1.0.0` (`faa7ca8`).
 
-The hardened `examples/abba.sh` now requires at least three blocks, fixed
+The hardened `examples/abba.sh` requires at least three blocks, fixed
 warm-up, a stable binary/image fingerprint, score/p95/error rate, TSV
 provenance, and paired 95% CI gates. It has passed its local script contract
 (also enforced in CI since v1.1.0); it has **not yet been rerun on
-private-isu**. v1.1.0 was tagged with this §7 gate explicitly waived.
+private-isu** at three or more blocks. v1.1.0 was tagged with this §7 gate
+explicitly waived, and the v1.2.0 observation above is two blocks.
 
 ## Post-release hardening (released in v1.1.0)
 
@@ -137,8 +318,13 @@ private-isu**. v1.1.0 was tagged with this §7 gate explicitly waived.
 4. ~~WS/SSE separation~~ → connection stats + active gauge (v0.7.0)
 5. ~~save caps~~ → initial serialization in v1.0.0; size/concurrency/read caps
    completed in v1.1.0
-6. ~~ABBA template~~ → hardened + CI script-contract test (v1.1.0); remote
-   multi-block gate still pending
-7. cross-collector shared generation gate — still open (1.x): benchmark
-   automation must wait for `POST /reset` to return before load starts
-   (the reference bench.sh does)
+6. ~~ABBA template~~ → hardened + CI script-contract test (v1.1.0); the remote
+   multi-block gate is still pending — the v1.2.0 run is two blocks, one short
+7. ~~cross-collector shared generation gate~~ → v1.2.0: every collector is
+   registered on one `runctl.Controller` and fenced by the same
+   `(runID, epoch)`, and the measured boundary spread is recorded in the
+   snapshot against `SpreadLimitGeneration` (50ms) / `SpreadLimitBoundary`
+   (1.5s). The operational requirement survives: `POST /reset` fixes the
+   boundary before it answers 204 with `X-Isutools-Run-Id`, so benchmark
+   automation must still wait for that response before load starts (the
+   reference bench.sh does)

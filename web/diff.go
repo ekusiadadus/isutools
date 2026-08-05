@@ -34,9 +34,10 @@ type diffRow struct {
 }
 
 type diffPage struct {
-	A, B           string
-	AScore, BScore string
-	SQL, HTTP      []diffRow
+	A, B              string
+	AScore, BScore    string
+	ProvenanceWarning string
+	SQL, HTTP         []diffRow
 }
 
 // diff renders GET /diff?a=<run-id>&b=<run-id>: which queries/paths got
@@ -63,14 +64,23 @@ func (h *handler) diff(w http.ResponseWriter, r *http.Request) {
 	}
 	page := diffPage{
 		A: a, B: b,
-		AScore: snapA.Meta.Score, BScore: snapB.Meta.Score,
-		SQL:  diffEntries(snapA.SQL, snapB.SQL),
-		HTTP: diffEntries(entriesOf(snapA.HTTP), entriesOf(snapB.HTTP)),
+		AScore:            snapA.Meta.Score,
+		BScore:            snapB.Meta.Score,
+		ProvenanceWarning: provenanceWarning(snapA.Meta, snapB.Meta),
+		SQL:               diffEntries(snapA.SQL, snapB.SQL),
+		HTTP:              diffEntries(entriesOf(snapA.HTTP), entriesOf(snapB.HTTP)),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := diffTmpl.Execute(w, page); err != nil {
 		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
 	}
+}
+
+func provenanceWarning(a, b Meta) string {
+	if a.ProvenanceValid && b.ProvenanceValid {
+		return ""
+	}
+	return "build provenance unverified: revision が unknown または dirty の run を含むため、差分を再現可能なビルド間比較とは断定できません。"
 }
 
 // loadRun reads a stored run's JSON snapshot by its timestamp id.
@@ -191,6 +201,7 @@ th { background: #f5f5f5; }
 td.l { text-align: left; white-space: normal; word-break: break-all; }
 tbody tr:nth-child(odd) { background: #fafafa; }
 .up { color: #b91c1c; } .down { color: #15803d; }
+.warn { color: #b45309; font-weight: bold; }
 .empty { color: #999; }
 a { color: #0b57d0; }
 </style>
@@ -198,6 +209,7 @@ a { color: #0b57d0; }
 <body>
 <h1>diff: {{.A}} (score {{.AScore}}) &rarr; {{.B}} (score {{.BScore}})</h1>
 <p class="meta">delta = B - A。合計時間の変化量順、上位30件。件数が異なる行では合計deltaを改善・悪化とは判定できません。avgと負荷条件を確認してください。<a href="./">&larr; runs</a></p>
+{{if .ProvenanceWarning}}<p class="warn">{{.ProvenanceWarning}}</p>{{end}}
 
 <h2>SQL</h2>
 {{if .SQL}}

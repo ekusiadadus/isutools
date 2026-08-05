@@ -30,6 +30,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/sysinfo"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
+	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 )
@@ -111,13 +112,21 @@ type Provider struct {
 	// SQLGeneration and RotateSQL opt into atomic generation boundaries. They
 	// are separate callbacks so simple aggregation tables remain usable in
 	// tests and custom integrations.
-	SQLGeneration  func() int64
-	RotateSQL      func() (generation int64, entries []agg.Entry)
-	Health         *health.Registry
-	HTTP           httpCollector
-	AccessLog      accessLogCollector
-	AccessLogQuiet time.Duration
-	AccessLogPoll  time.Duration
+	SQLGeneration func() int64
+	RotateSQL     func() (generation int64, entries []agg.Entry)
+	// RunGenerationManaged is shorthand for custom providers whose SQL, HTTP,
+	// and Counters generations are all owned by StartRun. The per-collector
+	// flags below let production preserve that guarantee when only a subset
+	// registered successfully.
+	RunGenerationManaged      bool
+	SQLGenerationManaged      bool
+	HTTPGenerationManaged     bool
+	CountersGenerationManaged bool
+	Health                    *health.Registry
+	HTTP                      httpCollector
+	AccessLog                 accessLogCollector
+	AccessLogQuiet            time.Duration
+	AccessLogPoll             time.Duration
 	// AccessLogGenerationManaged says the access log's generation adapter is
 	// registered with the run coordinator, so the coordinator's
 	// BeginBoundary → Drain → Release cycle owns the aggregate's lifetime.
@@ -187,11 +196,19 @@ type Provider struct {
 	// error: /save predates the run lifecycle and has to keep working without
 	// one.
 	CompleteRun func(ctx context.Context) (RunFinish, error)
+	// AbortRun abandons the run in flight and fences its background worker.
+	// POST /abort is idempotent and publishes no snapshot; profile artifacts
+	// already captured at the opening boundary are marked as orphans.
+	AbortRun func(ctx context.Context) (RunAbort, error)
 	// Sections supplies the completed run's collector sections keyed by
 	// collector name, as produced by the run coordinator. Unknown keys and
 	// unexpected types are ignored, so a collector can be added on one side of
 	// the wiring before the other catches up.
 	Sections func() map[string]any
+	// RunSnapshot supplies the same sections together with the lifecycle
+	// evidence that makes a completed run auditable. When set it supersedes
+	// Sections; the older callback remains for custom-provider compatibility.
+	RunSnapshot func() *RunSnapshot
 	// RuntimeProfiles lists the runtime profiles ("mutex", "block", "heap")
 	// captured at a run boundary, in capture order. Empty — the default —
 	// captures nothing. The rates themselves are process-wide runtime
@@ -205,6 +222,9 @@ type RunStart struct {
 	// RunID is the coordinator's run identifier, echoed in the reset response
 	// so a bench script can name the run it started.
 	RunID string
+	// Epoch is the coordinator fencing token. It prevents a delayed boundary
+	// artifact from being attached to a newer incarnation of the same run id.
+	Epoch uint64
 	// StartedAt is the opening boundary's moment. Boundary artifacts are named
 	// after it rather than after the moment they are written, so an opening
 	// and a closing artifact of one run share a filename prefix.
@@ -213,6 +233,10 @@ type RunStart struct {
 	// "invalid"). It is a plain string because the transport copies it
 	// verbatim and never branches on it.
 	Validity string
+	// GenerationWindow and BoundaryWindow preserve the coordinator's measured
+	// uncertainty at the opening boundary for profile residual accounting.
+	GenerationWindow BoundaryWindow
+	BoundaryWindow   BoundaryWindow
 }
 
 // RunFinish is the record of a run's closing boundary, as reported by
@@ -221,12 +245,70 @@ type RunFinish struct {
 	// RunID names the run whose boundary was fixed. Empty means no run was in
 	// flight, which is not an error: the save/collect loop predates runs.
 	RunID string `json:"run_id,omitempty"`
+	// Epoch is the coordinator fencing token for this closing boundary.
+	Epoch uint64 `json:"epoch,omitempty"`
 	// Validity is the run's data-quality verdict ("valid", "partial",
 	// "invalid"), copied verbatim like RunStart.Validity.
 	Validity string `json:"validity,omitempty"`
 	// AcceptedAt is the measured moment the closing boundary was fixed. It is
 	// the end of the interval every section of this run describes.
 	AcceptedAt time.Time `json:"accepted_at,omitzero"`
+	// GenerationWindow and BoundaryWindow preserve the coordinator's measured
+	// uncertainty at the closing boundary for profile residual accounting.
+	GenerationWindow BoundaryWindow `json:"generation_window,omitzero"`
+	BoundaryWindow   BoundaryWindow `json:"boundary_window,omitzero"`
+}
+
+// RunAbort is the transport projection of the coordinator's abort result.
+// POST /abort itself answers 204, but the handler needs this record to orphan
+// the right profile pair and report the run id back in its header.
+type RunAbort struct {
+	RunID     string    `json:"run_id,omitempty"`
+	Epoch     uint64    `json:"epoch,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+	Detached  bool      `json:"detached,omitempty"`
+	AbortedAt time.Time `json:"aborted_at,omitzero"`
+	Partial   []string  `json:"partial,omitempty"`
+}
+
+// BoundaryWindow is the measured span of one coordinated boundary.
+type BoundaryWindow struct {
+	Min    time.Time     `json:"min,omitzero"`
+	Max    time.Time     `json:"max,omitzero"`
+	Spread time.Duration `json:"spread_ns"`
+}
+
+// RunCollectorBoundary records one collector operation at a run boundary.
+type RunCollectorBoundary struct {
+	Name      string    `json:"name"`
+	Kind      string    `json:"kind"`
+	Required  bool      `json:"required"`
+	Phase     string    `json:"phase"`
+	At        time.Time `json:"at,omitzero"`
+	Committed bool      `json:"committed"`
+	Code      string    `json:"code,omitempty"`
+	Err       string    `json:"err,omitempty"`
+	Dropped   bool      `json:"dropped,omitempty"`
+}
+
+// RunInfo is the immutable lifecycle envelope persisted with a report.
+type RunInfo struct {
+	RunID            string                 `json:"run_id"`
+	Epoch            uint64                 `json:"epoch"`
+	Validity         string                 `json:"validity"`
+	Trigger          string                 `json:"trigger,omitempty"`
+	Collectors       []RunCollectorBoundary `json:"collectors,omitempty"`
+	GenerationWindow BoundaryWindow         `json:"generation_window"`
+	BoundaryWindow   BoundaryWindow         `json:"boundary_window"`
+	StartedAt        time.Time              `json:"started_at,omitzero"`
+	FinishedAt       time.Time              `json:"finished_at,omitzero"`
+}
+
+// RunSnapshot is the provider-side form of a completed run. Sections remain
+// top-level in the report while Info is persisted under Meta.Run.
+type RunSnapshot struct {
+	Info     RunInfo
+	Sections map[string]any
 }
 
 // Meta identifies when, on which host, and from which revision a snapshot
@@ -237,12 +319,24 @@ type Meta struct {
 	Generation    int64  `json:"generation"`
 	Revision      string `json:"revision"`
 	Dirty         bool   `json:"dirty"`
+	// BuildSource says how Revision was obtained (vcs, ldflags, env, unknown).
+	// ProvenanceValid is false for an unknown or dirty build, where a snapshot
+	// cannot be reproduced from Revision alone.
+	BuildSource     string `json:"build_source"`
+	ProvenanceValid bool   `json:"provenance_valid"`
 	// Score is the benchmark score supplied via POST /save?score=; persisted
 	// snapshots always carry it so every report is attributable to a result.
 	Score   string         `json:"score,omitempty"`
 	Host    sysinfo.Info   `json:"host"`
 	Partial bool           `json:"partial"`
 	Health  []health.Entry `json:"health,omitempty"`
+	Run     *RunInfo       `json:"run,omitempty"`
+	// Profiles is the run's runtime-profile record: every capture attempted at
+	// either boundary and the pairs that can be differenced. It is filled when
+	// a run is persisted, because that is the first moment both halves exist;
+	// a live report has no closing half yet and omits the field. Additive and
+	// omitempty, so a v1.0 reader of this JSON is unaffected.
+	Profiles *ProfileManifest `json:"profiles,omitempty"`
 }
 
 // Snapshot is the complete state of all measurements at one point in time.
@@ -270,6 +364,11 @@ type Snapshot struct {
 	Network *netstats.NetworkStats `json:"network,omitempty"`
 	SQLRows *sqlrows.Section       `json:"sqlrows,omitempty"`
 	DBPool  []dbpool.Entry         `json:"dbpool,omitempty"`
+	// QueryPlan holds the EXPLAIN output captured in the run's enrich phase.
+	// It is filled from the same section map as the others rather than from a
+	// live read, which is what keeps a dashboard refresh from putting EXPLAIN
+	// statements on the measured database.
+	QueryPlan *queryplan.Section `json:"queryplan,omitempty"`
 }
 
 // applyRunSections copies a completed run's baseline collector sections into
@@ -295,6 +394,9 @@ func applyRunSections(snap *Snapshot, sections map[string]any) {
 	if entries, ok := sections[dbpool.Name].([]dbpool.Entry); ok {
 		snap.DBPool = entries
 	}
+	if section, ok := sections[queryplan.Name].(*queryplan.Section); ok {
+		snap.QueryPlan = section
+	}
 	// The collectors record why a section is missing or incomplete inside the
 	// section value itself, because Collect has to stay pure. Forwarding those
 	// notes here is what turns "the hoststats section is absent" into "the
@@ -313,30 +415,27 @@ func applyRunSections(snap *Snapshot, sections map[string]any) {
 // A generation boundary hands the run's data over and leaves the live
 // collector empty, so a report rendered after a run was finished would
 // otherwise show the fresh, empty generation instead of the interval that was
-// just measured. An empty section never overwrites live data: a run that
-// produced nothing must not erase what the live collectors still hold.
+// just measured. Presence, not cardinality, is authoritative: an explicitly
+// empty frozen section means the run measured zero events, and must erase any
+// post-boundary values already accumulated by the live collector.
 func applyRunIntervalSections(snap *Snapshot, sections map[string]any) {
 	if snap == nil || len(sections) == 0 {
 		return
 	}
-	if frozen, ok := sections[sqlstats.SectionName].(sqlstats.Frozen); ok && len(frozen.Entries) > 0 {
+	if frozen, ok := sections[sqlstats.SectionName].(sqlstats.Frozen); ok {
 		snap.SQL = frozen.Entries
 	}
 	if result, ok := sections[httpstats.CollectorName].(httpstats.Result); ok {
-		if len(result.HTTP) > 0 {
-			snap.HTTP = result.HTTP
-		}
-		if result.Connections != (httpstats.ConnSnapshot{}) {
-			conns := result.Connections
-			snap.Connections = &conns
-		}
+		snap.HTTP = result.HTTP
+		conns := result.Connections
+		snap.Connections = &conns
 	}
-	if value, ok := sections[accesslog.SectionName].(accesslog.Snapshot); ok && accessLogHasContent(value) {
+	if value, ok := sections[accesslog.SectionName].(accesslog.Snapshot); ok {
 		section := value
 		snap.AccessLog = &section
 		applyAccessLogHealth(&snap.Meta, section.Health)
 	}
-	if frozen, ok := sections[counters.SectionName].(counters.Frozen); ok && len(frozen.Entries) > 0 {
+	if frozen, ok := sections[counters.SectionName].(counters.Frozen); ok {
 		snap.Counters = frozen.Entries
 		if frozen.Dropped > 0 {
 			snap.Meta.Partial = true
@@ -347,19 +446,6 @@ func applyRunIntervalSections(snap *Snapshot, sections map[string]any) {
 		}
 	}
 	applyOverflowHealth(snap)
-}
-
-// accessLogHasContent reports whether a frozen access-log generation says
-// anything at all. Lines are the obvious case, but a generation that read
-// nothing and complained about it says something too: "the log could not be
-// parsed" is a finding, and silently keeping the live (equally empty) value
-// would hide it.
-func accessLogHasContent(value accesslog.Snapshot) bool {
-	switch value.Health.Status {
-	case accesslog.StatusPartial, accesslog.StatusError:
-		return true
-	}
-	return value.Lines > 0 || len(value.Entries) > 0 || value.Health.Dropped > 0
 }
 
 // SectionHealth derives the health entries a completed run's sections report,
@@ -406,6 +492,9 @@ func SectionHealth(sections map[string]any) []health.Entry {
 		}
 		add(dbpool.Name, messages)
 	}
+	if section, ok := sections[queryplan.Name].(*queryplan.Section); ok {
+		add(queryplan.Name, queryPlanSectionMessages(section))
+	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Collector < entries[j].Collector })
 	return entries
 }
@@ -443,6 +532,22 @@ func sqlRowsSectionMessages(section *sqlrows.Section) []string {
 			continue
 		}
 		messages = append(messages, joinNote(target.TargetID, strings.TrimSpace(target.Code+" "+target.Reason)))
+	}
+	return messages
+}
+
+// queryPlanSectionMessages renders the capture's grouped notes.
+//
+// The notes are already one line per reason across every target that hit it,
+// and the reasons themselves come from a fixed table inside the capture, so
+// nothing derived from a statement's text can reach health through this path.
+func queryPlanSectionMessages(section *queryplan.Section) []string {
+	if section == nil {
+		return nil
+	}
+	messages := make([]string, 0, len(section.Health))
+	for _, note := range section.Health {
+		messages = append(messages, joinNote(note.Key, note.Message))
 	}
 	return messages
 }
@@ -486,7 +591,7 @@ type handler struct {
 // NewHandler returns the report handler. Routes are relative:
 // GET / (run index), GET /<run-id> (stored run detail), GET /live,
 // GET /snapshot.html, GET /json, GET /files/<name>,
-// POST /reset, POST /collect, POST /save.
+// POST /reset, POST /collect, POST /finish, POST /abort, POST /save.
 func NewHandler(p Provider) http.Handler { return newHandler(p).routes() }
 
 // newHandler builds the report handler without wiring its routes, so an
@@ -509,6 +614,7 @@ func (h *handler) routes() http.Handler {
 	mux.HandleFunc("/reset", h.reset)
 	mux.HandleFunc("/collect", h.collect)
 	mux.HandleFunc("/finish", h.finish)
+	mux.HandleFunc("/abort", h.abort)
 	mux.HandleFunc("/save", h.save)
 	mux.HandleFunc("/files/", h.files)
 	return mux
@@ -571,24 +677,32 @@ func (h *handler) currentGeneration() int64 {
 	return h.gen.Load()
 }
 
-// runSections returns the completed run's collector sections, or nil when no
-// coordinator is wired or no run has produced a snapshot yet.
-func (h *handler) runSections() map[string]any {
+// completedRun returns one consistent completed-run record. The legacy
+// Sections callback is wrapped in an envelope without evidence so existing
+// custom providers remain source-compatible.
+func (h *handler) completedRun() *RunSnapshot {
+	if h.p.RunSnapshot != nil {
+		return h.p.RunSnapshot()
+	}
 	if h.p.Sections == nil {
 		return nil
 	}
-	return h.p.Sections()
+	sections := h.p.Sections()
+	if sections == nil {
+		return nil
+	}
+	return &RunSnapshot{Sections: sections}
 }
 
 func (h *handler) makeSnapshot(generation int64, db *dbinspect.Schema, entries []agg.Entry) Snapshot {
-	return h.snapshotWith(generation, db, entries, h.runSections())
+	return h.snapshotWith(generation, db, entries, h.completedRun())
 }
 
 // snapshotWith builds a snapshot around an already-read section map, so a
 // caller that needs the sections twice — once for the baseline sections here,
 // once for the interval overlay after the live reads — observes one consistent
 // set rather than two reads of a run that may have finished in between.
-func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries []agg.Entry, sections map[string]any) Snapshot {
+func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries []agg.Entry, run *RunSnapshot) Snapshot {
 	healthEntries, partial := []health.Entry(nil), false
 	if h.p.Health != nil {
 		healthEntries, partial = h.p.Health.Snapshot()
@@ -597,18 +711,25 @@ func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries [
 	bi := buildinfo.Get()
 	snap := Snapshot{
 		Meta: Meta{
-			SchemaVersion: schemaVersion,
-			Time:          time.Now().In(reportTZ).Format(time.RFC3339),
-			Generation:    generation,
-			Revision:      bi.Short(),
-			Dirty:         bi.Dirty,
-			Host:          sysinfo.Get(),
-			Partial:       partial,
-			Health:        healthEntries,
+			SchemaVersion:   schemaVersion,
+			Time:            time.Now().In(reportTZ).Format(time.RFC3339),
+			Generation:      generation,
+			Revision:        bi.Short(),
+			Dirty:           bi.Dirty,
+			BuildSource:     bi.Source,
+			ProvenanceValid: bi.Source != "unknown" && bi.Revision != "" && !bi.Dirty,
+			Host:            sysinfo.Get(),
+			Partial:         partial,
+			Health:          healthEntries,
 		},
 		DB:      db,
 		Advisor: h.currentAdvisor(),
 		SQL:     entries,
+	}
+	var sections map[string]any
+	if run != nil {
+		sections = run.Sections
+		applyRunInfo(&snap, run.Info)
 	}
 	if h.p.Counters != nil {
 		snap.Counters = h.p.Counters.Snapshot()
@@ -626,6 +747,39 @@ func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries [
 	}
 	applyRunSections(&snap, sections)
 	return snap
+}
+
+// applyRunInfo attaches the lifecycle evidence and derives run-specific health
+// from the same immutable collector records.
+func applyRunInfo(snap *Snapshot, info RunInfo) {
+	if snap == nil || info.RunID == "" {
+		return
+	}
+	copyInfo := info
+	copyInfo.Collectors = append([]RunCollectorBoundary(nil), info.Collectors...)
+	snap.Meta.Run = &copyInfo
+	if info.Validity != "" && info.Validity != "valid" {
+		snap.Meta.Partial = true
+	}
+	for _, boundary := range info.Collectors {
+		if boundary.Code == "" {
+			continue
+		}
+		status := health.StatusDegraded
+		if boundary.Dropped {
+			status = health.StatusFailed
+		}
+		message := strings.TrimSpace(boundary.Phase + " " + boundary.Code)
+		if boundary.Err != "" {
+			message += ": " + boundary.Err
+		}
+		mergeHealth(&snap.Meta, health.Entry{
+			Collector: boundary.Name,
+			Status:    status,
+			Message:   message,
+		})
+		snap.Meta.Partial = true
+	}
 }
 
 // readAccessLog reads the access log for display.
@@ -649,12 +803,16 @@ func (h *handler) readAccessLog() accesslog.Snapshot {
 }
 
 func (h *handler) take() Snapshot {
-	sections := h.runSections()
+	run := h.completedRun()
+	var sections map[string]any
+	if run != nil {
+		sections = run.Sections
+	}
 	var entries []agg.Entry
 	if h.p.SQL != nil {
 		entries = h.p.SQL.Snapshot()
 	}
-	snap := h.snapshotWith(h.currentGeneration(), h.currentDB(), entries, sections)
+	snap := h.snapshotWith(h.currentGeneration(), h.currentDB(), entries, run)
 	applyOverflowHealth(&snap)
 	if h.p.HTTP != nil {
 		snap.HTTP = h.p.HTTP.Snapshot()
@@ -678,6 +836,7 @@ func (h *handler) take() Snapshot {
 	h.applyProtocolAdvice(&snap)
 	h.applyQUICTelemetry(&snap)
 	h.applyCacheTelemetry(&snap)
+	applyQueryPlanAdvice(&snap)
 	return snap
 }
 
@@ -748,6 +907,86 @@ func (h *handler) applyCacheTelemetry(snap *Snapshot) {
 
 func applyCacheTelemetry(snap *Snapshot, telemetry *advisor.CacheTelemetry, err error) {
 	snap.Advisor = advisor.WithCacheTelemetry(snap.Advisor, telemetry, err)
+}
+
+// applyQueryPlanAdvice replaces the advisor's placeholder plan checks with a
+// verdict once a run has actually captured an EXPLAIN.
+//
+// Nothing happens without a captured section: the placeholders advisor.Collect
+// already emitted say the capture never ran, which is exactly right for a
+// process with the feature off, and re-deriving them here would only risk
+// disagreeing with them.
+func applyQueryPlanAdvice(snap *Snapshot) {
+	if snap == nil || snap.QueryPlan == nil {
+		return
+	}
+	snap.Advisor = advisor.WithQueryPlans(snap.Advisor, advisorQueryPlans(snap.QueryPlan), nil)
+}
+
+// advisorQueryPlans flattens the captured section into the advisor's input.
+//
+// Every field copied here is either a closed enum or schema text (a table or
+// index name); the sample statement never left the capture callback, and this
+// type has no field able to hold it either. The nullable EXPLAIN columns are
+// copied by value into fresh pointers rather than aliased, so the snapshot and
+// the advisor cannot observe each other's edits.
+func advisorQueryPlans(section *queryplan.Section) []advisor.QueryPlan {
+	plans := make([]advisor.QueryPlan, 0, len(section.Targets))
+	for _, target := range section.Targets {
+		for _, plan := range target.Plans {
+			converted := advisor.QueryPlan{
+				TargetID:    target.TargetID,
+				Digest:      plan.Digest,
+				Query:       plan.Query,
+				Freshness:   advisor.PlanFreshness(plan.Freshness),
+				FreshReason: string(plan.FreshReason),
+				Rows:        advisorPlanRows(plan.Rows),
+			}
+			if plan.Err != nil {
+				converted.ErrClass = string(plan.Err.Class)
+			}
+			plans = append(plans, converted)
+		}
+	}
+	return plans
+}
+
+func advisorPlanRows(rows []queryplan.PlanRow) []advisor.QueryPlanRow {
+	if len(rows) == 0 {
+		return nil
+	}
+	out := make([]advisor.QueryPlanRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, advisor.QueryPlanRow{
+			SelectType:   copyString(row.SelectType),
+			Table:        copyString(row.Table),
+			Type:         copyString(row.Type),
+			Key:          copyString(row.Key),
+			PossibleKeys: copyString(row.PossibleKeys),
+			Rows:         copyInt64(row.Rows),
+			Extra:        copyString(row.Extra),
+		})
+	}
+	return out
+}
+
+// copyString and copyInt64 duplicate a nullable column, preserving "the server
+// reported no value" as a nil rather than collapsing it to an empty string or
+// a zero.
+func copyString(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	value := *v
+	return &value
+}
+
+func copyInt64(v *int64) *int64 {
+	if v == nil {
+		return nil
+	}
+	value := *v
+	return &value
 }
 
 // runIDPattern is the timestamp id embedded at the start of persisted
@@ -911,16 +1150,42 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	// collector generations.
 	h.resetMu.Lock()
 	defer h.resetMu.Unlock()
+	// Fix the boundary before waiting for the immutable snapshot. Runtime
+	// profiles must close here, while the background drain is still in flight;
+	// taking them after CompleteRun would include the collector's own teardown.
+	var run RunFinish
+	if h.p.FinishRun != nil {
+		accepted, err := h.p.FinishRun(r.Context())
+		if err != nil {
+			if h.p.Health != nil {
+				h.p.Health.Set("runctl", health.StatusDegraded, err.Error())
+			}
+			http.Error(w, "isutools: no run to save: "+err.Error(), http.StatusConflict)
+			return
+		}
+		run = accepted
+		h.captureCloseProfiles(run)
+	}
 	// End the run first. Everything below then renders the run's immutable
 	// snapshot instead of the live collectors, which is the whole point of
 	// having a closing boundary: a report saved after the boundary must
 	// describe the interval, not the empty generation that replaced it.
-	run := h.completeRun(r.Context())
+	completed := h.completeRun(r.Context())
+	if completed.RunID != "" {
+		run = completed
+	}
+	// Legacy/custom providers may expose CompleteRun without FinishRun. Their
+	// capture is necessarily late, but still produces a complete, explicit pair.
+	h.captureCloseProfiles(run)
 	if run.RunID != "" {
 		h.runEnded.Store(true)
 		w.Header().Set(runIDHeader, run.RunID)
 	}
 	snap := h.take()
+	// The run's profile record is attached here rather than in take(): both
+	// halves of a pair exist only once the run has been closed, and a live
+	// report has no run id to look one up by.
+	snap.Meta.Profiles = h.profileManifest(run.RunID)
 	base := fmt.Sprintf("%s_gen%d_%s",
 		h.nextRunID(), snap.Meta.Generation, fileSafeRevision(snap.Meta))
 	if score := r.URL.Query().Get("score"); score != "" {
@@ -1053,7 +1318,12 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	defer h.resetMu.Unlock()
 
 	var snap Snapshot
-	if h.p.RotateSQL != nil {
+	if h.p.RunGenerationManaged || h.p.SQLGenerationManaged {
+		// StartRun owns the rotation. This read is only the previous display;
+		// rotating here as well would advance the same collector twice and put
+		// the public generation ahead of the run coordinator's epoch.
+		snap = h.take()
+	} else if h.p.RotateSQL != nil {
 		generation, entries := h.p.RotateSQL()
 		snap = h.makeSnapshot(generation, h.currentDB(), entries)
 	} else {
@@ -1064,7 +1334,7 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		h.gen.Add(1)
 	}
 	applyOverflowHealth(&snap)
-	if h.p.HTTP != nil {
+	if h.p.HTTP != nil && !h.p.RunGenerationManaged && !h.p.HTTPGenerationManaged {
 		before := h.httpResetsCutShort()
 		snap.HTTP = h.p.HTTP.Reset()
 		applyOverflowHealth(&snap)
@@ -1090,28 +1360,35 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	h.applyProtocolAdvice(&snap)
 	h.applyQUICTelemetry(&snap)
 	h.applyCacheTelemetry(&snap)
+	applyQueryPlanAdvice(&snap)
 	h.mu.Lock()
 	h.prev = &snap
 	h.mu.Unlock()
 	if h.p.Health != nil {
 		h.p.Health.ResetDropped()
 	}
-	if h.p.Counters != nil {
+	if h.p.Counters != nil && !h.p.RunGenerationManaged && !h.p.CountersGenerationManaged {
 		h.p.Counters.Reset()
 	}
+	// Refresh schema and advisor inputs before the measured boundary opens.
+	// These callbacks issue their own SQL; running them after StartRun would put
+	// isutools' information_schema probes into the application's sqlrows interval.
+	h.captureDB()
 	// Open the run here, immediately after the generations were rotated, and
-	// not after the schema inspection below: an observation that lands between
+	// after the schema inspection above: an observation that lands between
 	// the rotation and the run boundary belongs to the new generation but to
 	// no run, and would be silently lost.
-	run := h.startRun(r.Context())
+	run, err := h.startRun(r.Context())
+	if err != nil {
+		http.Error(w, "isutools: run could not be started: "+err.Error(), http.StatusConflict)
+		return
+	}
 	// The generations are fresh again, so a flush has somewhere to land even
 	// when the run itself could not be opened.
 	h.runEnded.Store(false)
 	if run.RunID != "" {
 		w.Header().Set(runIDHeader, run.RunID)
 	}
-	// Re-capture the schema so the new generation records its pre-run state.
-	h.captureDB()
 	// Profile the fresh generation (i.e. the benchmark that follows).
 	h.captureCPUProfile(h.currentGeneration())
 	// The opening runtime profiles are taken here, after the boundary is fixed
@@ -1155,24 +1432,23 @@ func (h *handler) rebaselineAccessLog() {
 const runIDHeader = "X-Isutools-Run-Id"
 
 // startRun opens the run this reset measures. A coordinator failure degrades
-// health and yields an anonymous run rather than failing the reset, because
-// the collector generations have already been rotated: answering with an
-// error would tell the caller nothing was measured when in fact it was.
-func (h *handler) startRun(ctx context.Context) RunStart {
+// health and is returned to /reset, which fails closed: a benchmark must not
+// begin after the full boundary failed to open.
+func (h *handler) startRun(ctx context.Context) (RunStart, error) {
 	if h.p.StartRun == nil {
-		return RunStart{}
+		return RunStart{}, nil
 	}
 	run, err := h.p.StartRun(ctx)
 	if err != nil {
 		if h.p.Health != nil {
 			h.p.Health.Set("runctl", health.StatusDegraded, err.Error())
 		}
-		return RunStart{}
+		return RunStart{}, err
 	}
 	if h.p.Health != nil {
 		h.p.Health.Set("runctl", health.StatusOK, "")
 	}
-	return run
+	return run, nil
 }
 
 // completeRun ends the run this save reports on and waits for its immutable
@@ -1232,6 +1508,14 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: no run to finish: "+err.Error(), http.StatusConflict)
 		return
 	}
+	// The closing half of the run's profile pair, taken on this line and not
+	// one later. FinishRun returns the accepted boundary without waiting for
+	// the drain, the collect or the snapshot build, so a capture taken after
+	// any of that would contain isutools' own background work — which mutex
+	// and block profiles would attribute to lock contention, the one thing
+	// they are read for. Whatever did land between the freeze and here is
+	// measured rather than assumed, and reported as the pair's tail excess.
+	h.captureCloseProfiles(run)
 	if h.p.Health != nil {
 		h.p.Health.Set("runctl", health.StatusOK, "")
 	}
@@ -1242,6 +1526,43 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(run)
+}
+
+// abort abandons the run in flight without producing a snapshot. It uses the
+// same operation and boundary locks as reset/finish/save so no flush or new
+// boundary can cross the coordinator's epoch fence.
+func (h *handler) abort(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	if h.p.AbortRun == nil {
+		http.Error(w, "isutools: this build has no run coordinator", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.beginOperation(w) {
+		return
+	}
+	defer h.endOperation()
+	h.resetMu.Lock()
+	defer h.resetMu.Unlock()
+
+	run, err := h.p.AbortRun(r.Context())
+	if err != nil {
+		if h.p.Health != nil {
+			h.p.Health.Set("runctl", health.StatusDegraded, err.Error())
+		}
+		http.Error(w, "isutools: run could not be aborted: "+err.Error(), http.StatusConflict)
+		return
+	}
+	h.abortRunProfiles(run.RunID)
+	if h.p.Health != nil {
+		h.p.Health.Set("runctl", health.StatusOK, "")
+	}
+	if run.RunID != "" {
+		h.runEnded.Store(true)
+		w.Header().Set(runIDHeader, run.RunID)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handler) collect(w http.ResponseWriter, r *http.Request) {

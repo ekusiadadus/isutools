@@ -68,6 +68,11 @@ var (
 	ErrInvalidPurpose = errors.New("isutools: invalid purpose")
 	// ErrDuplicatePurpose means (target, purpose) already has a credential.
 	ErrDuplicatePurpose = errors.New("isutools: purpose already registered")
+	// ErrInspectorTargetMismatch means a purpose credential points at a
+	// different database server from the target's application credential.
+	// The default database may differ because inspector connections remove it,
+	// but driver, network and address must identify the same endpoint.
+	ErrInspectorTargetMismatch = errors.New("isutools: inspector credential points at a different target")
 	// ErrPurposeNotRegistered means the purpose has no credential and no
 	// fallback is allowed for it.
 	ErrPurposeNotRegistered = errors.New("isutools: purpose not registered")
@@ -77,6 +82,11 @@ var (
 	// ErrUnparsedDSN means the DSN could not be parsed structurally, so the
 	// connection hygiene rules cannot be applied to it.
 	ErrUnparsedDSN = errors.New("isutools: dsn could not be parsed")
+	// ErrUnsupportedDSNForm means the DSN parses, but not into a form the
+	// inspector hygiene rules can be applied to. Only the
+	// go-sql-driver/mysql form can be rebuilt without its default database,
+	// which is the property the whole hygiene argument rests on.
+	ErrUnsupportedDSNForm = errors.New("isutools: dsn form does not support inspector connection hygiene")
 	// ErrTooManyTargets means the registry is at MaxTargets.
 	ErrTooManyTargets = errors.New("isutools: too many db targets")
 	// ErrDriverFailed reports a failure raised by the database driver itself.
@@ -180,6 +190,10 @@ func RegisterDBTarget(id, driverName, dsn string) error {
 // target. Only PurposeStats and PurposeExplain are accepted: PurposeApp is
 // the target's identity, and replacing it mid-run would change Display,
 // Schema and the canonical tuple under the collectors' feet.
+//
+// The DSN must use the go-sql-driver/mysql form, because that is the only
+// form the connection hygiene rules can be applied to; a URL-form DSN is
+// rejected with ErrUnsupportedDSNForm rather than opened without them.
 func RegisterDBInspector(targetID string, purpose Purpose, driverName, dsn string) error {
 	return defaultRegistry.registerInspector(targetID, purpose, driverName, dsn)
 }
@@ -418,6 +432,21 @@ func (r *registry) registerInspector(targetID string, purpose Purpose, driverNam
 		// stripped, so this connection would pollute the measured schema.
 		return fmt.Errorf("%w: inspector DSNs must be parseable so the default database can be removed", ErrUnparsedDSN)
 	}
+	if parsed.form != formMySQL {
+		// A URL-form DSN cannot be rebuilt without its default database
+		// (inspectorDSN hands it back verbatim), so none of the inspector
+		// parameters would take effect: the connection would keep a default
+		// database, and every statement it runs — including the EXPLAIN
+		// pre-flight (SET ROLE NONE, SELECT CURRENT_ROLE(), SHOW GRANTS) —
+		// would be filed under the measured schema instead of
+		// SCHEMA_NAME IS NULL. Refusing at registration time makes that a
+		// startup error the operator can see, rather than measurements that
+		// are silently contaminated hours later. PurposeApp is unaffected:
+		// the application's DSN is whatever the application chose.
+		return fmt.Errorf("%w: the %q credential must use the go-sql-driver/mysql DSN form "+
+			"(user:password@tcp(host:port)/dbname), because a URL-form DSN cannot be opened without its default database",
+			ErrUnsupportedDSNForm, purpose)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -427,6 +456,10 @@ func (r *registry) registerInspector(targetID string, purpose Purpose, driverNam
 	}
 	if _, exists := t.creds[purpose]; exists {
 		return fmt.Errorf("%w: %q already has a %q credential", ErrDuplicatePurpose, targetID, purpose)
+	}
+	app := t.creds[PurposeApp]
+	if parsed.endpoint(driverName) != app.parsed.endpoint(app.driver) {
+		return fmt.Errorf("%w: target %q expects %s", ErrInspectorTargetMismatch, targetID, t.info().Display)
 	}
 	t.creds[purpose] = credential{driver: driverName, dsn: dsn, parsed: parsed}
 	return nil
@@ -965,9 +998,8 @@ func slug(s string) string {
 type dsnForm int
 
 const (
-	formUnparsed dsnForm = iota
 	// formMySQL is [user[:pass]@][net[(addr)]]/dbname[?params].
-	formMySQL
+	formMySQL dsnForm = iota + 1
 	// formURL is scheme://[user[:pass]@]host[:port]/dbname[?params].
 	formURL
 )
@@ -1184,6 +1216,15 @@ func canonicalAddr(network, addr, defPort string) string {
 // parameters — only what decides which database bytes end up in.
 func (p parsedDSN) tuple(driverName string) string {
 	return strings.Join([]string{driverName, p.network, p.addr, p.database}, "\x00")
+}
+
+// endpoint is the credential-independent server identity used to ensure a
+// purpose credential cannot silently read a different database under an
+// existing TargetID. The default database is intentionally excluded: every
+// inspector connection removes it before opening and binds TargetInfo.Schema
+// explicitly.
+func (p parsedDSN) endpoint(driverName string) string {
+	return strings.Join([]string{driverName, p.network, p.addr}, "\x00")
 }
 
 // display rebuilds a human-readable endpoint from an allowlist of fields

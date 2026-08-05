@@ -82,6 +82,7 @@ func Collect(ctx context.Context, opts Options) []Check {
 	checks = append(checks, checkHTTP3(opts)...)
 	checks = append(checks, checkResponseCache(opts)...)
 	checks = append(checks, cacheHealthCheck(opts.Cache, opts.CacheError))
+	checks = append(checks, queryPlanChecks(nil, "")...)
 	checks = append(checks, checkECH(opts)...)
 	checks = append(checks, checkTransport(opts)...)
 	sort.SliceStable(checks, func(i, j int) bool {

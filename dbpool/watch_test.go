@@ -1,7 +1,6 @@
 package dbpool
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -226,5 +225,5 @@ func TestWatchRealDBStats(t *testing.T) {
 	if entries[0].Partial {
 		t.Fatalf("Partial = true, want false for a quiet pool: %+v", entries[0])
 	}
-	var _ sql.DBStats = db.Stats()
+	_ = db.Stats()
 }

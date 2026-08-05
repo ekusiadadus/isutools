@@ -11,7 +11,10 @@ import (
 type Status string
 
 const (
-	StatusOK       Status = "ok"
+	StatusOK Status = "ok"
+	// StatusInfo is useful configuration context, not an incomplete
+	// measurement. Like disabled, it does not make a snapshot partial.
+	StatusInfo     Status = "info"
 	StatusDegraded Status = "degraded"
 	StatusFailed   Status = "failed"
 	StatusDisabled Status = "disabled"

@@ -9,6 +9,8 @@
 ISUCON 向けオールインワン計測モジュール。**アプリの変更1行**で SQL / HTTP /
 nginx アクセスログ / プロセス・CPU / DB スキーマ / pprof を計測し、
 **ソート済みダッシュボード**と**自己完結スナップショット**で振り返る。
+v1.2 では **SQL 行効率(examined/sent)・実行計画・DB プール・ホスト資源・
+ネットワーク**が同じ run 境界の中に並ぶ。
 
 ベンチ毎の履歴がスコア・git rev 付きで並び、行クリックで当時の全計測が開く:
 
@@ -40,6 +42,62 @@ http.ListenAndServe(":8080", isutools.HTTP(handler))
 driver ごとの import・DSN・pgxpool の制約は
 [統合ガイド §2](./docs/INTEGRATION.md#2-db-ドライバへの接続)を参照。
 
+## Go API(任意の追加連携)
+
+1行導入はそのまま。以下は **すべて opt-in** で、呼ばなければ従来どおり動く。
+
+```go
+// (1) initialize をベンチ区間の開始にする
+func postInitialize(w http.ResponseWriter, r *http.Request) {
+	err := isutools.SerializeInitialize(r.Context(), func(ctx context.Context) error {
+		if err := rebuildDB(ctx); err != nil {
+			return err
+		}
+		// ★ initialize レスポンスを書く「前」に呼ぶ。
+		//    ベンチはレスポンスを見た瞬間に負荷を開始するので、
+		//    後で呼ぶと run の冒頭が丸ごと欠ける。
+		run, err := isutools.ResetNow(ctx)
+		if err != nil || run.Validity == isutools.ValidityInvalid {
+			return fmt.Errorf("isutools: this run is not measurable: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		// 計測が必須なら handler ごと失敗させる。
+		// 汚染された run を「それらしい数値」として残すほうが有害。
+		http.Error(w, "initialize failed", http.StatusInternalServerError)
+		return
+	}
+	writeInitializeResponse(w) // レスポンスはここで初めて書く
+}
+
+// (2) DB を安定 ID で登録し、プールと EXPLAIN 用 credential を紐付ける
+//     Purpose は "github.com/ekusiadadus/isutools/sqlstats" にある
+isutools.RegisterDBTarget("app", "mysql", dsn) // sqlx.Open より前に呼ぶ
+db, _ := sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
+isutools.WatchDBPool("app", db.DB)             // 反映は「次の run」から
+isutools.RegisterDBInspector("app", sqlstats.PurposeExplain, "mysql", explainDSN)
+```
+
+| 関数 | シグネチャと要点 |
+|---|---|
+| `ResetNow` | `func ResetNow(ctx context.Context) (StartResult, error)`。実行中の run を preempt して即座に新しい run を開く(最後の initialize が必ず勝つ)。`ISUTOOLS=off` ならゼロ値と `nil` を返すので分岐不要 |
+| `ResetNowWithNonce` | `func ResetNowWithNonce(ctx context.Context, nonce string) (StartResult, error)`。同じ nonce の再送は最初の `StartResult` を replay する(initialize リトライ対策) |
+| `SerializeInitialize` | `func SerializeInitialize(ctx context.Context, fn func(context.Context) error) error`。initialize 全体(スキーマ再構築 + `ResetNow`)を包む。**プロセス内**の直列化のみ。取得できなければ `ErrInitializeBusy`(既定 30 秒)。`ISUTOOLS=off` でも直列化は効く |
+| `RegisterDBTarget` | `func RegisterDBTarget(id, driverName, dsn string) error`。論理 DB に人間が読める安定 ID を付ける。**Open より前**に呼ぶこと(先に接続すると DSN から自動導出された `名前-ハッシュ` 形式の ID で登録され、明示 ID の登録は `ErrDuplicateTarget` で失敗する) |
+| `RegisterDBInspector` | `func RegisterDBInspector(targetID string, purpose sqlstats.Purpose, driverName, dsn string) error`。既存 target に 2 本目の credential を付ける。`PurposeStats`(SHOW STATUS / performance_schema)と `PurposeExplain`(EXPLAIN 専用・最小権限)のみ。`PurposeExplain` はアプリ credential へ **fallback しない**。DSN は go-sql-driver/mysql 形式のみ |
+| `WatchDBPool` / `UnwatchDBPool` | `func WatchDBPool(targetID string, db *sql.DB) error`。登録済み TargetID(byte 一致)のプールだけを見る。ID を作ることはしない — 未登録なら `ErrUnknownTarget`、`db` が nil なら `ErrNilDB`。ID は `RegisterDBTarget` か `sqlstats.TargetIDForDSN` から得る。引数検査は `ISUTOOLS=off` / `ISUTOOLS_DBPOOL=off` でも実行されるので、配線ミスはベンチ時ではなく本番構成で気付ける |
+
+`ResetNow` 系はいずれも「境界を確定するだけ」であり、2 回目の initialize が
+DB を作り直すこと自体は止められない。だから `SerializeInitialize` で包む。
+包まずに開いた initialize run は health に `initialize-unserialized`(degraded)
+として残る。
+
+なお `ResetNowOpts` も exported だが、引数の型が `internal/runctl` にあり
+**アプリからは import できないので実際には呼べない**(戻り値の `StartResult` /
+`Validity` は型エイリアスがあるので読める)。initialize から使うのは
+`ResetNow` と `ResetNowWithNonce` の2つだけでよい。
+
 ## エンドポイント(管理サーバ)
 
 | ルート | 内容 |
@@ -51,19 +109,37 @@ driver ごとの import・DSN・pgxpool の制約は
 | `GET /json` | 機械可読スナップショット(`prev` = 前世代付き) |
 | `GET /pprof/` | net/http/pprof(アプリプロセスのプロファイル) |
 | `GET /diff?a=<id>&b=<id>` | **2つの実行の差分**(total/count/avg。件数差がある行は改善と断定しない) |
-| `POST /reset` | 世代リセット(ベンチ前に叩く)。CPU プロファイル自動採取も開始 |
+| `POST /reset` | 世代リセット + run 開始(ベンチ前に叩く)。CPU プロファイル自動採取も開始 |
 | `POST /collect` | buffered nginx log を期限付きで flush 待ち・回収 |
-| `POST /save?score=N` | 現世代を上限付きで html+json staging 保存(HTML は JSON 公開後に一覧へ出る) |
+| `POST /finish` | 現 run の終了境界を固定し、drain を待たず `202` + 境界 JSON を返す |
+| `POST /abort` | 現 run を epoch fence 付きで中止(`204`、冪等、snapshot は作らない) |
+| `POST /save?score=N` | 終了境界を固定して immutable snapshot を待ち、上限付きで html+json staging 保存(HTML は JSON 公開後に一覧へ出る) |
 | `GET /files/<name>` | 保存済み html / json / pprof の取得 |
+
+`/reset` `/finish` `/abort` `/save` は開始・終了した run の ID を
+`X-Isutools-Run-Id` ヘッダで返す(ベンチスクリプトのログに残すと、
+どの run がどのベンチだったかを後から突き合わせられる)。
 
 ## レポートに出るもの
 
-- **meta**: 時刻(**常に JST**)・git rev(+dirty)・世代番号・score・
+- **meta**: 時刻(**常に JST**)・git rev(+dirty)・build source / provenance 判定・世代番号・score・
   **ホスト情報(CPU モデル / コア数 / メモリ GB / OS)**
 - **Collector Health**: 各コレクターの状態・欠損(`partial`)警告
 - **DB Schema**: 世代開始時点のテーブル・行数・**インデックス一覧**(「実行前に何が
   貼ってあったか」の証跡)
 - **SQL**: 正規化クエリ別 total/count/errors/avg/p95/max(文字列・数値リテラルは `?` にマスク)
+- **SQL 行効率**: digest 別 rows examined / rows sent。「1 行返すために何行読んだか」
+  = インデックスが効いているかの実測(MySQL の performance_schema が必要)
+- **Query Plans**: 上位 digest の EXPLAIN 結果。「なぜその行効率なのか」を
+  type=ALL / Using filesort / Using temporary で示す(既定 off)
+- **DB Pool**: `database/sql` のプール統計。「DB が遅いのか、プール上限の
+  行列で待っているだけなのか」を waits と平均 wait で切り分ける
+- **Host**: メモリ / ディスク IO / PSI / cgroup 上限と host identity。
+  「マシン側に資源が残っていたのか」(Linux のみ)
+- **Network**: TCP ソケット要約と NIC のスループット・エラー・drop・MTU。
+  「NIC を使い切ったのか、それとも余っていたのか」(Linux のみ)
+- **Profiles**: run の両端で採った mutex / block / heap のペアと、その
+  `go tool pprof -diff_base` 差分コマンド(既定 off)
 - **HTTP**: アプリ視点のリクエスト別レイテンシ・バイト数
 - **Proxy Access Log**: nginx/Caddy/明示JSON(reqtime/upstime 分離・bytes・cache・304 等)
 - **Processes**: ベンチ区間のプロセス別 CPU/RSS(top 互換 1core=100%)+
@@ -74,7 +150,17 @@ driver ごとの import・DSN・pgxpool の制約は
   シナリオ別の上位ユーザーストーリーとして集計(GA4風flowの最小基盤)
 - **Counters**: `isutools.Count("cache_hit")` によるアプリ内カウンタ(世代毎リセット)
 - **Advisor**: ISUCON 定石で未設定のものに加え、HTTP/3/QUIC移行readiness
-  (server/TLS/Alt-Svc/fallback/UDP/edge/実測protocol/再送・drop evidence)
+  (server/TLS/Alt-Svc/fallback/UDP/edge/実測protocol/再送・drop evidence)、
+  キャッシュ戦略(`nginx-proxy-cache` / `nginx-proxy-cache-lock` /
+  `nginx-proxy-cache-set-cookie` / `cache-app-telemetry`)、ECH readiness
+  (`ech-config` / `ech-key-rotation` / `ech-logging`)、
+  同一ホスト upstream の UNIX domain socket 化(`nginx-upstream-uds`)、
+  listen backlog と `somaxconn` の突き合わせ(`nginx-listen-backlog`)、
+  Go PGO ビルドの有無(`go-pgo`)、実行計画由来の
+  `plan-full-scan` / `plan-filesort` / `plan-temporary`。
+  v1.2 の3件(`nginx-upstream-uds` / `nginx-listen-backlog` / `go-pgo`)は
+  「不具合」ではなく「伸びしろ」なので ok / info / skip しか出さず warn には**しない**。
+  `plan-*` の3件だけは実測の実行計画が根拠なので warn を出す
 - **Snapshots / CPU Profiles**: 過去実行・プロファイルの一覧(ダッシュボードから選択、
   各行に前回実行との diff リンク)
 
@@ -98,6 +184,57 @@ driver ごとの import・DSN・pgxpool の制約は
 | `ISUTOOLS_HTTP3_QUIC_METRICS` | — | snapshot時に再読込するproxy QUIC counter JSON。再送率とUDP dropを診断 |
 | `ISUTOOLS_CACHE_METRICS` | — | snapshot時に再読込するアプリ側キャッシュ counter JSON(`hits` / `misses` / `evictions`)。ヒット率とexpire前evictionを診断 |
 
+### コレクター有効/無効(すべて既定 on)
+
+`off` を入れるとそのコレクターは **登録自体されない**(1文も発行せず、
+phase 予算も消費しない)。ABBA で「その計測だけ外した run」を作るための
+スイッチであり、機能を止めるためのものではない。
+
+無効と解釈される値は `off` / `0` / `false` / `no` / `disabled`(前後の空白と
+大文字小文字は無視)。それ以外の値はすべて on 扱いになる。**`ISUTOOLS_HOSTSTATS`
+だけは `disabled` を受け付けない**(`off` / `0` / `false` / `no` のみ)ので、
+`ISUTOOLS_HOSTSTATS=disabled` は無効化にならず on のままになる。
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `ISUTOOLS_HOSTSTATS` | on | Host セクション(メモリ / disk / PSI / cgroup / identity)。Linux 以外、および `/proc/meminfo` が読めない環境では `ErrUnsupportedOS` を返して自動的に未登録 |
+| `ISUTOOLS_NETSTATS` | on | Network セクション(collector 名は `network`)。Linux 以外では `/proc/net` が無いため未登録 |
+| `ISUTOOLS_SQLROWS` | on | SQL 行効率セクション。performance_schema が有効な MySQL でのみ数値が出る |
+| `ISUTOOLS_DBPOOL` | on | DB Pool セクション。`WatchDBPool` を1つも呼んでいなければセクションは出ない |
+
+### ランタイムプロファイル(すべて既定 off)
+
+run の両端で採り、差分だけを読む。プロファイルレートはプロセス全体の
+runtime 設定なので、**未設定の変数には一切触らない**(アプリが自分で
+設定した値を勝手に上書きしない)。
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `ISUTOOLS_MUTEX_FRACTION` | (未設定=変更しない) | `runtime.SetMutexProfileFraction` に渡す 0 以上の整数。実効値が 0 より大きいときだけ mutex profile を採る |
+| `ISUTOOLS_BLOCK_RATE_NS` | (未設定=変更しない) | `runtime.SetBlockProfileRate` に渡す 0 以上の整数(ナノ秒)。この変数で 1 以上を設定したときだけ block profile を採る |
+| `ISUTOOLS_HEAP_PROFILE` | off | `1` / `true` / `on` / `yes` で heap profile を採る |
+
+数値として解釈できない値は **無視して fail-open** し、health の `profile` に
+`ignored invalid values: ...` として残る。成果物は `ISUTOOLS_DATA_DIR` に置かれ、
+ダッシュボードの Profiles セクションに `go tool pprof -diff_base` のコマンドが出る。
+
+### EXPLAIN(既定 off)
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `ISUTOOLS_EXPLAIN` | off | `1` / `on` / `true` / `yes` / `enabled` で EXPLAIN 取得を有効化。それ以外は off(計測対象 DB に文を追加するので opt-in) |
+| `ISUTOOLS_EXPLAIN_TOP` | 10 | 1 target あたり EXPLAIN する SELECT digest の上限。解釈不能・0 以下は 10 に戻し、200 を超える値は 200 に丸める |
+| `ISUTOOLS_EXPLAIN_DSN` | — | EXPLAIN 専用 credential の DSN(go-sql-driver/mysql 形式)。**登録済み target がちょうど1つのときだけ**有効で、2つ以上なら「どちらの DB か」が決まらないため拒否し health に残す。その場合は `RegisterDBInspector(id, PurposeExplain, ...)` を使う |
+| `ISUTOOLS_EXPLAIN_DRIVER` | `mysql` | 上の DSN を open するドライバ名 |
+
+### ホスト計測の補助
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `ISUTOOLS_ROLE` | — | この agent の役割ラベル(`app` / `db` / `proxy` など)。自由記述で、表示にのみ使う |
+| `ISUTOOLS_CGROUP_SCOPE` | (自動判定) | `host` を入れたときだけ「initial cgroup namespace に居る」という宣言になる。コンテナ内からは自己判定できないので推測しない。既定は見えている cgroup ツリーに応じて `visible-root` / `agent-cgroup` |
+| `ISUTOOLS_CGROUP_PATH` | — | 読む cgroup を cgroup2 マウント相対で指定(agent と mysqld が別 cgroup のとき用)。絶対パス・`..`・マウント外へのシンボリックリンク・読めないパスは **fail closed** で cgroup 計測ごと skip し、理由コードを health に残す |
+
 ## 追加ライブラリと事前準備
 
 pprof は Go 標準ライブラリなので、計測側の追加 package は不要。自動 CPU profile には
@@ -105,6 +242,60 @@ writable な `ISUTOOLS_DATA_DIR`、解析時だけ `go tool pprof` が必要に�
 追加 package はないが Linux `/proc` と PID namespace の権限が必要。k6、curl、jq、
 Graphviz は用途別の外部コマンドであり、isutools の runtime library ではない。
 機能別の必須／任意一覧は [統合ガイド §1](./docs/INTEGRATION.md#1-必須任意の全体像)。
+
+## SQL 行効率(examined/sent)
+
+`performance_schema.events_statements_summary_by_digest` を run の両端で読み、
+その差分から digest ごとの **rows examined / rows sent** を出す。
+「1 行返すために何行読んだか」であり、**ISUCON13 優勝チームが実際に使った基準は
+「5 倍以下」**。ダッシュボードは比 > 5 の行、および no index / tmp disk table /
+sort merge が発生した行を網掛けにする。
+
+比は **SELECT かつ sent > 0 の digest でのみ**算出し、**DML と rows_sent=0 は
+`N/A`** と表示する(0 で割るか、単に「該当行が無かった」だけのクエリに最悪スコアを
+でっち上げるかのどちらかになるため)。DML の行は代わりに affected 列を見る。
+
+前提と制約:
+
+- MySQL の **performance_schema が有効**であること。無効な target は数値を出さず
+  skip 理由だけを出す(「測るものが無い」ことは失敗として扱わない)。sqlrows は必須
+  コレクターではないので、実際に失敗した場合も run は partial に落ちるだけで無効にはならない。
+- 計測用接続は既定 DB を持たない状態で張られ、自分の文が計測結果に混ざらないことを
+  `performance_schema.threads` で**検証**する。検証できない target は
+  「混ざった数値」を出すより skip を選ぶ。
+- `performance_schema_digests_size` が不足していると overflow 行が出る。
+  その target の集計は全数ではない旨が警告として表示される。
+
+## Query Plans(EXPLAIN・既定 off)
+
+`ISUTOOLS_EXPLAIN=1` のときだけ、ベンチ終了後の enrich フェーズで
+**1 run につき 1 回**、上位 digest に EXPLAIN を実行する。ダッシュボードを
+開いても再実行はしない。結果は type=ALL / Using filesort / Using temporary を
+網掛けし、advisor の `plan-full-scan` / `plan-filesort` / `plan-temporary` に繋がる。
+
+- 文面は MySQL の `QUERY_SAMPLE_TEXT` を使うため **MySQL 8.0.17 以降のみ**。
+  それ未満と MariaDB には列が無く、`explain-unsupported` として skip する。
+- **EXPLAIN 専用の最小権限ユーザーが必須**(`PurposeExplain`)。アプリの credential に
+  fallback することは決してしない — EXPLAIN SELECT はストアド関数経由で副作用を持ち得るため。
+  権限は接続そのもの上で role を無効化して検証し、許可リスト(対象 schema と
+  performance_schema への SELECT ほか)を超えていれば skip する。
+- リテラルを含む文面はサンプルを読んだコールバックの外に出さない。スナップショットに
+  残るのは正規化済みの DIGEST_TEXT と、失敗時は分類コード + ドライバの数値コードだけ。
+
+## Host / Network / DB Pool
+
+- **Host**(`hoststats`)と **Network**(`netstats`)は procfs / sysfs / cgroup v2 を
+  読むため **Linux でのみ登録される**。他 OS では collector health に disabled と出る。
+- Host はどの cgroup を見たか(scope)と host identity(hostname、machine-id /
+  boot-id のハッシュ、各 namespace)を必ず併記する。コンテナ内では同じファイルが
+  マシンではなく namespace を説明するので、scope の無い数値は読めない。
+- Network の値は**表示専用**で、advisor の閾値には一切繋げていない。区間平均は
+  瞬間的な飽和を見られず、`/proc/net/sockstat` の TIME_WAIT は inbound と outbound を
+  区別しないため。
+- DB Pool も現時点では数値のみで閾値判定はしない。`wait 合計` は待った goroutine
+  全員の待ち時間の総和なので run の長さを超え得る。比較には **平均 wait**
+  (wait_duration ÷ waits)を使う。waits が 0 でなければ、その待ち時間を決めたのは
+  DB ではなくプール上限。
 
 ## nginx 設定(アクセスログ計測)
 
@@ -141,6 +332,10 @@ curl -X POST $ADMIN/reset                  # 世代開始(CPU プロファイル
 curl -X POST "$ADMIN/save?score=$score"    # 永続化 → ダッシュボード一覧に1行追加
 curl $ADMIN/json | jq '.sql[:5]'           # その場で top5 確認
 ```
+
+保存せずに終了境界だけを即時固定する場合は `POST /finish`、計測を破棄して次の
+run を開始可能にする場合は `POST /abort` を使う。`POST /collect` は access log の
+flush だけであり run を終了しない。
 
 ## スクリーンショット
 
@@ -184,6 +379,41 @@ email等を`sess`/`scenario`へ入れてはいけない。これらは偽装可�
 構成するブロックを最低3回実行する。同一 binary/image fingerprint、固定 warm-up、
 score・p95・error rate、paired 95% CI を TSV と provenance に保存し、CI 上限で判定する。
 必要な BENCH 出力形式はスクリプト先頭と[統合ガイド §7](./docs/INTEGRATION.md#7-pprofprocstats負荷生成ツール)を参照。
+
+**v1.2.0 ではこのゲートは未通過(pending)**。[実装状況](./docs/IMPLEMENTATION_STATUS.md)に
+記録された private-isu 上の観測は 2 ブロック(8 run)で off 平均 556,196 /
+on 平均 546,150 = **+1.81% のスコア低下**であり、v1.0.0 の −0.58% より明確に重い。
+しかも `abba.sh` は信頼区間を作るために最低 3 ブロックを要求して 2 ブロックでは
+exit 2 する(`ABBA_BLOCKS must be >= 3 for a confidence interval`)ため、
+この +1.81% は区間の付かない点推定にすぎない。コレクターが4本増えた以上
+当然の増加ではあるが、DESIGN.md §7 の 2% 上限にほとんど余裕がない。
+
+## v1.2 対応状況
+
+実装済み: **run ライフサイクル**(`internal/runctl` の Start / Finish / Abort / Ack、
+epoch fencing、phase 別の時間予算)/ **DB target registry**(安定 TargetID と
+Purpose `app` / `stats` / `explain`、`RegisterDBTarget` / `RegisterDBInspector` /
+`Inspect` / `Targets` / `TargetIDForDSN`)/ **SQL 行効率**(performance_schema の
+examined vs sent)/ **hoststats**(メモリ / disk / PSI / cgroup / host identity・Linux のみ)/
+**netstats**(TCP 要約 / NIC スループット / MTU・collector 名 `network`・Linux のみ)/
+**dbpool**(`WatchDBPool` による `database/sql` プール統計)/
+**queryplan**(`QUERY_SAMPLE_TEXT` 経由の EXPLAIN 取得・MySQL 8.0.17 以降・既定 off)/
+**advisor 追加チェック**(`nginx-upstream-uds` / `nginx-listen-backlog` / `go-pgo` /
+`plan-full-scan` / `plan-filesort` / `plan-temporary`)/
+**ダッシュボードの新セクション**(SQL 行効率・Host・Network・DB Pool・Query Plans・Profiles)/
+**Go API**(`ResetNow` / `ResetNowWithNonce` / `SerializeInitialize`、run 両端の
+ランタイムプロファイルペア)。
+
+**複数台横断計測(peer protocol)は未実装で、計画のみ**
+([plans/10-multi-host.md](./plans/10-multi-host.md))。現状は **1 ホスト単位**の計測であり、
+`ISUTOOLS_PEER` / `ISUTOOLS_PEER_TOKEN` / `ISUTOOLS_AGENT_TARGETS_FILE` といった
+計画中の変数を読むコードは存在しない。複数台構成では各ホストで別々に isutools を
+動かし、ダッシュボードもホストごとに開くことになる。`SerializeInitialize` の
+直列化もプロセス内に閉じており、ホストをまたいだ initialize は直列化できない。
+
+その他の既知の制約: hoststats / netstats は Linux 専用、SQL 行効率は MySQL の
+performance_schema が必要、EXPLAIN は MySQL 8.0.17 以降 + 専用の最小権限 credential が必要で
+既定 off。ランタイムプロファイル(mutex / block / heap)も既定 off。
 
 ## v1.0 対応状況
 

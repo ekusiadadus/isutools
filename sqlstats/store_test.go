@@ -175,7 +175,7 @@ func TestRotateContextHonoursTheCallersDeadline(t *testing.T) {
 	// A nil context is a caller mistake measurement must survive rather than
 	// panic on: it falls back to the budget alone.
 	s.SetRotateDrainBudget(20 * time.Millisecond)
-	if frozen := s.RotateContext(nil); frozen.Generation != 2 {
+	if frozen := s.RotateContext(nil); frozen.Generation != 2 { //nolint:staticcheck // explicitly verifies the documented nil-context fallback
 		t.Fatalf("frozen = %#v, want generation 2", frozen)
 	}
 }

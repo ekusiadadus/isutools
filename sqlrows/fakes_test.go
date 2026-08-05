@@ -49,13 +49,6 @@ func (q *fakeQuerier) fail(query string, err error) *fakeQuerier {
 	return q
 }
 
-// forget removes a scripted answer, which makes the statement fail as an
-// unscripted one.
-func (q *fakeQuerier) forget(query string) *fakeQuerier {
-	delete(q.answers, query)
-	return q
-}
-
 func (q *fakeQuerier) record(query string, args []any) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

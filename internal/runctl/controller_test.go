@@ -524,6 +524,39 @@ func TestAwaitRespectsCallerCancellation(t *testing.T) {
 	close(g.drainBlock)
 }
 
+func TestSnapshotOfReturnsDefensiveCopies(t *testing.T) {
+	ctx := context.Background()
+	c, _, _, _ := startedController(t)
+	start, err := c.StartRun(ctx, StartRunOptions{})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if _, err := c.FinishRun(ctx, start.RunID); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	if _, err := c.Await(ctx, start.RunID); err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+
+	first, err := c.SnapshotOf(start.RunID)
+	if err != nil {
+		t.Fatalf("SnapshotOf: %v", err)
+	}
+	first.Sections["injected"] = "caller mutation"
+	first.Collectors[0].Code = "caller-mutation"
+
+	second, err := c.SnapshotOf(start.RunID)
+	if err != nil {
+		t.Fatalf("SnapshotOf again: %v", err)
+	}
+	if _, ok := second.Sections["injected"]; ok {
+		t.Fatal("section map mutation changed the retained snapshot")
+	}
+	if second.Collectors[0].Code == "caller-mutation" {
+		t.Fatal("collector slice mutation changed the retained snapshot")
+	}
+}
+
 func TestRetainedRunsEvictsTheOldestInactiveRecord(t *testing.T) {
 	ctx := context.Background()
 	c, _, _, _ := startedController(t)

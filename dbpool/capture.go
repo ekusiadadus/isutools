@@ -61,6 +61,14 @@ func (c *Collector) captureBaselineLocked(runID string, ep runctl.Epoch) runctl.
 	if c.run.baseTaken && c.run.base != nil {
 		return *c.run.base
 	}
+	// Notes describe one run, not the lifetime of the process. Starting a new
+	// baseline drops the previous run's diagnostics before recording this run's
+	// watch-set verdict.
+	c.notes = nil
+	c.noteSeen = make(map[string]struct{})
+	if len(c.watch) == 0 && !c.everWatched {
+		c.noteLocked(HealthNotRegistered + ": WatchDBPool was not called before the run started")
+	}
 	at := c.now()
 	sample := make(Sample, len(c.watch))
 	active := make(map[string]struct{}, len(c.watch))

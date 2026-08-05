@@ -4,9 +4,11 @@ import (
 	"html/template"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ekusiadadus/isutools/hoststats"
+	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 )
 
@@ -42,7 +44,7 @@ a { color: #0b57d0; }
 </head>
 <body>
 <h1>isutools</h1>
-<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} &middot; gen {{.Snapshot.Meta.Generation}}</p>
+<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} ({{.Snapshot.Meta.BuildSource}}) &middot; gen {{.Snapshot.Meta.Generation}}{{if not .Snapshot.Meta.ProvenanceValid}} &middot; build provenance unverified{{end}}</p>
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 {{if .Snapshot.Meta.Partial}}<p class="meta warn">partial snapshot: one or more collectors reported incomplete data</p>{{end}}
 <p class="meta"><a href="live">live report</a> &middot; <a href="snapshot.html">download current</a> &middot; <a href="json">json</a></p>
@@ -217,6 +219,226 @@ func digestIndexHot(d sqlrows.DigestStat) bool {
 		d.SortMergePasses > 0 || d.CreatedTmpDiskTables > 0
 }
 
+// planNullCell is what a NULL EXPLAIN column renders as. Every column of
+// MySQL's classic EXPLAIN output can be NULL, and the one thing it must never
+// print as is Go's "<nil>": an em dash reads as "the server reported nothing
+// here", which is what a NULL means.
+const planNullCell = "—"
+
+// planQueryRunes bounds the statement text in a query-plan cell. The full text
+// stays in the cell's title attribute like the SQL 行効率 table's does.
+const planQueryRunes = 90
+
+// planTable is one target's query plans, prepared for rendering.
+type planTable struct {
+	TargetID string
+	Schema   string
+	Lines    []planLine
+}
+
+// planLine is one row of the Query Plans table: one row of one digest's
+// EXPLAIN output, or the single line a digest with no plan contributes.
+//
+// The columns are rendered into strings here rather than in the template
+// because the interesting cases — a NULL column, a plan that failed, a sample
+// the run cannot vouch for — are decisions, and a decision buried in template
+// syntax cannot be tested on its own.
+type planLine struct {
+	Query  string
+	Digest string
+	// Freshness is the Japanese label for this sample's verdict, and Fresh is
+	// false for anything the advisor is not allowed to judge.
+	Freshness string
+	Fresh     bool
+
+	SelectType   string
+	Table        string
+	Type         string
+	Key          string
+	PossibleKeys string
+	Rows         string
+	// RowsSort is the sortable numeric value behind Rows, -1 when the server
+	// reported none, so a NULL sorts apart from a genuine zero.
+	RowsSort int64
+	Extra    string
+
+	// The three access-path defects the plan checks warn about, kept as flags
+	// so the cell that carries the evidence is the cell that is highlighted.
+	FullScan  bool
+	Filesort  bool
+	Temporary bool
+
+	// Note explains a digest with no EXPLAIN row at all.
+	Note string
+}
+
+// Hot reports a line worth highlighting as a whole.
+func (l planLine) Hot() bool { return l.FullScan || l.Filesort || l.Temporary }
+
+// planTables prepares the captured section for rendering, dropping every
+// target that produced no plan.
+//
+// The dropping is what makes the section disappear entirely on a run where
+// EXPLAIN captured nothing: a heading over an empty table would suggest the
+// statements had no plan, when in fact none was taken. The reasons are not
+// lost — they reach the reader through the Collector Health table, which is
+// where the other collectors' skips are read too.
+func planTables(section *queryplan.Section) []planTable {
+	if section == nil {
+		return nil
+	}
+	tables := make([]planTable, 0, len(section.Targets))
+	for _, target := range section.Targets {
+		if len(target.Plans) == 0 {
+			continue
+		}
+		tables = append(tables, planTable{
+			TargetID: target.TargetID,
+			Schema:   target.Schema,
+			Lines:    planLines(target.Plans),
+		})
+	}
+	if len(tables) == 0 {
+		return nil
+	}
+	return tables
+}
+
+// planLines flattens one target's plans into table rows.
+//
+// The statement is repeated on every row of a digest rather than written once
+// and left blank below, because the table is sortable: a click on a header
+// reorders the rows, and a cell whose meaning depends on the row above it
+// would then belong to the wrong statement.
+func planLines(plans []queryplan.Plan) []planLine {
+	lines := make([]planLine, 0, len(plans))
+	for _, plan := range plans {
+		fresh := plan.Freshness == queryplan.FreshnessFresh
+		base := planLine{
+			Query:     plan.Query,
+			Digest:    plan.Digest,
+			Freshness: planFreshnessLabel(plan),
+			Fresh:     fresh,
+		}
+		if len(plan.Rows) == 0 {
+			base.Note = planErrorLabel(plan.Err)
+			base.RowsSort = -1
+			base.SelectType, base.Table = planNullCell, planNullCell
+			base.Type, base.Key, base.PossibleKeys = planNullCell, planNullCell, planNullCell
+			base.Rows, base.Extra = planNullCell, planNullCell
+			lines = append(lines, base)
+			continue
+		}
+		for _, row := range plan.Rows {
+			line := base
+			line.SelectType = planCell(row.SelectType)
+			line.Table = planCell(row.Table)
+			line.Type = planCell(row.Type)
+			line.Key = planCell(row.Key)
+			line.PossibleKeys = planCell(row.PossibleKeys)
+			line.Rows, line.RowsSort = planRowsCell(row.Rows)
+			line.Extra = planCell(row.Extra)
+			// Only a fresh plan is highlighted. A stale or unjudgeable sample
+			// may have run with a different literal, and a warning colour on a
+			// plan this run never took is an invitation to tune the wrong
+			// statement.
+			line.FullScan = fresh && planIsFullScan(row.Type)
+			line.Filesort = fresh && planHasExtra(row.Extra, "using filesort")
+			line.Temporary = fresh && planHasExtra(row.Extra, "using temporary")
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// planCell renders a nullable EXPLAIN column. These carry schema identifiers —
+// table names, index names, optimizer notes — never a statement's literals.
+func planCell(v *string) string {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return planNullCell
+	}
+	return strings.TrimSpace(*v)
+}
+
+// planRowsCell renders the row estimate together with its sort key.
+func planRowsCell(v *int64) (string, int64) {
+	if v == nil {
+		return planNullCell, -1
+	}
+	return strconv.FormatInt(*v, 10), *v
+}
+
+func planIsFullScan(access *string) bool {
+	return access != nil && strings.EqualFold(strings.TrimSpace(*access), "ALL")
+}
+
+func planHasExtra(extra *string, flag string) bool {
+	return extra != nil && strings.Contains(strings.ToLower(*extra), flag)
+}
+
+// planFreshnessLabel says whether the sample belongs to the measured interval,
+// and when it does not, why that could not be established.
+//
+// The reason is a closed enum on the producing side. An unrecognized value is
+// reported generically rather than echoed, so a future producer cannot put
+// unvetted text on the page through this path.
+func planFreshnessLabel(plan queryplan.Plan) string {
+	switch plan.FreshReason {
+	case queryplan.FreshInInterval:
+		if plan.Freshness == queryplan.FreshnessFresh {
+			return "計測区間内"
+		}
+	case queryplan.FreshBeforeInterval:
+		return "区間より前"
+	case queryplan.FreshAfterInterval:
+		return "区間より後"
+	case queryplan.FreshClockAnomaly:
+		return "DB 時計異常のため判定不能"
+	case queryplan.FreshClockMissing:
+		return "DB 側時計情報なしのため判定不能"
+	case queryplan.FreshRunPartial:
+		return "区間が partial のため判定不能"
+	case queryplan.FreshIntervalShort:
+		return "区間が短すぎて判定不能"
+	}
+	switch plan.Freshness {
+	case queryplan.FreshnessFresh:
+		return "計測区間内"
+	case queryplan.FreshnessStale:
+		return "計測区間外"
+	default:
+		return "判定不能"
+	}
+}
+
+// planErrorLabel renders why a digest has no plan. Like the freshness reason
+// it is a closed enum, mapped here rather than printed.
+func planErrorLabel(err *queryplan.PlanError) string {
+	if err == nil {
+		return "実行計画の行なし"
+	}
+	switch err.Class {
+	case queryplan.PlanErrTimeout:
+		return "タイムアウト"
+	case queryplan.PlanErrBudgetExhausted:
+		return "時間予算切れ"
+	case queryplan.PlanErrPermission:
+		return "権限不足"
+	case queryplan.PlanErrSyntax:
+		return "構文エラーまたはサンプル切り詰め"
+	case queryplan.PlanErrObjectMissing:
+		return "対象オブジェクトなし"
+	case queryplan.PlanErrSampleUnavail:
+		return "サンプルなし"
+	case queryplan.PlanErrSampleTruncated:
+		return "サンプル切り詰めの疑い"
+	case queryplan.PlanErrConnection:
+		return "接続エラー"
+	default:
+		return "その他"
+	}
+}
+
 // reportFuncs is the report template's function set. The formatting helpers
 // are named functions rather than closures so each one can be tested on its
 // own, without rendering a page to find out what it prints.
@@ -239,9 +461,13 @@ var reportFuncs = template.FuncMap{
 	"f1": func(value float64) string {
 		return strconv.FormatFloat(value, 'f', 1, 64)
 	},
-	"size":         humanBytes,
-	"sizeDelta":    humanBytesDelta,
-	"dur":          humanDuration,
+	"size":      humanBytes,
+	"sizeDelta": humanBytesDelta,
+	"dur":       humanDuration,
+	// ns renders a nanosecond count the profile records carry as raw integers,
+	// so a capture's distance from its boundary reads in the same units as
+	// every other duration on the page.
+	"ns":           func(nanos int64) string { return humanDuration(time.Duration(nanos)) },
 	"pf1":          optFloat,
 	"psize":        optBytes,
 	"clock":        clockTime,
@@ -250,6 +476,7 @@ var reportFuncs = template.FuncMap{
 	"ratio":        digestRatio,
 	"ratioHot":     digestRatioHot,
 	"indexHot":     digestIndexHot,
+	"planTables":   planTables,
 	"diskUtilNote": func() string { return hoststats.DiskUtilNote },
 	"cgroupNote":   func() string { return hoststats.CGroupScopeNote },
 }
@@ -273,15 +500,17 @@ tbody tr:nth-child(odd) { background: #fafafa; }
 .empty { color: #999; }
 .warn { color: #b45309; }
 tr.hot > td { background: #fef3c7; }
+tr.stale > td { color: #999; }
 td.flag { color: #b45309; font-weight: bold; }
 details { font-size: .8rem; margin: .4rem 0; }
 summary { cursor: pointer; color: #666; }
 ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
+pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-break: break-all; }
 </style>
 </head>
 <body>
 <h1>isutools report{{if .Snapshot.Meta.Score}} — score {{.Snapshot.Meta.Score}}{{end}}</h1>
-<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} &middot; gen {{.Snapshot.Meta.Generation}}{{if .Snapshot.Meta.Score}} &middot; score {{.Snapshot.Meta.Score}}{{end}}</p>
+<p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} ({{.Snapshot.Meta.BuildSource}}) &middot; gen {{.Snapshot.Meta.Generation}}{{if .Snapshot.Meta.Score}} &middot; score {{.Snapshot.Meta.Score}}{{end}}{{if not .Snapshot.Meta.ProvenanceValid}} &middot; build provenance unverified{{end}}</p>
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
 
@@ -379,6 +608,33 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 {{end}}
 <p class="meta">examined/sent は SELECT かつ sent &gt; 0 の digest でのみ算出します(DML と sent=0 は N/A)。網掛けの行は比 &gt; 5、または no index / tmp disk table / sort merge が発生した digest です。</p>
 {{if .Health}}<p class="meta warn">{{range $i, $note := .Health}}{{if $i}} &middot; {{end}}{{$note.Key}}: {{$note.Message}}{{end}}</p>{{end}}
+{{end}}{{end}}
+
+{{with .Snapshot.QueryPlan}}{{with planTables .}}
+<h2>Query Plans <span class="meta">(ベンチ終了後に上位 digest へ EXPLAIN を 1 回だけ実行した結果。画面を開いても再実行はしません)</span></h2>
+{{range .}}
+<p class="meta">target {{.TargetID}}{{if .Schema}} &middot; schema {{.Schema}}{{end}}</p>
+<table>
+<thead><tr>
+<th>query</th><th>鮮度</th><th>select_type</th><th>table</th><th>type</th><th>key</th><th>possible_keys</th><th>rows</th><th>Extra</th>
+</tr></thead>
+<tbody>
+{{range .Lines}}<tr{{if .Hot}} class="hot"{{else if not .Fresh}} class="stale"{{end}}>
+<td class="l" title="{{.Query}}">{{cut .Query 90}}</td>
+<td class="l">{{.Freshness}}</td>
+<td class="l">{{.SelectType}}</td>
+<td class="l">{{.Table}}</td>
+<td class="l{{if .FullScan}} flag{{end}}">{{.Type}}</td>
+<td class="l">{{.Key}}</td>
+<td class="l">{{.PossibleKeys}}</td>
+<td data-v="{{.RowsSort}}">{{.Rows}}</td>
+<td class="l{{if or .Filesort .Temporary}} flag{{end}}">{{if .Note}}{{.Note}}{{else}}{{.Extra}}{{end}}</td>
+</tr>{{end}}
+</tbody>
+</table>
+{{end}}
+<p class="meta">type=ALL(全表走査)・Using filesort(索引で解けないソート)・Using temporary(一時表)の行を網掛けにしています。— は当該列が NULL、つまりサーバが値を返さなかったことを表します。</p>
+<p class="meta">灰色の行は計測区間内に実行されたサンプルではありません(区間外・DB 時計異常・partial な区間)。リテラルが違えば実行計画も変わるため、advisor の判定対象からは外しています。鮮度の列にその理由が入ります。</p>
 {{end}}{{end}}
 
 <h2>HTTP</h2>
@@ -584,6 +840,29 @@ ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 <p class="meta">Mbit/s は NIC の speed とそのまま比べられる単位です。区間平均なので瞬間的な飽和は見えません。MTU は表示のみ(経路全体が一致して初めて意味を持つため、良し悪しは判定しません)。</p>
 {{else}}<p class="empty">no interface counters (loopback は既定で除外)</p>{{end}}
 {{if .Health}}<p class="meta warn">{{range $i, $note := .Health}}{{if $i}} &middot; {{end}}{{$note.Key}}{{if $note.Detail}}: {{$note.Detail}}{{end}}{{end}}</p>{{end}}
+{{end}}
+
+{{with .Snapshot.Meta.Profiles}}
+<h2>Profiles <span class="meta">(run の両端で採った mutex / block / heap。差分だけが run を近似します)</span></h2>
+{{if .Pairs}}
+{{range .Pairs}}
+<p class="meta">{{if .Lagging}}<span class="warn">⚠ 採取遅延</span> &middot; {{end}}{{.Kind}} &middot; {{.ResidualText}}{{if .OpenGate}} &middot; open gate {{.OpenGate}}{{end}}</p>
+{{range .Notes}}<p class="meta">{{.}}</p>{{end}}
+<pre class="cmd">{{.DiffCommand}}</pre>
+{{end}}
+{{else}}<p class="empty">差分できる pair はありません(片端しか採れていない種別は pair を作りません)</p>{{end}}
+{{if .Captures}}
+<table>
+<thead><tr><th>kind</th><th>point</th><th>status</th><th>code</th><th>lag</th><th>file</th></tr></thead>
+<tbody>{{range .Captures}}<tr>
+<td class="l">{{.Kind}}</td><td>{{.Point}}</td><td>{{.Status}}</td>
+<td class="l">{{if .Code}}{{.Code}}{{else}}-{{end}}</td>
+<td data-v="{{.LagFromRefNs}}">{{ns .LagFromRefNs}}</td>
+<td class="l">{{if .File}}{{.File}}{{else}}-{{end}}</td>
+</tr>{{end}}</tbody>
+</table>
+{{end}}
+<p class="meta">artifact は ISUTOOLS_DATA_DIR に保存され、ダッシュボードの files/&lt;name&gt; から取得できます(sidecar の .meta.json も同じ場所です)。run 単位のプロファイルは存在しないので、必ず open と close の差分で読んでください。</p>
 {{end}}
 
 {{if .Sortable}}<script>

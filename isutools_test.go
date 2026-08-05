@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/internal/runctl"
 	"github.com/ekusiadadus/isutools/netstats"
+	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 	"github.com/ekusiadadus/isutools/web"
@@ -783,6 +785,31 @@ func TestLatestSectionsIsEmptyWhileTheRunIsInFlight(t *testing.T) {
 	}
 }
 
+func TestAbortResetRunClearsCurrentRunAndAllowsTheNext(t *testing.T) {
+	m := newTestMeasurement(t, nil)
+	started, err := m.startResetRun(context.Background())
+	if err != nil {
+		t.Fatalf("startResetRun: %v", err)
+	}
+	aborted, err := m.abortResetRun(context.Background())
+	if err != nil {
+		t.Fatalf("abortResetRun: %v", err)
+	}
+	if aborted.RunID != started.RunID || aborted.Reason != runctl.ReasonExplicit {
+		t.Fatalf("abort = %+v, started = %+v", aborted, started)
+	}
+	if got := m.currentRunID(); got != "" {
+		t.Fatalf("current run after abort = %q, want empty", got)
+	}
+	status, ok := m.ctrl.Status(started.RunID)
+	if !ok || status.State != runctl.StateAborted || status.Validity != runctl.ValidityInvalid {
+		t.Fatalf("aborted status = %+v (found=%v)", status, ok)
+	}
+	if _, err := m.startResetRun(context.Background()); err != nil {
+		t.Fatalf("next run after abort: %v", err)
+	}
+}
+
 func TestWatchDBPoolRejectsArgumentBugs(t *testing.T) {
 	if err := WatchDBPool("whatever", nil); !errors.Is(err, dbpool.ErrNilDB) {
 		t.Errorf("nil handle: err = %v, want ErrNilDB", err)
@@ -1131,6 +1158,226 @@ func TestRunEndToEnd_SectionsReachSnapshot(t *testing.T) {
 	}
 }
 
+// TestResetNowOpensTheProfilePairThatSaveCloses drives the other documented way
+// a run begins — the initialize contract — with runtime profiles enabled, and
+// insists that the pair on disk comes out complete.
+//
+// It is the test whose absence hid a permanently silent feature. The opening
+// capture used to live only inside the POST /reset handler, so an application
+// that follows the initialize contract published no opening artifact at all;
+// every closing capture then found no opening half to be differenced against
+// and wrote nothing, for the whole life of the process.
+func TestResetNowOpensTheProfilePairThatSaveCloses(t *testing.T) {
+	dir := t.TempDir()
+	core := newTestMeasurement(t, map[string]string{
+		envDataDir:     dir,
+		envHeapProfile: "1",
+	})
+	if !contains(core.profiles, "heap") {
+		t.Fatalf("profiles = %v, want the heap capture the environment asked for", core.profiles)
+	}
+	// Pin the generation the artifacts are filed under so their names can be
+	// asserted rather than merely counted.
+	core.generation = func() int64 { return 7 }
+	handler := web.NewHandler(web.Provider{
+		Health:          health.NewRegistry(),
+		DataDir:         dir,
+		RuntimeProfiles: core.profiles,
+		FinishRun:       core.finishResetRun,
+		CompleteRun:     core.completeResetRun,
+		Sections:        core.latestSections,
+	})
+
+	// The documented initialize: the whole handler serialized, the boundary
+	// taken inside it, and no POST /reset anywhere in the flow.
+	var started StartResult
+	err := SerializeInitialize(context.Background(), func(ctx context.Context) error {
+		var startErr error
+		started, startErr = core.resetNow(ctx, runctl.StartRunOptions{
+			Preempt: true, Reason: reasonInitialize, Trigger: "api",
+		})
+		return startErr
+	})
+	if err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	if started.RunID == "" {
+		t.Fatal("ResetNow opened no run")
+	}
+	// The opening half exists before anything is saved: it is taken at the
+	// boundary, not reconstructed at the end of the run.
+	opens := profileArtifacts(t, dir, "*_heap_open.pprof")
+	if len(opens) != 1 {
+		t.Fatalf("opening artifacts = %v, want exactly one, published by ResetNow", opens)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /save = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	closes := profileArtifacts(t, dir, "*_heap_close.pprof")
+	if len(closes) != 1 {
+		t.Fatalf("closing artifacts = %v, want the second half of the pair", closes)
+	}
+	// The two halves differ in the point and in nothing else, which is what
+	// makes the pair reassemblable from a directory listing.
+	base := strings.TrimSuffix(opens[0], "_open.pprof")
+	if want := base + "_close.pprof"; closes[0] != want {
+		t.Errorf("closing artifact = %q, want %q", closes[0], want)
+	}
+	if !strings.Contains(base, "_gen7_") || !strings.Contains(base, started.RunID[:8]) {
+		t.Errorf("artifact prefix = %q, want the run's generation and id in the name", base)
+	}
+	// Both records have to be on disk too: the sidecar is the durable primary
+	// record, and an opening capture is written long before any snapshot exists.
+	for _, point := range []string{"open", "close"} {
+		name := base + "_" + point + ".meta.json"
+		capture := readProfileCapture(t, dir, name)
+		if capture.RunID != started.RunID || capture.Epoch != uint64(started.Epoch) {
+			t.Errorf("%s records run %s/%d, want %s/%d",
+				name, capture.RunID, capture.Epoch, started.RunID, started.Epoch)
+		}
+		if capture.Status != "ok" || capture.File != base+"_"+point+".pprof" {
+			t.Errorf("%s = %+v, want an ok record naming its artifact", name, capture)
+		}
+		if string(capture.Point) != point {
+			t.Errorf("%s records point %q, want %q", name, capture.Point, point)
+		}
+	}
+	if leftovers := profileArtifacts(t, dir, "*.tmp"); len(leftovers) > 0 {
+		t.Errorf("temporary files left behind: %v", leftovers)
+	}
+
+	// And the saved report carries the pair, so a run read back months later
+	// still knows which two files to difference.
+	manifest := readSavedSnapshot(t, dir, rec).Meta.Profiles
+	if manifest == nil || len(manifest.Pairs) != 1 {
+		t.Fatalf("saved manifest = %+v, want exactly one pair", manifest)
+	}
+	if manifest.RunID != started.RunID {
+		t.Errorf("manifest run = %q, want the run ResetNow opened (%q)", manifest.RunID, started.RunID)
+	}
+	pair := manifest.Pairs[0]
+	if pair.Kind != "heap" || pair.OpenFile != opens[0] || pair.CloseFile != closes[0] {
+		t.Errorf("pair = %+v, want the two heap artifacts on disk (%v, %v)", pair, opens, closes)
+	}
+	if !strings.Contains(pair.DiffCommand, pair.OpenFile) || !strings.Contains(pair.DiffCommand, pair.CloseFile) {
+		t.Errorf("diff command = %q, want it to difference both halves", pair.DiffCommand)
+	}
+}
+
+// TestResetNowExportedEntryPointOpensThePair covers the one line the test above
+// cannot: whether an application calling the exported ResetNow reaches the
+// capture at all. The mechanism and the wiring are separate failures — a
+// perfect capture path that the public API routes around is still a feature
+// nobody can use.
+func TestResetNowExportedEntryPointOpensThePair(t *testing.T) {
+	dir := t.TempDir()
+	core := newTestMeasurement(t, map[string]string{
+		envDataDir:     dir,
+		envHeapProfile: "1",
+	})
+	core.generation = func() int64 { return 3 }
+	useDefaultMeasurement(t, core)
+
+	var started StartResult
+	err := SerializeInitialize(context.Background(), func(ctx context.Context) error {
+		var startErr error
+		started, startErr = ResetNow(ctx)
+		return startErr
+	})
+	if err != nil {
+		t.Fatalf("ResetNow: %v", err)
+	}
+	if started.RunID == "" {
+		t.Fatal("ResetNow opened no run")
+	}
+	opens := profileArtifacts(t, dir, "*_heap_open.pprof")
+	if len(opens) != 1 {
+		t.Fatalf("opening artifacts = %v, want the pair ResetNow opened", opens)
+	}
+	if !strings.Contains(opens[0], "_gen3_") || !strings.Contains(opens[0], started.RunID[:8]) {
+		t.Errorf("artifact = %q, want the run's generation and id in the name", opens[0])
+	}
+}
+
+// TestResetNowPublishesNothingWithoutABoundary keeps the capture behind the
+// boundary that justifies it. A start that failed measured nothing, and an
+// opening artifact from it would be indistinguishable from half of a pair whose
+// other half is still coming.
+func TestResetNowPublishesNothingWithoutABoundary(t *testing.T) {
+	dir := t.TempDir()
+	core := newTestMeasurement(t, map[string]string{
+		envDataDir:     dir,
+		envHeapProfile: "1",
+	})
+	ctx := context.Background()
+	if _, err := core.resetNow(ctx, runctl.StartRunOptions{Reason: "http", Trigger: "reset"}); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	// The zero options do not preempt, so this start collides with the run in
+	// flight and never reaches a boundary.
+	if _, err := core.resetNow(ctx, runctl.StartRunOptions{Reason: "http", Trigger: "reset"}); err == nil {
+		t.Fatal("a colliding start must fail rather than open a second run")
+	}
+	// Nor is a boundary that names no run worth an artifact: nothing could ever
+	// be paired with it.
+	core.captureOpenProfiles(runctl.StartResult{})
+
+	if names := profileArtifacts(t, dir, "*_heap_open.pprof"); len(names) != 1 {
+		t.Errorf("opening artifacts = %v, want only the successful start's", names)
+	}
+}
+
+// useDefaultMeasurement points the process-wide core at a test's own for the
+// duration of one test.
+//
+// The exported ResetNow family reaches the core through the singleton, so this
+// is the only way to drive the entry point an application actually calls
+// against a private Controller. The singleton is read from API entry points
+// only — never from a background goroutine — and tests in this package never
+// run in parallel, so the swap is observed by nobody else.
+func useDefaultMeasurement(t *testing.T, core *measurement) {
+	t.Helper()
+	// Fire the sync.Once first: an initialization that ran after the swap would
+	// overwrite it.
+	previous := defaultMeasurement()
+	t.Cleanup(func() { measurementCore = previous })
+	measurementCore = core
+}
+
+// profileArtifacts lists the data directory's entries matching a pattern, by
+// base name and in a stable order.
+func profileArtifacts(t *testing.T, dir, pattern string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, pattern))
+	if err != nil {
+		t.Fatalf("glob %s: %v", pattern, err)
+	}
+	names := make([]string, 0, len(matches))
+	for _, match := range matches {
+		names = append(names, filepath.Base(match))
+	}
+	sort.Strings(names)
+	return names
+}
+
+// readProfileCapture decodes one capture record from the data directory.
+func readProfileCapture(t *testing.T, dir, name string) web.ProfileCapture {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("read sidecar %s: %v", name, err)
+	}
+	var capture web.ProfileCapture
+	if err := json.Unmarshal(body, &capture); err != nil {
+		t.Fatalf("decode sidecar %s: %v", name, err)
+	}
+	return capture
+}
+
 // TestFinishIsTerminalAndCollectIsNot pins the two halves of the compatibility
 // guarantee at the level the endpoints actually run: /finish ends the run,
 // /collect never does.
@@ -1179,8 +1426,9 @@ func TestFinishIsTerminalAndCollectIsNot(t *testing.T) {
 // savedSnapshot is the subset of the persisted JSON the end-to-end test reads.
 type savedSnapshot struct {
 	Meta struct {
-		Score  string         `json:"score"`
-		Health []health.Entry `json:"health"`
+		Score    string               `json:"score"`
+		Health   []health.Entry       `json:"health"`
+		Profiles *web.ProfileManifest `json:"profiles"`
 	} `json:"meta"`
 	SQL  []agg.Entry `json:"sql"`
 	HTTP []struct {
@@ -1331,6 +1579,45 @@ func TestForwardRunHealthPublishesCollectorNotes(t *testing.T) {
 	}
 }
 
+func TestDBPoolNotRegisteredIsInformational(t *testing.T) {
+	if got := dbpoolNotesStatus([]string{dbpool.HealthNotRegistered + ": WatchDBPool was not called"}); got != health.StatusInfo {
+		t.Fatalf("status = %q, want info", got)
+	}
+	if got := dbpoolNotesStatus([]string{dbpool.HealthRegisteredMidRun + ": db1"}); got != health.StatusDegraded {
+		t.Fatalf("mid-run registration status = %q, want degraded", got)
+	}
+}
+
+func TestForwardRunHealthClearsARecoveredCollector(t *testing.T) {
+	restoreCollectorHealth(t, sqlrows.Name)
+	m := newTestMeasurement(t, nil)
+	m.forwardRunHealth("run-bad", &runctl.Snapshot{
+		RunID: "run-bad",
+		Collectors: []runctl.CollectorBoundary{{
+			Name: sqlrows.Name, Kind: runctl.KindBaseline, Phase: runctl.PhaseCollect,
+			Code: runctl.CodeCollectFailed, Err: "temporary failure", Dropped: true,
+		}},
+		Sections: map[string]any{},
+	})
+	if got := healthStatus(t, sqlrows.Name); got != health.StatusFailed {
+		t.Fatalf("bad run status = %q, want failed", got)
+	}
+
+	m.forwardRunHealth("run-good", &runctl.Snapshot{
+		RunID: "run-good",
+		Collectors: []runctl.CollectorBoundary{{
+			Name: sqlrows.Name, Kind: runctl.KindBaseline, Phase: runctl.PhaseCollect,
+		}},
+		Sections: map[string]any{sqlrows.Name: &sqlrows.Section{Validity: runctl.ValidityValid}},
+	})
+	if got := healthStatus(t, sqlrows.Name); got != health.StatusOK {
+		t.Fatalf("recovered run status = %q, want ok", got)
+	}
+	if got := healthMessage(t, sqlrows.Name); got != "" {
+		t.Fatalf("recovered run message = %q, want empty", got)
+	}
+}
+
 func healthMessage(t *testing.T, collector string) string {
 	t.Helper()
 	entries, _ := collectorHealth.Snapshot()
@@ -1474,5 +1761,418 @@ func TestRunEndToEnd_AccessLogSectionStopsAtTheFreezePoint(t *testing.T) {
 	}
 	if got := accessLogURIs(*payload.AccessLog); !slices.Equal(got, want) {
 		t.Fatalf("reported access log = %v, want exactly the run's traffic %v", got, want)
+	}
+}
+
+// TestExplainEnabledAgreesWithQueryplan pins the wiring's flag reader to the
+// capture package's own. This file reads an injected environment so the
+// wiring can be tested without process-wide state, and two readers of one
+// variable that disagree would turn the feature on in one place and off in
+// the other.
+func TestExplainEnabledAgreesWithQueryplan(t *testing.T) {
+	for _, value := range []string{
+		"", "1", "0", "on", "off", "true", "false", "yes", "no",
+		"enabled", "disabled", "ON", " 1 ", "maybe",
+	} {
+		t.Run("value="+value, func(t *testing.T) {
+			t.Setenv(queryplan.EnvFlag, value)
+			if got, want := explainEnabled(os.Getenv), queryplan.Enabled(); got != want {
+				t.Errorf("explainEnabled(%q) = %v, want queryplan.Enabled() = %v", value, got, want)
+			}
+		})
+	}
+}
+
+func TestExplainHookIsInstalledOnlyWhenTheFlagIsOn(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want bool
+	}{
+		{name: "off by default", env: map[string]string{}},
+		{name: "explicitly off", env: map[string]string{queryplan.EnvFlag: "0"}},
+		{name: "on", env: map[string]string{queryplan.EnvFlag: "1"}, want: true},
+		{
+			name: "measurement disabled wins",
+			env:  map[string]string{queryplan.EnvFlag: "1", "ISUTOOLS": "off"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newTestMeasurement(t, tt.env)
+			if (m.explain != nil) != tt.want {
+				t.Errorf("explain capture = %v, want installed=%v", m.explain, tt.want)
+			}
+		})
+	}
+}
+
+func TestComposeEnrichRunsCallerAndQueryPlanHooks(t *testing.T) {
+	wantFirst := errors.New("caller enrichment failed")
+	wantSecond := errors.New("query-plan enrichment failed")
+	var calls []string
+	hook := composeEnrich(
+		func(context.Context, *runctl.Snapshot) error {
+			calls = append(calls, "caller")
+			return wantFirst
+		},
+		func(context.Context, *runctl.Snapshot) error {
+			calls = append(calls, "queryplan")
+			return wantSecond
+		},
+	)
+	err := hook(context.Background(), &runctl.Snapshot{})
+	if strings.Join(calls, ",") != "caller,queryplan" {
+		t.Fatalf("calls=%v, want both hooks in caller-first order", calls)
+	}
+	if !errors.Is(err, wantFirst) || !errors.Is(err, wantSecond) {
+		t.Fatalf("error=%v, want both failures preserved", err)
+	}
+	if composeEnrich(nil, nil) != nil {
+		t.Fatal("two nil hooks must remain nil")
+	}
+}
+
+// TestExplainCredentialShortcut covers the ISUTOOLS_EXPLAIN_DSN path, which is
+// only defined for a single-target process: with two databases registered
+// there is nothing that says which one the DSN reaches.
+func TestExplainCredentialShortcut(t *testing.T) {
+	const secretDSN = "explainer:hunter2@tcp(127.0.0.1:3306)/"
+	type call struct {
+		target  string
+		purpose sqlstats.Purpose
+		driver  string
+		dsn     string
+	}
+	tests := []struct {
+		name        string
+		env         map[string]string
+		targets     []sqlstats.TargetInfo
+		registerErr error
+		wantCalls   []call
+		wantStatus  health.Status
+		wantMessage string
+	}{
+		{
+			name:    "no dsn configured registers nothing",
+			env:     map[string]string{},
+			targets: []sqlstats.TargetInfo{{ID: "db1"}},
+		},
+		{
+			name:      "single target gets the credential",
+			env:       map[string]string{envExplainDSN: secretDSN},
+			targets:   []sqlstats.TargetInfo{{ID: "db1"}},
+			wantCalls: []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "mysql", dsn: secretDSN}},
+			// The note names the target, never the DSN.
+			wantStatus: health.StatusOK, wantMessage: `target "db1"`,
+		},
+		{
+			name: "an explicit driver is honoured",
+			env: map[string]string{
+				envExplainDSN: secretDSN, envExplainDriver: "pgx",
+			},
+			targets:    []sqlstats.TargetInfo{{ID: "db1"}},
+			wantCalls:  []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "pgx", dsn: secretDSN}},
+			wantStatus: health.StatusOK,
+		},
+		{
+			name:        "two targets refuse the shortcut",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			targets:     []sqlstats.TargetInfo{{ID: "db1"}, {ID: "db2"}},
+			wantStatus:  health.StatusDegraded,
+			wantMessage: "RegisterDBInspector",
+		},
+		{
+			name:        "no target yet refuses it too",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			wantStatus:  health.StatusDegraded,
+			wantMessage: envExplainDSN,
+		},
+		{
+			name:        "an already registered credential is the steady state",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			targets:     []sqlstats.TargetInfo{{ID: "db1"}},
+			registerErr: sqlstats.ErrDuplicatePurpose,
+			wantCalls:   []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "mysql", dsn: secretDSN}},
+			wantStatus:  health.StatusOK,
+		},
+		{
+			name:        "a registration failure is reported from a fixed table",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			targets:     []sqlstats.TargetInfo{{ID: "db1"}},
+			registerErr: sqlstats.ErrUnknownDriver,
+			wantCalls:   []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "mysql", dsn: secretDSN}},
+			wantStatus:  health.StatusDegraded,
+			wantMessage: envExplainDriver,
+		},
+		{
+			name:        "an unparseable DSN is refused, not opened",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			targets:     []sqlstats.TargetInfo{{ID: "db1"}},
+			registerErr: sqlstats.ErrUnparsedDSN,
+			wantCalls:   []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "mysql", dsn: secretDSN}},
+			wantStatus:  health.StatusDegraded,
+			wantMessage: "接続衛生",
+		},
+		{
+			name:        "a target that vanished between the read and the write",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			targets:     []sqlstats.TargetInfo{{ID: "db1"}},
+			registerErr: sqlstats.ErrUnknownTarget,
+			wantCalls:   []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "mysql", dsn: secretDSN}},
+			wantStatus:  health.StatusDegraded,
+			wantMessage: "target",
+		},
+		{
+			name:        "an unclassified failure still says something",
+			env:         map[string]string{envExplainDSN: secretDSN},
+			targets:     []sqlstats.TargetInfo{{ID: "db1"}},
+			registerErr: errors.New("driver exploded: dsn=" + secretDSN),
+			wantCalls:   []call{{target: "db1", purpose: sqlstats.PurposeExplain, driver: "mysql", dsn: secretDSN}},
+			wantStatus:  health.StatusDegraded,
+			wantMessage: "登録に失敗しました",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := health.NewRegistry()
+			var calls []call
+			capture := &explainCapture{
+				getenv:  envMap(tt.env),
+				health:  registry,
+				targets: func() []sqlstats.TargetInfo { return tt.targets },
+				register: func(targetID string, purpose sqlstats.Purpose, driverName, dsn string) error {
+					calls = append(calls, call{targetID, purpose, driverName, dsn})
+					return tt.registerErr
+				},
+			}
+			capture.registerCredential()
+
+			if !slices.Equal(calls, tt.wantCalls) {
+				t.Errorf("registrations = %+v, want %+v", calls, tt.wantCalls)
+			}
+			entries, _ := registry.Snapshot()
+			entry, found := healthEntry(entries, healthExplainCredential)
+			if tt.wantStatus == "" {
+				if found {
+					t.Errorf("health = %+v, want no note when the shortcut is unused", entry)
+				}
+				return
+			}
+			if !found || entry.Status != tt.wantStatus {
+				t.Fatalf("health = %+v (found=%v), want status %q", entry, found, tt.wantStatus)
+			}
+			if tt.wantMessage != "" && !strings.Contains(entry.Message, tt.wantMessage) {
+				t.Errorf("health message = %q, want it to mention %q", entry.Message, tt.wantMessage)
+			}
+			// A DSN carries a password and this string is published in a
+			// snapshot, so no part of it may survive into the note.
+			if strings.Contains(entry.Message, "hunter2") || strings.Contains(entry.Message, secretDSN) {
+				t.Errorf("health message leaked the DSN: %q", entry.Message)
+			}
+		})
+	}
+}
+
+// fakeSQLRowsCollector publishes a fixed interval under sqlrows' own name, so
+// the enrich hook has the ranking and the database clock it needs without a
+// database behind it.
+type fakeSQLRowsCollector struct{ section *sqlrows.Section }
+
+func (fakeSQLRowsCollector) Name() string { return sqlrows.Name }
+
+func (c fakeSQLRowsCollector) CaptureBaseline(_ context.Context, runID string, ep runctl.Epoch) (runctl.SampleResult, error) {
+	return c.sample(runID, ep, runctl.PhaseStartBaseline), nil
+}
+
+func (c fakeSQLRowsCollector) CaptureFinal(_ context.Context, runID string, ep runctl.Epoch) (runctl.SampleResult, error) {
+	return c.sample(runID, ep, runctl.PhaseFinishFinal), nil
+}
+
+func (c fakeSQLRowsCollector) sample(runID string, ep runctl.Epoch, phase runctl.Phase) runctl.SampleResult {
+	at := time.Now()
+	return runctl.SampleResult{
+		Handle:    runctl.NewBaselineHandle(runID, ep, sqlrows.Name, phase, at, 0),
+		At:        at,
+		Committed: true,
+	}
+}
+
+func (c fakeSQLRowsCollector) Collect(runctl.BaselineHandle, runctl.BaselineHandle) (any, error) {
+	return c.section, nil
+}
+
+func (fakeSQLRowsCollector) Release(runctl.BaselineHandle) {}
+
+// explainableInterval is an interval the capture will act on: a usable target
+// with a SELECT digest and a database clock wide enough to judge a sample by.
+func explainableInterval() *sqlrows.Section {
+	now := time.Now().UTC()
+	return &sqlrows.Section{
+		Validity: runctl.ValidityValid,
+		Limit:    sqlrows.DigestTextFetchLimit,
+		Targets: []sqlrows.TargetSection{{
+			TargetID: "db1", Schema: "isuconp", Usable: true, Shown: 1, Total: 1,
+			Digests: []sqlrows.DigestStat{{
+				Digest: "d1", Query: "SELECT plan_marker FROM posts WHERE id = ?",
+				Kind: sqlrows.KindSelect, Count: 42, TimerWaitPicos: 5_000_000_000,
+			}},
+			DBClock: sqlrows.DBClock{
+				BaselineBefore: now.Add(-90 * time.Second),
+				BaselineAfter:  now.Add(-89 * time.Second),
+				FinalBefore:    now.Add(-2 * time.Second),
+				FinalAfter:     now.Add(-time.Second),
+				Monotonic:      true,
+			},
+		}},
+	}
+}
+
+// TestExplainRunsOnlyInTheEnrichPhase is the regression this feature's whole
+// design rests on.
+//
+// EXPLAIN issues statements against the database the benchmark is hammering.
+// It must therefore happen exactly once per run, in the finishing worker, and
+// never on a dashboard GET — which a bench operator refreshes while the
+// benchmark runs — nor on POST /collect, which is a non-terminal flush with no
+// interval to rank digests by.
+func TestExplainRunsOnlyInTheEnrichPhase(t *testing.T) {
+	restoreCollectorHealth(t, "runctl", sqlrows.Name, queryplan.Name)
+	core := newTestMeasurement(t, map[string]string{
+		queryplan.EnvFlag: "1",
+		// sqlrows' own collector is replaced by the fake below, so the flag
+		// keeps the real one from claiming the name first.
+		sqlrows.EnvFlag: "off",
+	})
+	if core.explain == nil {
+		t.Fatal("ISUTOOLS_EXPLAIN=1 installed no capture")
+	}
+	if err := core.ctrl.RegisterBaseline(
+		runctl.Registration{Name: sqlrows.Name},
+		fakeSQLRowsCollector{section: explainableInterval()},
+	); err != nil {
+		t.Fatalf("registering the interval collector: %v", err)
+	}
+
+	var inspects atomic.Int64
+	core.explain.inspect = func(context.Context, string, sqlstats.Purpose, func(context.Context, sqlstats.Querier) error) error {
+		inspects.Add(1)
+		// No credential, which is the honest answer for a process with no
+		// database: the capture records the reason and moves on.
+		return sqlstats.ErrPurposeNotRegistered
+	}
+
+	handler := web.NewHandler(web.Provider{
+		SQL:         agg.NewTable(agg.DefaultMaxKeys),
+		StartRun:    core.startResetRun,
+		FinishRun:   core.finishResetRun,
+		CompleteRun: core.completeResetRun,
+		Sections:    core.latestSections,
+	})
+
+	runID := postReset(t, handler)
+	if runID == "" {
+		t.Fatal("POST /reset opened no run")
+	}
+	// The dashboard, hit the way a bench operator hits it: repeatedly, while
+	// the run is in flight.
+	for i := 0; i < 10; i++ {
+		for _, path := range []string{"/", "/live", "/json", "/snapshot.html"} {
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET %s = %d", path, rec.Code)
+			}
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/collect", nil))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("POST /collect = %d", rec.Code)
+		}
+	}
+	if got := inspects.Load(); got != 0 {
+		t.Fatalf("%d EXPLAIN sessions were opened by GETs and flushes, want none", got)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/finish", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /finish = %d: %s", rec.Code, rec.Body.String())
+	}
+	if _, err := core.ctrl.Await(context.Background(), runID); err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+	if got := inspects.Load(); got != 1 {
+		t.Fatalf("enrich opened %d EXPLAIN sessions, want exactly one per target per run", got)
+	}
+
+	snapshot, err := core.ctrl.SnapshotOf(runID)
+	if err != nil {
+		t.Fatalf("SnapshotOf: %v", err)
+	}
+	section, ok := snapshot.Sections[queryplan.Name].(*queryplan.Section)
+	if !ok || section == nil {
+		t.Fatalf("run snapshot has no query-plan section; it holds %v", sectionNames(snapshot.Sections))
+	}
+	if len(section.Targets) != 1 || section.Targets[0].Code != queryplan.CodePurposeUnregistered {
+		t.Fatalf("section = %+v, want the target skipped for a missing credential", section.Targets)
+	}
+	if len(section.Health) == 0 {
+		t.Error("a skipped target must leave a health note")
+	}
+
+	// The report renders the cached result, and renders it without going near
+	// the database again.
+	for i := 0; i < 5; i++ {
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /json after the run = %d", rec.Code)
+		}
+	}
+	if !strings.Contains(rec.Body.String(), `"queryplan"`) {
+		t.Error("the captured section must reach the report")
+	}
+	if got := inspects.Load(); got != 1 {
+		t.Errorf("rendering the report opened %d more EXPLAIN sessions, want none", got-1)
+	}
+}
+
+// TestExplainEnrichWithoutAnIntervalPublishesNothing keeps the hook silent on
+// a run sqlrows produced nothing for: without the interval there is no digest
+// ranking and no database clock, and re-reading either here would produce a
+// second opinion that could disagree with the numbers next to the plans.
+func TestExplainEnrichWithoutAnIntervalPublishesNothing(t *testing.T) {
+	inspects := 0
+	capture := &explainCapture{
+		getenv:  envMap(map[string]string{}),
+		targets: func() []sqlstats.TargetInfo { return nil },
+		register: func(string, sqlstats.Purpose, string, string) error {
+			t.Error("no credential may be registered without a DSN")
+			return nil
+		},
+		inspect: func(context.Context, string, sqlstats.Purpose, func(context.Context, sqlstats.Querier) error) error {
+			inspects++
+			return nil
+		},
+	}
+	for _, snapshot := range []*runctl.Snapshot{
+		nil,
+		{},
+		{Sections: map[string]any{}},
+		{Sections: map[string]any{sqlrows.Name: "not a section"}},
+		{Sections: map[string]any{sqlrows.Name: (*sqlrows.Section)(nil)}},
+	} {
+		if err := capture.enrich(context.Background(), snapshot); err != nil {
+			t.Errorf("enrich(%+v) = %v, want enrichment never to fail a run", snapshot, err)
+		}
+		if snapshot != nil && snapshot.Sections != nil {
+			if _, published := snapshot.Sections[queryplan.Name]; published {
+				t.Errorf("enrich published a section for %+v", snapshot)
+			}
+		}
+	}
+	if inspects != 0 {
+		t.Errorf("%d EXPLAIN sessions were opened without an interval, want none", inspects)
 	}
 }

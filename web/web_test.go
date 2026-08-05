@@ -23,6 +23,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/netstats"
+	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 )
@@ -236,6 +237,50 @@ func TestResetKeepsPreviousGeneration(t *testing.T) {
 	}
 	if got.Prev == nil || len(got.Prev.SQL) != 2 {
 		t.Errorf("prev generation must be kept after reset: %+v", got.Prev)
+	}
+}
+
+type resetCountingHTTP struct{ resets int }
+
+func (c *resetCountingHTTP) Snapshot() httpstats.Snapshot { return nil }
+func (c *resetCountingHTTP) Reset() httpstats.Snapshot {
+	c.resets++
+	return nil
+}
+
+type resetCountingCounters struct{ resets int }
+
+func (c *resetCountingCounters) Snapshot() []counters.Entry { return nil }
+func (c *resetCountingCounters) Reset()                     { c.resets++ }
+
+func TestCoordinatorManagedResetDoesNotRotateCollectorsTwice(t *testing.T) {
+	httpCollector := &resetCountingHTTP{}
+	counterCollector := &resetCountingCounters{}
+	sqlRotations := 0
+	generation := int64(1)
+	h := NewHandler(Provider{
+		SQL:                  agg.NewTable(agg.DefaultMaxKeys),
+		SQLGeneration:        func() int64 { return generation },
+		RotateSQL:            func() (int64, []agg.Entry) { sqlRotations++; generation++; return generation, nil },
+		HTTP:                 httpCollector,
+		Counters:             counterCollector,
+		RunGenerationManaged: true,
+		StartRun: func(context.Context) (RunStart, error) {
+			generation++ // models the coordinator's BeginBoundary.
+			return RunStart{RunID: "run-managed-reset", StartedAt: time.Now()}, nil
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("reset = %d: %s", rec.Code, rec.Body.String())
+	}
+	if sqlRotations != 0 || httpCollector.resets != 0 || counterCollector.resets != 0 {
+		t.Fatalf("legacy rotations: sql=%d http=%d counters=%d", sqlRotations, httpCollector.resets, counterCollector.resets)
+	}
+	if generation != 2 {
+		t.Fatalf("generation=%d, want exactly one coordinator advance", generation)
 	}
 }
 
@@ -561,6 +606,195 @@ func TestSnapshotIncludesRunSections(t *testing.T) {
 	}
 }
 
+// TestQueryPlanSectionReachesTheSnapshotAndItsHealth covers the additive
+// section end to end: the capture's own output lands under its collector name,
+// and the reasons it recorded for the targets it could not explain reach the
+// reader instead of being dropped with the section that carried them.
+func TestQueryPlanSectionReachesTheSnapshotAndItsHealth(t *testing.T) {
+	sections := fakeRunSections()
+	sections[queryplan.Name] = &queryplan.Section{
+		Top: queryplan.DefaultTop,
+		Targets: []queryplan.TargetSection{
+			{
+				TargetID: "app", Schema: "isuconp", Explained: true,
+				Plans: []queryplan.Plan{{
+					Digest: "d1", Query: "SELECT plan_marker FROM posts WHERE id = ?",
+					Freshness: queryplan.FreshnessFresh, FreshReason: queryplan.FreshInInterval,
+					Rows: []queryplan.PlanRow{{Type: stringPtr("ref"), Key: stringPtr("PRIMARY")}},
+				}},
+			},
+			{
+				TargetID: "db2",
+				Code:     queryplan.CodePurposeUnregistered,
+				Reason:   "EXPLAIN 専用 credential が未登録です",
+			},
+		},
+		Health: []queryplan.HealthNote{{
+			Key: queryplan.CodePurposeUnregistered, Message: "queryplan[db2]: skip (credential 未登録)",
+		}},
+	}
+	h := NewHandler(Provider{
+		SQL:      agg.NewTable(agg.DefaultMaxKeys),
+		Sections: func() map[string]any { return sections },
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var got Snapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.QueryPlan == nil || len(got.QueryPlan.Targets) != 2 {
+		t.Fatalf("queryplan section = %+v, want the capture's own value", got.QueryPlan)
+	}
+	if len(got.QueryPlan.Targets[0].Plans) != 1 {
+		t.Errorf("target plans = %+v, want the captured plan", got.QueryPlan.Targets[0])
+	}
+	if !strings.Contains(rec.Body.String(), `"queryplan"`) {
+		t.Error(`the section must be published under the collector's own key`)
+	}
+	entry, found := healthEntryFor(got.Meta.Health, queryplan.Name)
+	if !found || entry.Status == health.StatusOK {
+		t.Fatalf("queryplan health = %+v (found=%v), want the skip note forwarded", entry, found)
+	}
+	if !strings.Contains(entry.Message, queryplan.CodePurposeUnregistered) {
+		t.Errorf("health message = %q, want the reason ID the capture recorded", entry.Message)
+	}
+	if !got.Meta.Partial {
+		t.Error("a degraded section must mark the snapshot partial")
+	}
+}
+
+// TestQueryPlansReplaceThePlaceholderAdvisorChecks is the other half of the
+// wiring: a captured plan has to be judged, and only a plan the run can vouch
+// for may be.
+func TestQueryPlansReplaceThePlaceholderAdvisorChecks(t *testing.T) {
+	rows := []queryplan.PlanRow{{
+		Table: stringPtr("comments"), Type: stringPtr("ALL"), Rows: int64Ptr(20000),
+		Extra: stringPtr("Using filesort"),
+	}}
+	tests := []struct {
+		name      string
+		freshness queryplan.FreshnessState
+		reason    queryplan.FreshReason
+		want      advisor.Status
+	}{
+		{
+			name: "fresh plan is judged", freshness: queryplan.FreshnessFresh,
+			reason: queryplan.FreshInInterval, want: advisor.StatusWarn,
+		},
+		{
+			name: "stale plan is not", freshness: queryplan.FreshnessStale,
+			reason: queryplan.FreshBeforeInterval, want: advisor.StatusInfo,
+		},
+		{
+			name: "unjudgeable plan is not", freshness: queryplan.FreshnessUnknown,
+			reason: queryplan.FreshClockAnomaly, want: advisor.StatusInfo,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := Snapshot{
+				Advisor: []advisor.Check{
+					{ID: "plan-full-scan", Title: "実行計画: type=ALL の全表走査", Status: advisor.StatusSkip},
+				},
+				QueryPlan: &queryplan.Section{Targets: []queryplan.TargetSection{{
+					TargetID: "app", Explained: true,
+					Plans: []queryplan.Plan{{
+						Digest: "d1", Query: "SELECT plan_marker FROM comments WHERE post_id = ?",
+						Freshness: tt.freshness, FreshReason: tt.reason, Rows: rows,
+					}},
+				}}},
+			}
+			applyQueryPlanAdvice(&snap)
+			check, found := advisorCheck(snap.Advisor, "plan-full-scan")
+			if !found {
+				t.Fatalf("advisor = %+v, want the plan checks", snap.Advisor)
+			}
+			if check.Status != tt.want {
+				t.Errorf("plan-full-scan = %q (%s), want %q", check.Status, check.Detail, tt.want)
+			}
+			if _, ok := advisorCheck(snap.Advisor, "plan-filesort"); !ok {
+				t.Error("every plan check must be present, not only the one that fired")
+			}
+		})
+	}
+}
+
+// TestQueryPlanAdviceIsSkippedWithoutACapture keeps a process with the feature
+// off exactly as it was: the placeholder checks advisor.Collect emitted stand.
+func TestQueryPlanAdviceIsSkippedWithoutACapture(t *testing.T) {
+	snap := Snapshot{Advisor: []advisor.Check{{ID: "plan-full-scan", Status: advisor.StatusSkip}}}
+	applyQueryPlanAdvice(&snap)
+	if len(snap.Advisor) != 1 || snap.Advisor[0].Status != advisor.StatusSkip {
+		t.Errorf("advisor = %+v, want the placeholder checks untouched", snap.Advisor)
+	}
+}
+
+func advisorCheck(checks []advisor.Check, id string) (advisor.Check, bool) {
+	for _, check := range checks {
+		if check.ID == id {
+			return check, true
+		}
+	}
+	return advisor.Check{}, false
+}
+
+// TestQueryPlanAdviceCopiesNullableColumns pins the one thing a shared pointer
+// would break: the snapshot and the advisor must not be able to observe each
+// other's edits, and a NULL column must survive as a NULL.
+func TestQueryPlanAdviceCopiesNullableColumns(t *testing.T) {
+	key := "PRIMARY"
+	section := &queryplan.Section{Targets: []queryplan.TargetSection{{
+		TargetID: "app",
+		Plans: []queryplan.Plan{{
+			Digest: "d1", Freshness: queryplan.FreshnessFresh,
+			Rows: []queryplan.PlanRow{{Key: &key, Rows: int64Ptr(3)}},
+		}},
+	}}}
+	plans := advisorQueryPlans(section)
+	if len(plans) != 1 || len(plans[0].Rows) != 1 {
+		t.Fatalf("plans = %+v, want one row", plans)
+	}
+	row := plans[0].Rows[0]
+	if row.Key == &key {
+		t.Error("the advisor row must not alias the section's column")
+	}
+	if row.Key == nil || *row.Key != key || row.Rows == nil || *row.Rows != 3 {
+		t.Errorf("row = %+v, want the same values", row)
+	}
+	if row.Type != nil || row.Extra != nil {
+		t.Errorf("row = %+v, want NULL columns to stay NULL", row)
+	}
+
+	// A digest with no plan still reaches the advisor, carrying the closed
+	// class that says why: "nothing was judged" and "nothing went wrong" are
+	// different reports.
+	failed := advisorQueryPlans(&queryplan.Section{Targets: []queryplan.TargetSection{{
+		TargetID: "app",
+		Plans: []queryplan.Plan{{
+			Digest: "d2", Freshness: queryplan.FreshnessFresh,
+			Err: &queryplan.PlanError{Class: queryplan.PlanErrPermission, Errno: 1142},
+		}},
+	}}})
+	if len(failed) != 1 || failed[0].ErrClass != string(queryplan.PlanErrPermission) || failed[0].Rows != nil {
+		t.Errorf("failed plan = %+v, want the error class and no rows", failed)
+	}
+}
+
+// TestQueryPlanSectionMessagesTolerateAnAbsentSection keeps the health
+// forwarding from depending on a section that a coordinator never produced.
+func TestQueryPlanSectionMessagesTolerateAnAbsentSection(t *testing.T) {
+	if got := queryPlanSectionMessages(nil); got != nil {
+		t.Errorf("messages = %v, want none for an absent section", got)
+	}
+	if got := queryPlanSectionMessages(&queryplan.Section{}); len(got) != 0 {
+		t.Errorf("messages = %v, want none for a section with no notes", got)
+	}
+}
+
 func TestSnapshotOmitsAbsentRunSections(t *testing.T) {
 	h, _ := newTestHandler(t)
 	rec := httptest.NewRecorder()
@@ -628,9 +862,34 @@ func TestResetReportsTheRunItOpened(t *testing.T) {
 	}
 }
 
-func TestResetSurvivesRunStartFailure(t *testing.T) {
-	// The generations are already rotated by the time the run is opened, so
-	// refusing to answer would claim nothing was measured when it was.
+func TestResetRunsInspectionBeforeOpeningTheMeasuredInterval(t *testing.T) {
+	started := false
+	contaminated := false
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys),
+		DB: func(context.Context) *dbinspect.Schema {
+			if started {
+				contaminated = true
+			}
+			return &dbinspect.Schema{}
+		},
+		StartRun: func(context.Context) (RunStart, error) {
+			started = true
+			return RunStart{RunID: "run-clean", StartedAt: time.Now(), Validity: "valid"}, nil
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if contaminated {
+		t.Fatal("DB inspection ran after StartRun and contaminated the measured interval")
+	}
+}
+
+func TestResetFailsClosedWhenRunStartFails(t *testing.T) {
 	starter := &fakeRunStarter{err: errors.New("another run is active")}
 	registry := health.NewRegistry()
 	h := NewHandler(Provider{
@@ -640,8 +899,8 @@ func TestResetSurvivesRunStartFailure(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
 
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want the reset to succeed anyway", rec.Code)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
 	}
 	if got := rec.Header().Get("X-Isutools-Run-Id"); got != "" {
 		t.Errorf("X-Isutools-Run-Id = %q, want no id when no run was opened", got)
@@ -816,6 +1075,86 @@ func TestFinishEndsTheRunAndSaveCompletesIt(t *testing.T) {
 	}
 }
 
+func TestSaveDirectlyClosesProfilesAndPersistsManifest(t *testing.T) {
+	dir := t.TempDir()
+	starter := &fakeRunStarter{id: "run-profile-save"}
+	terminator := &fakeRunTerminator{id: starter.id}
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		StartRun: starter.start, CompleteRun: terminator.complete,
+		Sections: terminator.sections, RuntimeProfiles: []string{"heap"},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("save body: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, strings.TrimSuffix(saved.File, ".html")+".json"))
+	if err != nil {
+		t.Fatalf("read persisted snapshot: %v", err)
+	}
+	var payload Snapshot
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("decode persisted snapshot: %v", err)
+	}
+	if payload.Meta.Profiles == nil || len(payload.Meta.Profiles.Pairs) != 1 {
+		t.Fatalf("profiles = %+v, want one completed heap pair", payload.Meta.Profiles)
+	}
+}
+
+func TestCompletedRunEnvelopeIsPersistedWithBoundaryEvidence(t *testing.T) {
+	finishedAt := time.Unix(1_700_000_100, 0)
+	run := &RunSnapshot{
+		Info: RunInfo{
+			RunID: "run-evidence", Epoch: 7, Validity: "invalid", Trigger: "reset",
+			StartedAt: time.Unix(1_700_000_000, 0), FinishedAt: finishedAt,
+			GenerationWindow: BoundaryWindow{Min: finishedAt.Add(-time.Millisecond), Max: finishedAt, Spread: time.Millisecond},
+			BoundaryWindow:   BoundaryWindow{Min: finishedAt.Add(-2 * time.Millisecond), Max: finishedAt, Spread: 2 * time.Millisecond},
+			Collectors: []RunCollectorBoundary{{
+				Name: "sqlrows", Kind: "baseline", Phase: "collect", Required: true,
+				At: finishedAt, Code: "collect-failed", Err: "fixture failure", Dropped: true,
+			}},
+		},
+		Sections: map[string]any{},
+	}
+	h := NewHandler(Provider{
+		SQL:         agg.NewTable(agg.DefaultMaxKeys),
+		RunSnapshot: func() *RunSnapshot { return run },
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/json", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var payload jsonPayload
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.Meta.Run == nil || payload.Meta.Run.RunID != run.Info.RunID || payload.Meta.Run.Epoch != 7 {
+		t.Fatalf("run metadata = %+v, want %+v", payload.Meta.Run, run.Info)
+	}
+	if !payload.Meta.Partial {
+		t.Fatal("invalid run was not marked partial")
+	}
+	entry, ok := healthEntryFor(payload.Meta.Health, "sqlrows")
+	if !ok || entry.Status != health.StatusFailed || !strings.Contains(entry.Message, "fixture failure") {
+		t.Fatalf("sqlrows health = %+v found=%v", entry, ok)
+	}
+}
+
 func TestFinishWithoutACoordinatorIsUnavailable(t *testing.T) {
 	h, _ := newTestHandler(t)
 	rec := httptest.NewRecorder()
@@ -828,6 +1167,72 @@ func TestFinishWithoutACoordinatorIsUnavailable(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /finish = %d, want 405", rec.Code)
 	}
+}
+
+func TestAbortEndsRunAndOrphansOpeningProfiles(t *testing.T) {
+	dir := t.TempDir()
+	const runID = "run-abort012345"
+	aborts := 0
+	h := newHandler(Provider{
+		SQL:             agg.NewTable(agg.DefaultMaxKeys),
+		DataDir:         dir,
+		RuntimeProfiles: []string{"heap"},
+		StartRun: func(context.Context) (RunStart, error) {
+			return RunStart{RunID: runID, Epoch: 7, StartedAt: time.Now(), Validity: "valid"}, nil
+		},
+		AbortRun: func(context.Context) (RunAbort, error) {
+			aborts++
+			return RunAbort{RunID: runID, Epoch: 7, Reason: "explicit", AbortedAt: time.Now()}, nil
+		},
+	})
+	routes := h.routes()
+
+	rec := httptest.NewRecorder()
+	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("reset = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	routes.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/abort", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("abort = %d: %s", rec.Code, rec.Body.String())
+	}
+	if aborts != 1 || rec.Header().Get(runIDHeader) != runID {
+		t.Fatalf("aborts=%d header=%q", aborts, rec.Header().Get(runIDHeader))
+	}
+	if !h.runEnded.Load() {
+		t.Fatal("aborted run must close the collect window")
+	}
+	manifest := h.profileManifest(runID)
+	if manifest == nil || len(manifest.Pairs) != 0 {
+		t.Fatalf("manifest = %+v, want an orphan without a pair", manifest)
+	}
+	foundAbort := false
+	for _, capture := range manifest.Captures {
+		if capture.Point == ProfilePointClose && capture.Code == profileCodeAborted && capture.Orphan {
+			foundAbort = true
+		}
+	}
+	if !foundAbort {
+		t.Fatalf("captures = %+v, want explicit aborted close record", manifest.Captures)
+	}
+}
+
+func TestAbortContract(t *testing.T) {
+	t.Run("POST only", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		NewHandler(Provider{}).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/abort", nil))
+		if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
+			t.Fatalf("status=%d allow=%q", rec.Code, rec.Header().Get("Allow"))
+		}
+	})
+	t.Run("coordinator required", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		NewHandler(Provider{}).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/abort", nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503", rec.Code)
+		}
+	})
 }
 
 func TestFinishReportsAConflictWhenThereIsNoRun(t *testing.T) {
@@ -908,8 +1313,8 @@ func TestRunIntervalSectionsOverlayTheLiveCollectors(t *testing.T) {
 		t.Errorf("counters = %+v, want the frozen generation", snap.Counters)
 	}
 
-	// An empty run must never erase what the live collectors still hold: a run
-	// that measured nothing is not evidence that nothing was measured.
+	// A present frozen section is authoritative even when it is empty. Keeping
+	// live values here would attribute post-boundary traffic to the closed run.
 	live := Snapshot{
 		SQL:      []agg.Entry{{Key: "SELECT 1", Count: 1}},
 		HTTP:     httpstats.Snapshot{{Path: "/live", Count: 1}},
@@ -921,8 +1326,8 @@ func TestRunIntervalSectionsOverlayTheLiveCollectors(t *testing.T) {
 		accesslog.SectionName:   accesslog.Snapshot{},
 		counters.SectionName:    counters.Frozen{},
 	})
-	if len(live.SQL) != 1 || len(live.HTTP) != 1 || len(live.Counters) != 1 || live.AccessLog != nil {
-		t.Errorf("empty run overwrote live data: %+v", live)
+	if len(live.SQL) != 0 || len(live.HTTP) != 0 || len(live.Counters) != 0 || live.AccessLog == nil || live.Connections == nil {
+		t.Errorf("empty frozen run did not replace live data: %+v", live)
 	}
 
 	// An access log that read nothing and said why still has to reach the
@@ -1040,6 +1445,131 @@ func TestResetCapturesBoundaryProfiles(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/files/"+name, nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("profile download status = %d", rec.Code)
+	}
+}
+
+// TestFinishCapturesTheClosingHalfAndSaveRecordsThePair drives plan 07's
+// close point through the endpoint that owns it.
+//
+// POST /finish is where the closing capture belongs, because FinishRun returns
+// the accepted boundary without waiting for the drain, the collect or the
+// snapshot build. The save that follows must not take a second one — it would
+// be taken after all of that — and it is what publishes the pair into the
+// persisted report, since that is the first moment both halves exist.
+func TestFinishCapturesTheClosingHalfAndSaveRecordsThePair(t *testing.T) {
+	dir := t.TempDir()
+	starter := &fakeRunStarter{id: "run-close012345"}
+	terminator := &fakeRunTerminator{id: starter.id}
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		StartRun: starter.start, FinishRun: terminator.finish,
+		CompleteRun: terminator.complete, Sections: terminator.sections,
+		RuntimeProfiles: []string{"heap"},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d", rec.Code)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "*_heap_close.pprof")); len(matches) != 0 {
+		t.Fatalf("closing artifacts = %v, want none before the run is finished", matches)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/finish", nil))
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("finish status = %d: %s", rec.Code, rec.Body.String())
+	}
+	closing, _ := filepath.Glob(filepath.Join(dir, "*_heap_close.pprof"))
+	if len(closing) != 1 {
+		t.Fatalf("closing artifacts = %v, want exactly one written by /finish", closing)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if again, _ := filepath.Glob(filepath.Join(dir, "*_heap_close.pprof")); len(again) != 1 {
+		t.Errorf("closing artifacts = %v, want the save to reuse the one /finish took", again)
+	}
+
+	var saved struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("save body %q: %v", rec.Body.String(), err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, strings.TrimSuffix(saved.File, ".html")+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload Snapshot
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("saved json: %v", err)
+	}
+	manifest := payload.Meta.Profiles
+	if manifest == nil || len(manifest.Pairs) != 1 {
+		t.Fatalf("manifest = %+v, want the run's differenceable pair", manifest)
+	}
+	pair := manifest.Pairs[0]
+	if pair.Kind != "heap" || pair.OpenFile == "" || pair.CloseFile != filepath.Base(closing[0]) {
+		t.Errorf("pair = %+v, want the two halves that were written", pair)
+	}
+	// The residual is what makes the pair readable as an approximation rather
+	// than as the run itself, so it has to survive into the saved report.
+	if pair.ApproxErrorNs != pair.HeadLossNs+pair.TailExcessNs {
+		t.Errorf("pair residual = %+v, want head + tail", pair)
+	}
+	if !strings.Contains(pair.DiffCommand, "-diff_base") {
+		t.Errorf("diff command = %q", pair.DiffCommand)
+	}
+	// The Runs detail view is the saved HTML; the pair has to be visible there
+	// with its approximation notice.
+	page, err := os.ReadFile(filepath.Join(dir, saved.File))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"<h2>Profiles", "run 冒頭の", "finish freeze 後の"} {
+		if !strings.Contains(string(page), want) {
+			t.Errorf("saved run page is missing %q", want)
+		}
+	}
+}
+
+// TestSaveWithoutProfilesCarriesNoManifest keeps the default configuration
+// byte-identical: nothing captured, nothing claimed.
+func TestSaveWithoutProfilesCarriesNoManifest(t *testing.T) {
+	dir := t.TempDir()
+	starter := &fakeRunStarter{id: "run-noprof0123"}
+	terminator := &fakeRunTerminator{id: starter.id}
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		StartRun: starter.start, FinishRun: terminator.finish,
+		CompleteRun: terminator.complete, Sections: terminator.sections,
+	})
+	for _, path := range []string{"/reset", "/finish", "/save"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, nil))
+		if rec.Code >= http.StatusBadRequest {
+			t.Fatalf("POST %s = %d: %s", path, rec.Code, rec.Body.String())
+		}
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "*.pprof")); len(matches) > 0 {
+		t.Fatalf("profiles = %v, want none by default", matches)
+	}
+	for _, name := range []string{"*.json"} {
+		files, _ := filepath.Glob(filepath.Join(dir, name))
+		for _, file := range files {
+			body, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(body), `"profiles"`) {
+				t.Errorf("%s carries a profile manifest with profiling off", file)
+			}
+		}
 	}
 }
 
@@ -1174,6 +1704,18 @@ func TestMetaTimeIsJST(t *testing.T) {
 	}
 	if !strings.HasSuffix(got.Meta.Time, "+09:00") {
 		t.Errorf("meta.time = %q, must always be JST (+09:00)", got.Meta.Time)
+	}
+}
+
+func TestSnapshotCarriesBuildProvenanceVerdict(t *testing.T) {
+	snap := newHandler(Provider{}).take()
+	if snap.Meta.BuildSource == "" {
+		t.Fatal("build source must distinguish unknown from an omitted field")
+	}
+	wantValid := snap.Meta.BuildSource != "unknown" && snap.Meta.Revision != "unknown" && !snap.Meta.Dirty
+	if snap.Meta.ProvenanceValid != wantValid {
+		t.Fatalf("provenance valid=%v for source=%q revision=%q dirty=%v",
+			snap.Meta.ProvenanceValid, snap.Meta.BuildSource, snap.Meta.Revision, snap.Meta.Dirty)
 	}
 }
 

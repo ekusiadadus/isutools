@@ -469,7 +469,15 @@ func (c *Controller) SnapshotOf(runID string) (*Snapshot, error) {
 	if s.snapshot == nil {
 		return nil, ErrRunActive
 	}
-	return s.snapshot, nil
+	clone := *s.snapshot
+	clone.Collectors = cloneBoundaries(s.snapshot.Collectors)
+	if s.snapshot.Sections != nil {
+		clone.Sections = make(map[string]any, len(s.snapshot.Sections))
+		for name, section := range s.snapshot.Sections {
+			clone.Sections[name] = section
+		}
+	}
+	return &clone, nil
 }
 
 // Await blocks until the run reaches a state that answers the caller's

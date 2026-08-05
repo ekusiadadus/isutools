@@ -679,8 +679,11 @@ func TestBoundariesUnderConcurrentTraffic(t *testing.T) {
 	const workers = 4
 	c := New()
 	var served atomic.Int64
+	var flowing sync.Once
+	traffic := make(chan struct{})
 	h := c.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		served.Add(1)
+		flowing.Do(func() { close(traffic) })
 		w.WriteHeader(http.StatusOK)
 	}))
 	stop := make(chan struct{})
@@ -698,6 +701,10 @@ func TestBoundariesUnderConcurrentTraffic(t *testing.T) {
 			}
 		}()
 	}
+	// The boundaries must run against traffic, not against goroutines the
+	// scheduler has not started yet: on a single P the loop below can otherwise
+	// finish before any worker's first request.
+	<-traffic
 
 	drainAndCount := func(res runctl.BoundaryResult) int64 {
 		t.Helper()

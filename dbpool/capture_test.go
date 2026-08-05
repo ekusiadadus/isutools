@@ -118,6 +118,15 @@ func TestCaptureCommitted(t *testing.T) {
 	}
 }
 
+func TestEmptyWatchSetExplainsMissingSection(t *testing.T) {
+	c, _ := newTestCollector()
+	mustCapture(t, c.CaptureBaseline, "run-empty", 1)
+
+	if notes := c.Notes(); !hasNote(notes, HealthNotRegistered) {
+		t.Fatalf("notes = %v, want %s", notes, HealthNotRegistered)
+	}
+}
+
 // TestCollectPerformsNoSampling is the purity conformance test: the report is
 // derived from the two frozen handles, so the pool must not be read again
 // while Collect runs. A snapshot is built after the run has closed, and a

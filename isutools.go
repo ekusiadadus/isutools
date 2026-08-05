@@ -47,6 +47,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/runctl"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
+	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 	"github.com/ekusiadadus/isutools/web"
@@ -76,6 +77,12 @@ const (
 	envDBPool   = "ISUTOOLS_DBPOOL"
 )
 
+// envDataDir names the directory snapshots and profile artifacts are published
+// into. Both the transport and the ResetNow capture path read it, and they have
+// to read the same one: the two halves of a profile pair are matched by the
+// directory they were written to.
+const envDataDir = "ISUTOOLS_DATA_DIR"
+
 // Runtime profile configuration. All three default to off: the default
 // configuration must add zero overhead, and a profile rate is a process-wide
 // runtime setting that this package refuses to turn on behind the operator's
@@ -86,11 +93,28 @@ const (
 	envHeapProfile   = "ISUTOOLS_HEAP_PROFILE"
 )
 
+// EXPLAIN capture configuration. The master flag itself lives in the
+// queryplan package (queryplan.EnvFlag, default off); the two variables below
+// are the single-target convenience path for the credential it runs on.
+const (
+	envExplainDSN    = "ISUTOOLS_EXPLAIN_DSN"
+	envExplainDriver = "ISUTOOLS_EXPLAIN_DRIVER"
+	// defaultExplainDriver is what ISUTOOLS_EXPLAIN_DSN is opened with when
+	// ISUTOOLS_EXPLAIN_DRIVER says nothing.
+	defaultExplainDriver = "mysql"
+)
+
 // Health keys this file owns.
 const (
 	// healthProfiles records the resolved runtime profile configuration so a
 	// snapshot proves which rates were in effect while it was measured.
 	healthProfiles = "profile"
+	// healthExplainCredential records how the ISUTOOLS_EXPLAIN_DSN shortcut
+	// resolved. It is a separate key from the capture's own notes, which reach
+	// health under the collector name "queryplan": a credential that was never
+	// registered and a target that was skipped are different problems with
+	// different fixes.
+	healthExplainCredential = "queryplan-credential"
 	// healthInitializeUnserialized reports an initialize-triggered reset taken
 	// outside SerializeInitialize. Such a run can still succeed, but a
 	// concurrent rebuild may have polluted it, and a silently trusted
@@ -150,11 +174,30 @@ type measurement struct {
 	// profiles lists the runtime profiles to capture at a run boundary, in
 	// capture order. Empty means profiling is off, which is the default.
 	profiles []string
+	// explain is the query-plan capture wired into the Controller's enrich
+	// phase, or nil when ISUTOOLS_EXPLAIN is off. It is kept here so the
+	// wiring can be inspected without reaching into the Controller.
+	explain *explainCapture
+	// boundary captures the opening half of a run's profile pair for runs this
+	// package opens itself. POST /reset has its own capture inside the
+	// transport; ResetNow is the other documented way a run begins, and without
+	// this it would publish no opening artifact for the closing capture to be
+	// differenced against. Nil when no profile is configured.
+	boundary *web.BoundaryProfiler
+	// generation names the collector generation a boundary artifact is filed
+	// under. It is the number the transport reports as Provider.SQLGeneration,
+	// so an artifact opened by ResetNow is named exactly as one opened by POST
+	// /reset would have been.
+	generation func() int64
 
 	// accessLogOnce guards the late registration of the access log's
 	// generation collector, which cannot happen at construction time because
 	// the log collector is built by Handler.
 	accessLogOnce sync.Once
+	// generationManaged records which legacy dashboard collectors were
+	// successfully registered with the run coordinator. POST /reset uses it to
+	// avoid rotating the same generation a second time.
+	generationManaged generationRegistration
 
 	mu sync.Mutex
 	// lastRunID names the newest run this process opened. It is how the
@@ -165,6 +208,11 @@ type measurement struct {
 	// health registry, so a dashboard refreshing every second does not rewrite
 	// the same immutable notes on every render.
 	healthRunID string
+	// healthForwarded names the collectors whose registry status was last
+	// written by a run forward. Only those may be cleared when the next run is
+	// forwarded: a status set outside a run — a failed driver registration, for
+	// one — describes the process, not the run, and survives every run.
+	healthForwarded map[string]struct{}
 }
 
 // defaultMeasurement returns the process-wide core, building it once.
@@ -217,6 +265,17 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 	if opts.Health == nil {
 		opts.Health = collectorHealth
 	}
+	// The enrich hook has to be decided before the Controller exists, because
+	// a Controller's hook is fixed at construction. Preserve an Enrich supplied
+	// by the caller and compose query-plan capture after it; enabling EXPLAIN
+	// must not silently disable another snapshot enrichment.
+	var explain *explainCapture
+	if getenv("ISUTOOLS") != "off" {
+		explain = newExplainCapture(getenv, collectorHealth)
+		if explain != nil {
+			opts.Enrich = composeEnrich(opts.Enrich, explain.enrich)
+		}
+	}
 	ctrl, err := runctl.New(opts)
 	if err != nil {
 		// The default budget table is a compile-time constant set, so this is
@@ -227,14 +286,49 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 	}
 	// The process collector is built even when measurement is off, because
 	// Handler() has always served a report regardless of ISUTOOLS=off.
-	m := &measurement{ctrl: ctrl, proc: newProcCollector()}
+	m := &measurement{
+		ctrl:       ctrl,
+		proc:       newProcCollector(),
+		explain:    explain,
+		generation: sqlstats.Default.CurrentGeneration,
+	}
 	if getenv("ISUTOOLS") == "off" {
 		return m
 	}
 	registerCollectors(ctrl, getenv)
-	registerGenerationCollectors(ctrl, gens)
+	m.generationManaged = registerGenerationCollectorsStatus(ctrl, gens)
 	m.profiles = resolveProfileSettings(getenv).apply(collectorHealth)
+	// The capturer is built from the environment rather than from Handler(), so
+	// an application that opens its runs through ResetNow still publishes the
+	// opening half of every pair when the admin server is disabled.
+	m.boundary = web.NewBoundaryProfiler(web.Provider{
+		DataDir:         getenv(envDataDir),
+		RuntimeProfiles: m.profiles,
+		// The same registry the effective profile rates were recorded in, and
+		// the one Handler() hands the transport: a capture verdict has to reach
+		// the operator through one health section, not two.
+		Health: collectorHealth,
+	})
 	return m
+}
+
+// composeEnrich combines independent snapshot enrichments. Both run even if
+// the first fails so one optional feature cannot suppress another; errors.Join
+// preserves every failure for the coordinator's validity and health verdict.
+func composeEnrich(
+	first, second func(context.Context, *runctl.Snapshot) error,
+) func(context.Context, *runctl.Snapshot) error {
+	if first == nil {
+		return second
+	}
+	if second == nil {
+		return first
+	}
+	return func(ctx context.Context, snapshot *runctl.Snapshot) error {
+		firstErr := first(ctx, snapshot)
+		secondErr := second(ctx, snapshot)
+		return errors.Join(firstErr, secondErr)
+	}
 }
 
 // newProcCollector returns the process collector, or nil on a host without
@@ -324,10 +418,19 @@ func registerCollectors(ctrl *runctl.Controller, getenv func(string) string) []s
 // rather than invalidating it, because the sections that did succeed are still
 // real measurements and throwing them away would help nobody.
 func registerGenerationCollectors(ctrl *runctl.Controller, gens generationCollectors) []string {
+	return registerGenerationCollectorsStatus(ctrl, gens).names
+}
+
+type generationRegistration struct {
+	names              []string
+	http, sql, counter bool
+}
+
+func registerGenerationCollectorsStatus(ctrl *runctl.Controller, gens generationCollectors) generationRegistration {
 	var registered []string
-	add := func(fallback string, coll runctl.GenerationCollector) {
+	add := func(fallback string, coll runctl.GenerationCollector) bool {
 		if coll == nil {
-			return
+			return false
 		}
 		name, err := safeCollectorName(fallback, coll.Name)
 		if err == nil {
@@ -339,17 +442,20 @@ func registerGenerationCollectors(ctrl *runctl.Controller, gens generationCollec
 			// same key, such as a failed SQL driver registration under "sql".
 			collectorHealth.Set(name, health.StatusFailed, err.Error())
 			log.Printf("isutools: %s generation collector not registered: %v", name, err)
-			return
+			return false
 		}
 		registered = append(registered, name)
+		return true
 	}
 	// The fallback is the name the wiring expects this slot to carry. It names
 	// the health key when the collector cannot report a name of its own,
 	// because a failure recorded under no key at all is a failure nobody sees.
-	add(httpstats.CollectorName, gens.http)
-	add(sqlstats.SectionName, gens.sql)
-	add(counters.SectionName, gens.counters)
-	return registered
+	status := generationRegistration{}
+	status.http = add(httpstats.CollectorName, gens.http)
+	status.sql = add(sqlstats.SectionName, gens.sql)
+	status.counter = add(counters.SectionName, gens.counters)
+	status.names = registered
+	return status
 }
 
 // watchAccessLogGeneration registers the access log's generation collector and
@@ -566,6 +672,154 @@ func rateText(on bool, value int) string {
 	return strconv.Itoa(value)
 }
 
+// explainCapture is the query-plan capture wired into the run coordinator's
+// enrich phase.
+//
+// The phase is the whole point. EXPLAIN issues statements against the measured
+// database, so it runs exactly once per run — in the finishing worker, after
+// the interval has been collected and before the snapshot is published, inside
+// runctl.EnrichBudget. It is deliberately not reachable from a dashboard GET,
+// which would put an EXPLAIN on the database every time somebody opened the
+// report, nor from POST /collect, which is a non-terminal flush with no
+// interval to rank digests by.
+type explainCapture struct {
+	getenv func(string) string
+	// inspect overrides the registry entry point queryplan reaches targets
+	// through. Nil means sqlstats.Inspect, which is what production uses; a
+	// test supplies its own so a capture can be observed without a database.
+	inspect queryplan.InspectFunc
+	health  *health.Registry
+	// targets and register reach the DB target registry. They are fields
+	// rather than direct calls so the credential path can be exercised
+	// without registering a process-wide target that every other test in the
+	// binary would then see.
+	targets  func() []sqlstats.TargetInfo
+	register func(targetID string, purpose sqlstats.Purpose, driverName, dsn string) error
+}
+
+// newExplainCapture returns the enrich hook, or nil when EXPLAIN capture is
+// off — which is the default, because the feature adds statements to the
+// database being measured.
+func newExplainCapture(getenv func(string) string, reg *health.Registry) *explainCapture {
+	if !explainEnabled(getenv) {
+		return nil
+	}
+	return &explainCapture{
+		getenv:   getenv,
+		health:   reg,
+		targets:  sqlstats.Targets,
+		register: sqlstats.RegisterDBInspector,
+	}
+}
+
+// explainEnabled reports whether ISUTOOLS_EXPLAIN turns the feature on.
+//
+// It mirrors queryplan.Enabled, which reads the process environment directly,
+// so that the wiring can be driven from an injected environment like every
+// other flag here. TestExplainEnabledAgreesWithQueryplan pins the two to the
+// same vocabulary.
+func explainEnabled(getenv func(string) string) bool {
+	switch strings.ToLower(strings.TrimSpace(getenv(queryplan.EnvFlag))) {
+	case "1", "on", "true", "yes", "enabled":
+		return true
+	default:
+		return false
+	}
+}
+
+// enrich captures the run's query plans and attaches them to its snapshot.
+//
+// It never fails a run. A returned error would degrade the run's verdict, and
+// EXPLAIN is an optional extra: a target that could not be explained comes
+// back as a reason ID inside the section, which reaches the operator through
+// health without claiming the interval itself is worth less.
+func (e *explainCapture) enrich(ctx context.Context, snapshot *runctl.Snapshot) error {
+	if snapshot == nil || snapshot.Sections == nil {
+		return nil
+	}
+	rows, ok := snapshot.Sections[sqlrows.Name].(*sqlrows.Section)
+	if !ok || rows == nil {
+		// Without the interval there is nothing to rank digests by, and no
+		// database clock to judge a sample's freshness against. Reading either
+		// back here would produce a second opinion that could disagree with
+		// the numbers shown next to the plans.
+		return nil
+	}
+	e.registerCredential()
+	section, err := queryplan.Capture(ctx, queryplan.Input{Rows: rows, Inspect: e.inspect})
+	if err != nil || section == nil {
+		return nil
+	}
+	snapshot.Sections[queryplan.Name] = section
+	return nil
+}
+
+// registerCredential applies the ISUTOOLS_EXPLAIN_DSN shortcut.
+//
+// It is the convenience path for the common single-database setup only. With
+// two targets registered there is no way to tell which database the DSN
+// belongs to, and guessing would point a credential at the wrong server, so
+// the variable is refused and the operator is told to call
+// RegisterDBInspector(id, PurposeExplain, ...) per target instead.
+//
+// It runs here rather than at startup because a target only exists once it has
+// been declared or observed, which for an application that never calls
+// RegisterDBTarget is the first query it makes. Re-registering is harmless:
+// the registry answers a repeat with ErrDuplicatePurpose, which is the
+// steady state after the first run.
+func (e *explainCapture) registerCredential() {
+	dsn := strings.TrimSpace(e.getenv(envExplainDSN))
+	if dsn == "" {
+		return
+	}
+	targets := e.targets()
+	if len(targets) != 1 {
+		e.note(health.StatusDegraded, fmt.Sprintf(
+			"%s は登録済み target がちょうど 1 つのときだけ有効です(現在 %d 個)。"+
+				"target ごとに RegisterDBInspector(id, PurposeExplain, ...) を呼んでください",
+			envExplainDSN, len(targets)))
+		return
+	}
+	driverName := strings.TrimSpace(e.getenv(envExplainDriver))
+	if driverName == "" {
+		driverName = defaultExplainDriver
+	}
+	err := e.register(targets[0].ID, sqlstats.PurposeExplain, driverName, dsn)
+	if err != nil && !errors.Is(err, sqlstats.ErrDuplicatePurpose) {
+		e.note(health.StatusDegraded, fmt.Sprintf("%s を target %q に登録できませんでした: %s",
+			envExplainDSN, targets[0].ID, explainRegisterReason(err)))
+		return
+	}
+	e.note(health.StatusOK, fmt.Sprintf("%s を target %q の EXPLAIN 用 credential として登録しました",
+		envExplainDSN, targets[0].ID))
+}
+
+// explainRegisterReason renders a registration failure from a fixed table.
+//
+// The driver's own error is never forwarded. A DSN carries a password, drivers
+// routinely echo the DSN they were handed, and this string is published in a
+// snapshot's health section.
+func explainRegisterReason(err error) string {
+	switch {
+	case errors.Is(err, sqlstats.ErrUnknownDriver):
+		return envExplainDriver + " が database/sql に登録されていないドライバ名です"
+	case errors.Is(err, sqlstats.ErrUnparsedDSN):
+		return "DSN を解釈できませんでした(接続衛生を適用できないため登録しません)"
+	case errors.Is(err, sqlstats.ErrUnknownTarget):
+		return "target が登録されていません"
+	default:
+		return "登録に失敗しました"
+	}
+}
+
+// note records the credential verdict under this feature's own health key.
+func (e *explainCapture) note(status health.Status, message string) {
+	if e.health == nil {
+		return
+	}
+	e.health.Set(healthExplainCredential, status, message)
+}
+
 // ResetNow opens a new measurement run immediately, preempting one already in
 // flight so that the last initialize deterministically wins.
 //
@@ -616,7 +870,37 @@ func ResetNowOpts(ctx context.Context, o runctl.StartRunOptions) (StartResult, e
 	if Off() {
 		return StartResult{}, nil
 	}
-	return defaultMeasurement().startRun(ctx, o)
+	return defaultMeasurement().resetNow(ctx, o)
+}
+
+// resetNow opens the run and captures the opening half of its profile pair.
+//
+// The capture belongs to this path and not to startRun, which POST /reset also
+// goes through: the transport takes its own opening capture immediately before
+// the 204, under the generation it just rotated, and a capture taken earlier in
+// the shared path would claim the point first and file both halves of the pair
+// under a generation the transport never used.
+func (m *measurement) resetNow(ctx context.Context, o runctl.StartRunOptions) (StartResult, error) {
+	result, err := m.startRun(ctx, o)
+	if err != nil {
+		return result, err
+	}
+	m.captureOpenProfiles(result)
+	return result, nil
+}
+
+// captureOpenProfiles writes the opening half of the pair for a run this
+// package opened itself.
+//
+// It runs synchronously, before ResetNow returns and therefore before the
+// initialize response releases the benchmarker: a capture taken after that
+// would already contain the load it is supposed to precede. Nothing it does can
+// fail the run — a lost profile must never cost a measurement.
+func (m *measurement) captureOpenProfiles(result runctl.StartResult) {
+	if result.RunID == "" {
+		return
+	}
+	m.boundary.CaptureOpen(webRunStart(result), m.generation())
 }
 
 // startRun is the shared body of the ResetNow family.
@@ -647,6 +931,16 @@ func (m *measurement) currentRunID() string {
 // is still in flight, which is the normal case for a report rendered during
 // the benchmark.
 func (m *measurement) latestSections() map[string]any {
+	run := m.latestRunSnapshot()
+	if run == nil {
+		return nil
+	}
+	return run.Sections
+}
+
+// latestRunSnapshot returns the newest completed run with the lifecycle
+// evidence the web report needs to prove its sections belong to one boundary.
+func (m *measurement) latestRunSnapshot() *web.RunSnapshot {
 	runID := m.currentRunID()
 	if runID == "" {
 		return nil
@@ -656,7 +950,45 @@ func (m *measurement) latestSections() map[string]any {
 		return nil
 	}
 	m.forwardRunHealth(runID, snapshot)
-	return snapshot.Sections
+	return webRunSnapshot(snapshot)
+}
+
+func webRunSnapshot(snapshot *runctl.Snapshot) *web.RunSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	collectors := make([]web.RunCollectorBoundary, 0, len(snapshot.Collectors))
+	for _, boundary := range snapshot.Collectors {
+		collectors = append(collectors, web.RunCollectorBoundary{
+			Name:      boundary.Name,
+			Kind:      boundary.Kind,
+			Required:  boundary.Required,
+			Phase:     string(boundary.Phase),
+			At:        boundary.At,
+			Committed: boundary.Committed,
+			Code:      boundary.Code,
+			Err:       boundary.Err,
+			Dropped:   boundary.Dropped,
+		})
+	}
+	return &web.RunSnapshot{
+		Info: web.RunInfo{
+			RunID:            snapshot.RunID,
+			Epoch:            uint64(snapshot.Epoch),
+			Validity:         string(snapshot.Validity),
+			Trigger:          snapshot.Trigger,
+			Collectors:       collectors,
+			GenerationWindow: webBoundaryWindow(snapshot.GenerationWindow),
+			BoundaryWindow:   webBoundaryWindow(snapshot.BoundaryWindow),
+			StartedAt:        snapshot.StartedAt,
+			FinishedAt:       snapshot.FinishedAt,
+		},
+		Sections: snapshot.Sections,
+	}
+}
+
+func webBoundaryWindow(window runctl.BoundaryWindow) web.BoundaryWindow {
+	return web.BoundaryWindow{Min: window.Min, Max: window.Max, Spread: window.Spread}
 }
 
 // finishAwaitBudget bounds the wait for a finished run's snapshot. It is the
@@ -679,9 +1011,12 @@ func (m *measurement) finishResetRun(ctx context.Context) (web.RunFinish, error)
 		return web.RunFinish{}, fmt.Errorf("isutools: finishing run %s: %w", runID, err)
 	}
 	return web.RunFinish{
-		RunID:      accepted.RunID,
-		Validity:   string(accepted.Validity),
-		AcceptedAt: accepted.AcceptedAt,
+		RunID:            accepted.RunID,
+		Epoch:            uint64(accepted.Epoch),
+		Validity:         string(accepted.Validity),
+		AcceptedAt:       accepted.AcceptedAt,
+		GenerationWindow: webBoundaryWindow(accepted.GenerationWindow),
+		BoundaryWindow:   webBoundaryWindow(accepted.BoundaryWindow),
 	}, nil
 }
 
@@ -719,9 +1054,38 @@ func (m *measurement) completeResetRun(ctx context.Context) (web.RunFinish, erro
 		return web.RunFinish{}, fmt.Errorf("isutools: acknowledging run %s: %w", runID, err)
 	}
 	return web.RunFinish{
-		RunID:      runID,
-		Validity:   string(status.Validity),
-		AcceptedAt: accepted.AcceptedAt,
+		RunID:            runID,
+		Epoch:            uint64(accepted.Epoch),
+		Validity:         string(status.Validity),
+		AcceptedAt:       accepted.AcceptedAt,
+		GenerationWindow: webBoundaryWindow(accepted.GenerationWindow),
+		BoundaryWindow:   webBoundaryWindow(accepted.BoundaryWindow),
+	}, nil
+}
+
+// abortResetRun abandons the newest run without producing a snapshot. It is
+// idempotent: with no current run there is nothing left to abort.
+func (m *measurement) abortResetRun(ctx context.Context) (web.RunAbort, error) {
+	runID := m.currentRunID()
+	if runID == "" {
+		return web.RunAbort{}, nil
+	}
+	result, err := m.ctrl.AbortRun(ctx, runID, runctl.ReasonExplicit)
+	if err != nil {
+		return web.RunAbort{}, fmt.Errorf("isutools: aborting run %s: %w", runID, err)
+	}
+	m.mu.Lock()
+	if m.lastRunID == runID {
+		m.lastRunID = ""
+	}
+	m.mu.Unlock()
+	return web.RunAbort{
+		RunID:     result.RunID,
+		Epoch:     uint64(result.Epoch),
+		Reason:    result.Reason,
+		Detached:  result.Detached,
+		AbortedAt: result.AbortedAt,
+		Partial:   append([]string(nil), result.Partial...),
 	}, nil
 }
 
@@ -743,8 +1107,22 @@ func (m *measurement) forwardRunHealth(runID string, snapshot *runctl.Snapshot) 
 		return
 	}
 	m.healthRunID = runID
+	previous := m.healthForwarded
 	m.mu.Unlock()
 
+	// A collector's status describes the newest immutable run, so a failure the
+	// last run reported must not stay attached to this one. Only statuses a
+	// previous forward wrote are cleared: a status set outside any run — a
+	// driver registration that failed at startup, for one — describes the
+	// process rather than the run, and clearing it would report a database
+	// nothing is measuring as healthy.
+	for name := range previous {
+		collectorHealth.Set(name, health.StatusOK, "")
+	}
+
+	// written collects every collector this forward writes, so the next one
+	// knows exactly what to clear.
+	written := make(map[string]struct{}, len(snapshot.Collectors))
 	for _, boundary := range snapshot.Collectors {
 		if boundary.Code == "" {
 			continue
@@ -753,17 +1131,43 @@ func (m *measurement) forwardRunHealth(runID string, snapshot *runctl.Snapshot) 
 		if boundary.Dropped {
 			status = health.StatusFailed
 		}
+		written[boundary.Name] = struct{}{}
 		collectorHealth.Set(boundary.Name, status, boundaryMessage(boundary))
 	}
 	// The pool collector's notes explain an absent section — "no pool was ever
 	// watched" is the common one — and live on the collector rather than in
 	// the section, because a section that does not exist cannot carry them.
-	if notes := dbpool.Default.Notes(); len(notes) > 0 {
-		collectorHealth.Set(dbpool.Name, health.StatusDegraded, strings.Join(notes, "; "))
+	//
+	// They must not overwrite a boundary this run already failed. The notes are
+	// standing collector state, while the boundary describes the very run being
+	// forwarded, so a drain timeout would otherwise be relabelled "info" by an
+	// unrelated not-registered note and the run would look healthy.
+	if _, boundaryFailed := written[dbpool.Name]; !boundaryFailed {
+		if notes := dbpool.Default.Notes(); len(notes) > 0 {
+			written[dbpool.Name] = struct{}{}
+			collectorHealth.Set(dbpool.Name, dbpoolNotesStatus(notes), strings.Join(notes, "; "))
+		}
 	}
 	for _, entry := range web.SectionHealth(snapshot.Sections) {
+		written[entry.Collector] = struct{}{}
 		collectorHealth.Set(entry.Collector, entry.Status, entry.Message)
 	}
+
+	m.mu.Lock()
+	m.healthForwarded = written
+	m.mu.Unlock()
+}
+
+// dbpoolNotesStatus keeps a missing WatchDBPool integration visible without
+// claiming the measured interval is incomplete. Every other pool note
+// describes a boundary anomaly and therefore degrades the run.
+func dbpoolNotesStatus(notes []string) health.Status {
+	for _, note := range notes {
+		if !strings.HasPrefix(note, dbpool.HealthNotRegistered+":") {
+			return health.StatusDegraded
+		}
+	}
+	return health.StatusInfo
 }
 
 // boundaryMessage renders one boundary failure as a single readable line.
@@ -871,6 +1275,13 @@ func RegisterDBTarget(id, driverName, dsn string) error {
 // EXPLAIN user. The purpose is explicit and never falls back to the
 // application credential, because an implicit downgrade to a credential
 // holding DML rights would defeat the point of a restricted inspector.
+//
+// For PurposeExplain it is the only registration path once a process has more
+// than one target: with two databases registered, ISUTOOLS_EXPLAIN_DSN cannot
+// say which one it belongs to, so it is refused and recorded in health rather
+// than applied to a guess. A single-target process may use that variable (plus
+// ISUTOOLS_EXPLAIN_DRIVER, default "mysql") instead of calling this function.
+// Either way, EXPLAIN capture itself still requires ISUTOOLS_EXPLAIN=1.
 //
 // It is re-exported from sqlstats so an application configures isutools
 // through one package.
@@ -1100,7 +1511,7 @@ func AddCount(name string, delta int64) {
 
 // Handler serves the report UI: GET / (dashboard with snapshot history),
 // GET /snapshot.html (download), GET /json, GET /files/<name>,
-// POST /reset, POST /collect, POST /finish, POST /save. /reset opens a
+// POST /reset, POST /collect, POST /finish, POST /abort, POST /save. /reset opens a
 // measurement run and /finish or /save closes it; /collect stays a
 // non-terminal flush of the buffered access log.
 // Snapshot history persists to ISUTOOLS_DATA_DIR
@@ -1120,10 +1531,13 @@ func Handler() http.Handler {
 			frozen := sqlstats.Default.Rotate()
 			return frozen.Generation, frozen.Entries
 		},
-		Health:        collectorHealth,
-		HTTP:          httpstats.Default,
-		DataDir:       os.Getenv("ISUTOOLS_DATA_DIR"),
-		PprofDuration: pprofDuration(os.Getenv),
+		SQLGenerationManaged:      core.generationManaged.sql,
+		HTTPGenerationManaged:     core.generationManaged.http,
+		CountersGenerationManaged: core.generationManaged.counter,
+		Health:                    collectorHealth,
+		HTTP:                      httpstats.Default,
+		DataDir:                   os.Getenv(envDataDir),
+		PprofDuration:             pprofDuration(os.Getenv),
 		DB: func(ctx context.Context) *dbinspect.Schema {
 			name, dsn, ok := sqlstats.FirstConn()
 			if !ok {
@@ -1142,7 +1556,9 @@ func Handler() http.Handler {
 		StartRun:        core.startResetRun,
 		FinishRun:       core.finishResetRun,
 		CompleteRun:     core.completeResetRun,
+		AbortRun:        core.abortResetRun,
 		Sections:        core.latestSections,
+		RunSnapshot:     core.latestRunSnapshot,
 		RuntimeProfiles: core.profiles,
 	}
 	trafficClientFacing := os.Getenv("ISUTOOLS_HTTP3_EDGE") == ""
@@ -1204,11 +1620,23 @@ func (m *measurement) startResetRun(ctx context.Context) (web.RunStart, error) {
 		return web.RunStart{}, err
 	}
 	m.reapPreviousRun(ctx, previous, result)
+	return webRunStart(result), nil
+}
+
+// webRunStart renders a coordinator boundary as the transport's opening-run
+// record. Both entry points build it through this function, so a run opened by
+// ResetNow carries exactly the identity — id, epoch, boundary windows — that
+// POST /reset would have given it, and its profile artifacts are filed and
+// paired the same way.
+func webRunStart(result runctl.StartResult) web.RunStart {
 	return web.RunStart{
-		RunID:     result.RunID,
-		StartedAt: result.StartedAt,
-		Validity:  string(result.Validity),
-	}, nil
+		RunID:            result.RunID,
+		Epoch:            uint64(result.Epoch),
+		StartedAt:        result.StartedAt,
+		Validity:         string(result.Validity),
+		GenerationWindow: webBoundaryWindow(result.GenerationWindow),
+		BoundaryWindow:   webBoundaryWindow(result.BoundaryWindow),
+	}
 }
 
 // reapPreviousRun makes sure the run the previous reset opened is no longer

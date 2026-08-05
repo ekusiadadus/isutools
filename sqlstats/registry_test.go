@@ -202,7 +202,7 @@ func TestAutoTargetIDFormat(t *testing.T) {
 	}
 	for i := 0; i < len(hash); i++ {
 		c := hash[i]
-		if !(c >= 'a' && c <= 'z' || c >= '2' && c <= '7') {
+		if (c < 'a' || c > 'z') && (c < '2' || c > '7') {
 			t.Fatalf("hash %q has byte %q outside the lowercase base32 alphabet", hash, c)
 		}
 	}
@@ -721,6 +721,151 @@ func TestRegisterDBInspectorErrors(t *testing.T) {
 	}
 	if err := r.registerInspector("db1", PurposeStats, regDriverName, "stats:pw@tcp(db1:3306)/"); !errors.Is(err, ErrDuplicatePurpose) {
 		t.Fatalf("err = %v, want ErrDuplicatePurpose", err)
+	}
+}
+
+func TestRegisterDBInspectorRejectsDifferentEndpoint(t *testing.T) {
+	r := newTestRegistry(t)
+	mustRegister(t, r, "db1", "app:apppw@tcp(db1:3306)/isuconp")
+
+	err := r.registerInspector("db1", PurposeExplain, regDriverName,
+		"explain:pw@tcp(db2:3306)/isuconp")
+	if err == nil {
+		t.Fatal("registerInspector accepted a credential for db2 under target db1")
+	}
+	if strings.Contains(err.Error(), "explain:pw") {
+		t.Fatalf("error leaked inspector credentials: %v", err)
+	}
+}
+
+// TestRegisterDBInspectorRejectsURLFormDSN pins the connection hygiene
+// contract at its only enforcement point. inspectorDSN hands a URL-form DSN
+// back verbatim, so none of the inspector parameters (no default database,
+// multiStatements=false, interpolateParams=false, parseTime, loc=UTC) would
+// apply and the connection would keep the measured schema as its default
+// database. Accepting such a credential silently is the failure mode this
+// test exists to prevent.
+func TestRegisterDBInspectorRejectsURLFormDSN(t *testing.T) {
+	const inspectorDSN = "postgres://inspect:inspectpw@db1:5432/isuconp"
+	for _, purpose := range []Purpose{PurposeStats, PurposeExplain} {
+		t.Run(string(purpose), func(t *testing.T) {
+			r := newTestRegistry(t)
+			// The app credential uses the same endpoint, so the endpoint
+			// check cannot be what rejects this registration.
+			mustRegister(t, r, "db1", "postgres://app:apppw@db1:5432/isuconp")
+
+			err := r.registerInspector("db1", purpose, regDriverName, inspectorDSN)
+			if !errors.Is(err, ErrUnsupportedDSNForm) {
+				t.Fatalf("err = %v, want ErrUnsupportedDSNForm", err)
+			}
+			if strings.Contains(err.Error(), "inspectpw") || strings.Contains(err.Error(), inspectorDSN) {
+				t.Fatalf("error leaked the inspector credential: %v", err)
+			}
+			info, ok := r.target("db1")
+			if !ok {
+				t.Fatal("target db1 is missing")
+			}
+			for _, got := range info.Purposes {
+				if got == purpose {
+					t.Fatalf("purposes = %v, want the rejected %q credential not to be attached", info.Purposes, purpose)
+				}
+			}
+		})
+	}
+}
+
+// TestExplainStaysUnregisteredAfterAURLFormDSNIsRejected checks the refusal
+// fails closed: a rejected explain credential must leave the target with no
+// explain credential at all, not with one that opens a connection.
+func TestExplainStaysUnregisteredAfterAURLFormDSNIsRejected(t *testing.T) {
+	regDriver.reset()
+	r := newTestRegistry(t)
+	mustRegister(t, r, "db1", "postgres://app:apppw@db1:5432/isuconp")
+
+	if err := r.registerInspector("db1", PurposeExplain, regDriverName,
+		"postgres://explain:explainpw@db1:5432/isuconp"); !errors.Is(err, ErrUnsupportedDSNForm) {
+		t.Fatalf("registerInspector = %v, want ErrUnsupportedDSNForm", err)
+	}
+	err := r.inspect(context.Background(), "db1", PurposeExplain, func(context.Context, Querier) error {
+		t.Error("the callback must not run: no explain credential was accepted")
+		return nil
+	})
+	if !errors.Is(err, ErrPurposeNotRegistered) {
+		t.Fatalf("inspect = %v, want ErrPurposeNotRegistered", err)
+	}
+	if dsns, _, _ := regDriver.snapshot(); len(dsns) != 0 {
+		t.Fatalf("no connection may be opened: %v", dsns)
+	}
+}
+
+// TestRegisterDBInspectorAcceptsAndNormalisesTheDriverForm is the other half
+// of the rejection above: the go-sql-driver form is still accepted, and the
+// DSN it is opened with still has the default database removed and the
+// inspector parameters applied.
+func TestRegisterDBInspectorAcceptsAndNormalisesTheDriverForm(t *testing.T) {
+	regDriver.reset()
+	r := newTestRegistry(t)
+	mustRegister(t, r, "db1", "app:apppw@tcp(db1:3306)/isuconp")
+
+	if err := r.registerInspector("db1", PurposeExplain, regDriverName,
+		"explain:explainpw@tcp(db1:3306)/isuconp?multiStatements=true"); err != nil {
+		t.Fatalf("registerInspector: %v", err)
+	}
+	if err := r.inspect(context.Background(), "db1", PurposeExplain, func(context.Context, Querier) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	dsns, _, _ := regDriver.snapshot()
+	if len(dsns) != 1 {
+		t.Fatalf("dsns = %v, want exactly one connection", dsns)
+	}
+	if !strings.HasPrefix(dsns[0], "explain:explainpw@") {
+		t.Fatalf("explain used %q, want the explain credential", dsns[0])
+	}
+	parsed, ok := parseDSN(regDriverName, dsns[0])
+	if !ok {
+		t.Fatalf("rebuilt dsn %q is not parseable", dsns[0])
+	}
+	if parsed.database != "" {
+		t.Fatalf("database = %q, want empty so explain statements are not attributed to the app schema", parsed.database)
+	}
+	for key, want := range inspectorParams {
+		if got := parsed.params[key]; got != want {
+			t.Errorf("param %s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+// TestRegisterDBTargetAcceptsBothDSNForms guards the blast radius of the
+// rejection: the application's own DSN is whatever the application chose, so
+// PurposeApp keeps accepting the URL form.
+func TestRegisterDBTargetAcceptsBothDSNForms(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+		want string
+	}{
+		{name: "url form", dsn: "postgres://app:apppw@db2:5432/isuconp", want: "postgres://db2:5432/isuconp"},
+		{name: "driver form", dsn: "app:apppw@tcp(db1:3306)/isuconp", want: "tcp(db1:3306)/isuconp"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRegistry(t)
+			if err := r.registerTarget("db1", regDriverName, tc.dsn); err != nil {
+				t.Fatalf("registerTarget: %v", err)
+			}
+			info, ok := r.target("db1")
+			if !ok {
+				t.Fatal("target db1 is missing")
+			}
+			if info.Display != tc.want {
+				t.Fatalf("Display = %q, want %q", info.Display, tc.want)
+			}
+			if info.Schema != "isuconp" {
+				t.Fatalf("Schema = %q, want %q", info.Schema, "isuconp")
+			}
+		})
 	}
 }
 
