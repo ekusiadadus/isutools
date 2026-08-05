@@ -46,6 +46,93 @@ the raw driver name, and any missing data is always recorded in
 For per-driver imports, DSNs, and pgxpool constraints, see
 [Integration Guide §2](./docs/INTEGRATION.md#2-db-ドライバへの接続).
 
+## Five-minute preflight
+
+Run these checks first to avoid a benchmark that succeeds while silently
+missing part of the evidence.
+
+### 1. Keep the dashboard on loopback and use SSH forwarding
+
+```bash
+ssh -L 19191:127.0.0.1:19191 isucon@example-host
+```
+
+Open <http://127.0.0.1:19191/> locally. There is no need to expose the admin
+server on `0.0.0.0`. On the application host, also verify
+`curl -fsS http://127.0.0.1:19191/ >/dev/null`.
+
+### 2. Use one reset → benchmark → save boundary
+
+```bash
+curl -fsS -X POST http://127.0.0.1:19191/reset
+# benchmark command
+curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
+```
+
+When integration is inside the initialize handler, call `ResetNow` after the
+database rebuild and before writing the response. Do not stack `/reset` and
+`ResetNow` around the same run.
+
+### 3. Grant all three EXPLAIN permissions directly
+
+The target-schema `SELECT` grant alone is insufficient. Grant these three
+permissions directly to the dedicated user, not through a role (replace
+`isuride` with the target schema):
+
+```sql
+GRANT SELECT ON `isuride`.* TO 'isutools_explain'@'127.0.0.1';
+GRANT SELECT ON `performance_schema`.* TO 'isutools_explain'@'127.0.0.1';
+GRANT UPDATE ON `performance_schema`.`threads` TO 'isutools_explain'@'127.0.0.1';
+SHOW GRANTS FOR 'isutools_explain'@'127.0.0.1';
+```
+
+isutools validates the effective grants after `SET ROLE NONE`. The second
+line is required for permission checks; the third lets the EXPLAIN session
+disable its own instrumentation. Keep the password out of README files and
+shell history; load the DSN from a restricted environment file. See
+[Integration Guide §11](./docs/INTEGRATION.md#11-explain-取得計画09) for the
+safety model and allowlist.
+
+### 4. Give the nginx advisor the effective configuration
+
+The current version follows the entrypoint include graph, so start with the
+actual nginx entrypoint:
+
+```bash
+export ISUTOOLS_NGINX_CONF=/etc/nginx/nginx.conf
+export ISUTOOLS_PROXY_CONF=/etc/nginx/nginx.conf
+export ISUTOOLS_PROXY_KIND=nginx
+```
+
+For older releases or complex include/symlink layouts, freeze `nginx -T` into
+one effective-config file. Regenerate it after every nginx configuration
+change, then restart the application:
+
+```bash
+sudo sh -c 'nginx -T 2>/dev/null > /etc/nginx/isutools-effective.conf'
+sudo chmod 0644 /etc/nginx/isutools-effective.conf
+export ISUTOOLS_NGINX_CONF=/etc/nginx/isutools-effective.conf
+export ISUTOOLS_PROXY_CONF=/etc/nginx/isutools-effective.conf
+```
+
+This compatibility path avoids both failure modes seen in older versions:
+missing included vhosts when only `nginx.conf` is read, and double-counting a
+vhost when a directory contains both `sites-available` and its enabled symlink.
+
+### 5. Check that dynamic IDs aggregate into one route
+
+The current version normalizes numeric, UUID, and ULID path segments. Until an
+older version is upgraded, use an explicit rule when one HTTP row appears per
+ULID:
+
+```bash
+export ISUTOOLS_PATH_RULES='^/api/app/rides/[0-7][0-9A-HJKMNP-TV-Z]{25}/evaluation$=/api/app/rides/*/evaluation;^/api/chair/rides/[0-7][0-9A-HJKMNP-TV-Z]{25}/status$=/api/chair/rides/*/status'
+```
+
+The [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md) preserves
+the artifact evidence and chronological decisions that led from these checks
+to matcher and notification-polling changes after the score-9,511 run.
+
 ## Go API (optional add-ons)
 
 The one-line integration is unchanged. Everything below is **opt-in**: if you
@@ -132,6 +219,10 @@ you can match a run to the benchmark that produced it afterwards.
 - **meta**: time (**always JST**), git rev (+dirty), build source / provenance
   verdict, generation number, score,
   **host info (CPU model / core count / memory GB / OS)**
+- **Bottleneck Overview**: a first-look triage table for HTTP/SQL demand,
+  5xx/499, CPU interval trust and saturation, DB-pool waits, SQL row
+  efficiency, and host I/O. It connects each suspicion to detailed evidence
+  without claiming that one metric proves causality
 - **Collector Health**: per-collector status and missing-data (`partial`) warnings
 - **DB Schema**: tables, row counts, and **index list** as of generation start
   (evidence of "what indexes existed before the run")

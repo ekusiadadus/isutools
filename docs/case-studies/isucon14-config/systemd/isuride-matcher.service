@@ -1,0 +1,15 @@
+[Unit]
+Description=isuride-matcher
+After=isuride-go.service
+
+[Service]
+User=isucon
+Group=isucon
+EnvironmentFile=/home/isucon/env.sh
+ExecStart=/bin/sh -c "while true; do curl -sk -o /dev/null https://isuride.xiv.isucon.net/api/internal/matching; sleep $ISUCON_MATCHING_INTERVAL; done"
+ExecStop=/bin/kill -s TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
