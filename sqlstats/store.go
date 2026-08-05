@@ -1,6 +1,7 @@
 package sqlstats
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -12,7 +13,21 @@ import (
 type Frozen struct {
 	Generation int64
 	Entries    []agg.Entry
+	// CutShort reports that the rotation gave up on its bound with queries still
+	// running in the generation it closed, so Entries may be missing their rows.
+	// Callers publish such a generation as a partial section: a rotation that
+	// truncates silently reports an under-counted SQL table as a whole one.
+	CutShort bool
 }
+
+// RotateDrainBudget bounds how long Rotate waits for the queries pinned to the
+// generation it closes.
+//
+// It is generation.DefaultCompatWait, which is runctl.DrainBudget: a rotation
+// is the drain step of a run boundary expressed through the pre-generation API,
+// and httpstats.ResetDrainBudget names the same authority for the same reason.
+// TestRotateDrainBudgetIsTheSharedDrainBudget fails if they ever diverge.
+const RotateDrainBudget = generation.DefaultCompatWait
 
 // Store owns generation-scoped SQL aggregation tables.
 type Store struct {
@@ -76,9 +91,35 @@ func (s *Store) CurrentGeneration() int64 {
 
 // Rotate publishes a new empty generation and freezes the previous one after
 // all observations that started there have completed.
+//
+// The wait is bounded by RotateDrainBudget, or by whatever SetRotateDrainBudget
+// installed, so a query that never returns delays the rotation instead of
+// parking it. A rotation that gave up returns Frozen.CutShort, which is the
+// caller's cue to publish the generation as partial. Callers holding a request
+// context should use RotateContext.
 func (s *Store) Rotate() Frozen {
-	frozen := s.manager.SwapAndSnapshot()
-	return Frozen{Generation: frozen.Generation, Entries: frozen.Value}
+	return s.RotateContext(context.Background())
+}
+
+// RotateContext is Rotate bounded by the caller's context as well as by the
+// drain budget, whichever ends first. A nil context means the budget alone.
+//
+// It exists because Rotate runs on the /reset path while the handler holds the
+// process-wide reset lock and the operation slot: without the caller's context
+// a rotation waiting out a wedged query head-of-line-blocks every other admin
+// endpoint for the whole budget, long after the request that asked for it is
+// gone.
+func (s *Store) RotateContext(ctx context.Context) Frozen {
+	frozen := s.manager.SwapAndSnapshotContext(ctx)
+	return Frozen{Generation: frozen.Generation, Entries: frozen.Value, CutShort: frozen.CutShort}
+}
+
+// SetRotateDrainBudget bounds the wait performed by Rotate. A non-positive
+// value restores RotateDrainBudget. It exists for callers whose own operation
+// budget is tighter than the run controller's; the default is already bounded,
+// so leaving it alone is safe.
+func (s *Store) SetRotateDrainBudget(budget time.Duration) {
+	s.manager.SetCompatWait(budget)
 }
 
 // Reset starts a new generation and discards the frozen data. Prefer Rotate

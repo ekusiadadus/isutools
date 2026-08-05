@@ -4,13 +4,11 @@
 [![CI](https://github.com/ekusiadadus/isutools/actions/workflows/ci.yml/badge.svg)](https://github.com/ekusiadadus/isutools/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
+[English](./README.en.md) | **日本語**
+
 ISUCON 向けオールインワン計測モジュール。**アプリの変更1行**で SQL / HTTP /
 nginx アクセスログ / プロセス・CPU / DB スキーマ / pprof を計測し、
 **ソート済みダッシュボード**と**自己完結スナップショット**で振り返る。
-
-*All-in-one profiling for ISUCON-style tuning: add SQL / HTTP / access-log /
-process / schema / pprof dashboards with per-benchmark history and diffs.
-Includes a reproducible ABBA overhead gate.*
 
 ベンチ毎の履歴がスコア・git rev 付きで並び、行クリックで当時の全計測が開く:
 

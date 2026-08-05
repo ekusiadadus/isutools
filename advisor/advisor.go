@@ -83,6 +83,7 @@ func Collect(ctx context.Context, opts Options) []Check {
 	checks = append(checks, checkResponseCache(opts)...)
 	checks = append(checks, cacheHealthCheck(opts.Cache, opts.CacheError))
 	checks = append(checks, checkECH(opts)...)
+	checks = append(checks, checkTransport(opts)...)
 	sort.SliceStable(checks, func(i, j int) bool {
 		return statusRank[checks[i].Status] < statusRank[checks[j].Status]
 	})
@@ -224,10 +225,11 @@ func checkOS(opts Options) []Check {
 	if v, err := readUintFile(opts.FS, "proc/sys/net/core/somaxconn"); err != nil {
 		somax.Status = StatusSkip
 	} else {
-		somax.Detail = fmt.Sprintf("somaxconn=%d", v)
+		somax.Detail = fmt.Sprintf("somaxconn=%d(既定値は Linux 5.4 以降 4096、それ以前は 128)", v)
 		if v < 1024 {
 			somax.Status = StatusWarn
-			somax.Recommendation = "net.core.somaxconn=4096 以上(接続要求の取りこぼし防止)"
+			somax.Recommendation = "net.core.somaxconn=4096 以上(書籍の実例は 8192)に。接続要求の取りこぼし防止。" +
+				"nginx の listen backlog は既定 511 のままなので、上げるなら listen ... backlog= も合わせて明示する"
 		} else {
 			somax.Status = StatusOK
 		}
