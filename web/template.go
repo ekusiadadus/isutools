@@ -72,6 +72,13 @@ a { color: #0b57d0; }
 {{range .Profiles}}<li><a href="files/{{.}}">{{.}}</a></li>{{end}}
 </ul>
 {{else}}<p class="empty">no profiles yet (set ISUTOOLS_PPROF_SECONDS; captured automatically after POST /reset). Live profiling: <a href="pprof/">pprof/</a></p>{{end}}
+
+<h2>Trajectories <span class="meta">(post-benchmark agent / job animation)</span></h2>
+{{if .Trajectories}}
+<ul class="files">
+{{range .Trajectories}}<li><a href="files/{{.}}">{{.}}</a></li>{{end}}
+</ul>
+{{else}}<p class="empty">no trajectory viewers yet (generate a trajectory_*.html with isutools-trajectory)</p>{{end}}
 </body>
 </html>
 `))

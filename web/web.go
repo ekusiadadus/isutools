@@ -1034,7 +1034,12 @@ func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) index(w http.ResponseWriter) {
-	data := indexPage{Snapshot: h.take(), Runs: h.listRuns(), Profiles: h.listProfiles()}
+	data := indexPage{
+		Snapshot:     h.take(),
+		Runs:         h.listRuns(),
+		Profiles:     h.listProfiles(),
+		Trajectories: h.listTrajectories(),
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := indexTmpl.Execute(w, data); err != nil {
 		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
@@ -1062,9 +1067,10 @@ type runEntry struct {
 }
 
 type indexPage struct {
-	Snapshot Snapshot
-	Runs     []runEntry
-	Profiles []string
+	Snapshot     Snapshot
+	Runs         []runEntry
+	Profiles     []string
+	Trajectories []string
 }
 
 func (h *handler) listRuns() []runEntry {
@@ -1139,6 +1145,20 @@ func (h *handler) listFiles() []string {
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(names)))
 	return names
+}
+
+// listTrajectories returns portable post-benchmark viewers deliberately named
+// with the trajectory_ prefix. They share /files/ with the other artifacts but
+// are not snapshots and must never enter run history or diff selection.
+func (h *handler) listTrajectories() []string {
+	files := h.listFiles()
+	trajectories := make([]string, 0)
+	for _, name := range files {
+		if strings.HasPrefix(name, "trajectory_") {
+			trajectories = append(trajectories, name)
+		}
+	}
+	return trajectories
 }
 
 func (h *handler) save(w http.ResponseWriter, r *http.Request) {
