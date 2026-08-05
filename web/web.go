@@ -142,6 +142,10 @@ type Provider struct {
 	// InspectionTimeout bounds the context passed to DB and Advisor callbacks.
 	InspectionTimeout time.Duration
 	Proc              processCollector
+	// ProcRunManaged says Proc is registered with the run coordinator. Its
+	// reset and final snapshot then happen inside StartRun/FinishRun for both
+	// the HTTP and embedded ResetNow entry points.
+	ProcRunManaged bool
 	// DB captures the database schema (tables/indexes). Called at handler
 	// startup and on every reset so each generation records the pre-run state.
 	DB func(context.Context) *dbinspect.Schema
@@ -444,6 +448,11 @@ func applyRunIntervalSections(snap *Snapshot, sections map[string]any) {
 				Message: "name limit exceeded; identities merged into (other)", Dropped: frozen.Dropped,
 			})
 		}
+	}
+	if value, ok := sections[procstats.CollectorName].(procstats.Snapshot); ok {
+		section := value
+		snap.Proc = &section
+		applyProcHealth(&snap.Meta, section.Health)
 	}
 	applyOverflowHealth(snap)
 }
@@ -1347,7 +1356,7 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		applyOverflowHealth(&snap)
 		h.rebaselineAccessLog()
 	}
-	if h.p.Proc != nil {
+	if h.p.Proc != nil && !h.p.ProcRunManaged {
 		value := h.p.Proc.Snapshot()
 		snap.Proc = &value
 		applyProcHealth(&snap.Meta, value.Health)

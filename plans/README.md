@@ -18,7 +18,7 @@
 | 08 | 計測開始の自動化 | **出荷済み (v1.2.0)**(残件 1、下記) | `isutools.ResetNow*` / `SerializeInitialize` |
 | 09 | EXPLAIN 自動化 | **出荷済み (v1.2.0)** | `queryplan/` |
 | 10 | **複数台横断計測** | **未実装** | — → [10-multi-host.md](./10-multi-host.md) |
-| 11 | nginx transport 検査 + MTU | **出荷済み (v1.2.0)**(残件 1、下記) | `advisor/transport.go`、`netstats` の MTU 列 |
+| 11 | nginx transport 検査 + MTU | **出荷済み (v1.2.0)** | `advisor/transport.go`、`netstats` の MTU 列 |
 
 削除した 10 件の計画文書(v6・第5回レビュー反映版)は **git 履歴に残っている**。
 設計判断の経緯・撤回した主張・テスト計画・受け入れ条件を読み直す必要が出た場合は、
@@ -38,7 +38,6 @@
 | 出所 | 未実装の項目 | 現状のコード | 影響 |
 |---|---|---|---|
 | 08 §補助(best-effort) | `ISUTOOLS_RESET_ON_INITIALIZE=besteffort`(middleware で initialize 応答を検知して非同期に `ResetNow` を撃つモード)+ `httpstats` observer hook | 同期 API(`SerializeInitialize` + 末尾 `ResetNow`)のみ。guard の外で initialize reset を取った場合は health `initialize-unserialized` が degraded で記録される | 小。計画自身が「besteffort は不変条件 I1 を満たさない暫定手段」と位置づけていた。同期 API が正規経路 |
-| 11 §有効な listen endpoint の判定 | root nginx.conf からの include 木解決(`ISUTOOLS_NGINX_ROOT_CONF` / `ISUTOOLS_NGINX_PREFIX`、未解決 include の health `nginx-conf-include-unresolved`) | `nginx-listen-backlog` は**連結された conf**を解析し、`concatCaveat`(「解析対象: 連結された nginx conf(include 関係は未解決)」)を Detail に必ず付ける | 中。11 v6 が撤回したはずの v5 方式が残っている。include されていない `.conf` を有効設定として数える可能性があり、その旨は出力に明記されている |
 | 01 §allowlist 表示 | registry の target 一覧と `sqlstats.Notes()` を専用セクションとしてダッシュボードに出す | target ID は `SQL 行効率` / `DB Pool` / `Query Plans` の各セクション経由でのみ見える。`Notes()` はどこからも呼ばれていない | 小。registry の登録失敗理由が UI に出ない |
 
 ## 残る計画: 10 複数台横断計測

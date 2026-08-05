@@ -89,6 +89,12 @@ func newContaminationFixture(t *testing.T) *contaminationFixture {
 		copyCfg.DBName = schema
 		copyCfg.ParseTime = true
 		copyCfg.Loc = time.UTC
+		// This test is about schema attribution and collector
+		// self-contamination. Use the text protocol so the assertion does not
+		// also depend on a particular MySQL release's binary prepared-statement
+		// digest implementation; MySQL still normalizes the literal to one
+		// digest.
+		copyCfg.InterpolateParams = true
 		db, err := sql.Open("mysql", copyCfg.FormatDSN())
 		if err != nil {
 			t.Fatalf("open schema %s: %v", schema, err)
@@ -98,14 +104,43 @@ func newContaminationFixture(t *testing.T) *contaminationFixture {
 	primary = openSchema(primarySchema)
 	other = openSchema(otherSchema)
 
-	if _, err := admin.ExecContext(ctx, `UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = 'statements_digest'`); err != nil {
-		t.Fatalf("enable statements_digest: %v", err)
+	const requiredConsumers = 4
+	if _, err := admin.ExecContext(ctx, `UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME IN (`+
+		`'global_instrumentation', 'thread_instrumentation', 'events_statements_current', 'statements_digest')`); err != nil {
+		t.Fatalf("enable statement consumers: %v", err)
 	}
 	if _, err := admin.ExecContext(ctx, `UPDATE performance_schema.setup_instruments SET ENABLED = 'YES', TIMED = 'YES' WHERE NAME LIKE 'statement/%'`); err != nil {
 		t.Fatalf("enable statement instruments: %v", err)
 	}
+	var enabledConsumers int
+	if err := admin.QueryRowContext(ctx, `SELECT COUNT(*) FROM performance_schema.setup_consumers `+
+		`WHERE NAME IN ('global_instrumentation', 'thread_instrumentation', 'events_statements_current', 'statements_digest') `+
+		`AND ENABLED = 'YES'`).Scan(&enabledConsumers); err != nil {
+		t.Fatalf("verify statement consumers: %v", err)
+	}
+	if enabledConsumers != requiredConsumers {
+		t.Fatalf("enabled statement consumers = %d, want %d", enabledConsumers, requiredConsumers)
+	}
 	if _, err := admin.ExecContext(ctx, `TRUNCATE TABLE performance_schema.events_statements_summary_by_digest`); err != nil {
 		t.Fatalf("truncate digest table: %v", err)
+	}
+	// Fail at fixture setup with an actionable message when the service is not
+	// recording schema digests. Otherwise both interval assertions merely say
+	// "got zero", which hides whether the collector or MySQL setup failed.
+	var probeID int64
+	if err := primary.QueryRowContext(ctx, `SELECT id FROM contamination_probe WHERE id = ?`, 1).Scan(&probeID); err != nil {
+		t.Fatalf("digest readiness query: %v", err)
+	}
+	var recorded uint64
+	if err := admin.QueryRowContext(ctx, `SELECT COALESCE(SUM(COUNT_STAR), 0) `+
+		`FROM performance_schema.events_statements_summary_by_digest WHERE SCHEMA_NAME = ?`, primarySchema).Scan(&recorded); err != nil {
+		t.Fatalf("verify digest readiness: %v", err)
+	}
+	if recorded != 1 {
+		t.Fatalf("performance_schema recorded %d statements for readiness query in %s, want 1", recorded, primarySchema)
+	}
+	if _, err := admin.ExecContext(ctx, `TRUNCATE TABLE performance_schema.events_statements_summary_by_digest`); err != nil {
+		t.Fatalf("clear digest readiness query: %v", err)
 	}
 
 	targetID := "integration-" + suffix

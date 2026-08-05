@@ -81,6 +81,26 @@ func TestParseNginxLTSVDashAndInvalidUpstream(t *testing.T) {
 	}
 }
 
+func TestParseNginxLTSVEmptyUpstreamForStaticResponse(t *testing.T) {
+	line := strings.Replace(lineC, "upstime:0.080", "upstime:", 1)
+	rec, err := ParseNginxLTSV(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("empty nginx $upstream_response_time must be a valid static response: %v", err)
+	}
+	if !rec.UpstreamValid || rec.UpstreamComplete || !rec.NoUpstreamTiming || rec.UpstreamAttempts != 0 {
+		t.Fatalf("empty upstream timing = %#v", rec)
+	}
+	if rec.Partial || rec.Issue != "" {
+		t.Fatalf("a static response must not degrade access-log health: %#v", rec)
+	}
+
+	a := NewAggregator(10)
+	a.Observe(rec)
+	if got := a.Snapshot(); got.PartialLines != 0 || got.Lines != 1 {
+		t.Fatalf("static response aggregate = %#v", got)
+	}
+}
+
 func TestParseNginxLTSVRejectsMalformedRequiredFields(t *testing.T) {
 	tests := []string{
 		"method:GET\turi:/\tstatus:200\treqtime:0.1\tupstime:-\tbytes:1\tcache:-", // ctype missing

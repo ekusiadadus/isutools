@@ -233,7 +233,7 @@ log_format isutools ltsv escape=json
   "\turi:$uri"                       # query stringを保存しない
   "\tstatus:$status"
   "\treqtime:$request_time"          # クライアント視点の総時間
-  "\tupstime:$upstream_response_time" # upstream時間。retry時は複数値、"-"は計測値なし
+  "\tupstime:$upstream_response_time" # upstream時間。retry時は複数値、"-"/空は計測値なし
   "\tbytes:$body_bytes_sent"          # 転送バイト数(画像サイズ分析の主役)
   "\tcache:$upstream_cache_status"    # proxy_cache の HIT/MISS/BYPASS
   "\tctype:$sent_http_content_type"
@@ -249,7 +249,7 @@ log_format isutools ltsv escape=json
 | count / sum / avg / p95 / max(reqtime) | alp 相当の基本レイテンシ分析 |
 | **bytes: パス別 合計/平均転送量・上位パス** | どの画像・静的パスが帯域を食っているか(合計時間だけでは見えない) |
 | **reqtime − upstream合計の残差** | client upload・nginx処理・buffer・downstream等を含む非upstream時間の手掛かり |
-| **upstime = "-" の比率(no-upstream-timing率)** | upstream計測値がない割合。静的配信成功とは断定しない |
+| **upstime = "-" / 空の比率(no-upstream-timing率)** | upstream計測値がない割合。静的配信成功とは断定しない |
 | **status 304 比率** | Conditional GET / ETag・expires 設定の効き目 |
 | **cache HIT/MISS 率** | proxy_cache 導入の効き目 |
 | ctype 別集計 | 画像/CSS/JS/HTML の帯域内訳 |
@@ -270,11 +270,15 @@ log_format isutools ltsv escape=json
 
 ### 5.5 procstats
 
-- **世代差分方式**(レビュー P0-3 反映): 表示時の瞬間サンプリングでは
-  「ベンチ終了後のアイドル状態」を測ってしまう。`POST /reset` 時に
-  `/proc/[pid]/stat`(utime+stime+starttime)と全体 jiffies のベースラインを
-  記録し、snapshot 取得時に**ベンチ区間全体の差分**として CPU 時間を算出する
+- **run境界差分方式**(レビュー P0-3 反映): 表示時の瞬間サンプリングでは
+  「ベンチ終了後のアイドル状態」を測ってしまう。`POST /reset` と `ResetNow` が共有する
+  coordinator の開始境界で `/proc/[pid]/stat`(utime+stime+starttime)と全体 jiffies の
+  baseline を取り、終了境界で final を凍結する。dashboard/save 時刻ではなく
+  **ベンチ区間全体の差分**として CPU 時間を算出する
 - PID 再利用は starttime の一致で検知。CPU% は「1コア=100%(top 互換)」と定義
+- ホスト全体では短命プロセスの終了が通常発生するため、未追跡 PID の消滅だけでは
+  snapshot を partial にしない。明示追跡 PID (`WithTrackedPIDs`) の消滅は計測欠損として
+  partial にし、自動配線ではアプリ自身の PID を追跡する
 - RSS は snapshot 時点の値(`/proc/[pid]/statm`)。CPU / RSS 上位 N(既定10)
 - 外部依存なし(gopsutil 不使用)。Linux 専用で良い(ISUCON は Linux)
 - テスト容易性のため proc ルートは差し替え可能(`testdata/proc` フィクスチャ)
@@ -422,7 +426,7 @@ open snapshots/<latest>.html              # ブラウザで自動オープン
 | httpstats | h1/h2 / optional interface透過 / panic再伝播 / streaming / h3 integration(build tag) |
 | gqlstats | operation/subscription / unnamed / body上限・復元 / unsupported transport health |
 | accesslog | golden / 複数upstream / inode rotate / copytruncate / buffered flush / malformed・巨大行fuzz |
-| procstats | start/end差分 / PID再利用 / process出現・消滅 / permission failure / RSS |
+| procstats | start/end差分 / PID再利用 / 未追跡process消滅の許容 / 追跡PID消滅 / permission failure / RSS |
 | buildinfo | VCSあり・なし / dirty・clean・unknown / ldflags・env優先順位 |
 | web | schema互換 / sort / HTML escape / method・loopback・SSH-only bind policy / 同時reset・snapshot |
 

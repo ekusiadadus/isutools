@@ -208,6 +208,31 @@ func TestWithProtocolTrafficUsesMeasuredProtocolAndFlagsErrors(t *testing.T) {
 	}
 }
 
+func TestProtocolTrafficErrorRateFormatting(t *testing.T) {
+	tests := []struct {
+		name   string
+		count  int64
+		errors int64
+		want   string
+	}{
+		{name: "zero", count: 96052, errors: 0, want: "5xx 0/96052, 0%"},
+		{name: "one rare error", count: 96052, errors: 1, want: "5xx 1/96052, 0.0010%"},
+		{name: "larger percentage", count: 100, errors: 10, want: "5xx 10/100, 10.00%"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			check := byID(WithProtocolTraffic(nil, "proxy", []ProtocolSample{{
+				Protocol: "HTTP/1.0",
+				Count:    tt.count,
+				Errors:   tt.errors,
+			}}))["http3-traffic"]
+			if !strings.Contains(check.Detail, tt.want) {
+				t.Fatalf("detail = %q; want %q", check.Detail, tt.want)
+			}
+		})
+	}
+}
+
 func TestProtocolTrafficBehindEdgeIsNotClientEvidence(t *testing.T) {
 	checks := WithProtocolTrafficEvidence(nil, "origin proxy access log (edge declared)", false, []ProtocolSample{
 		{Protocol: "HTTP/3.0", Count: 100, P95: 10 * time.Millisecond},

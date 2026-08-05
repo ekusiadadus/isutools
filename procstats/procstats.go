@@ -4,6 +4,7 @@
 package procstats
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -15,9 +16,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ekusiadadus/isutools/internal/runctl"
 )
 
 const (
+	// CollectorName is the immutable run snapshot section populated by this
+	// collector.
+	CollectorName     = "proc"
 	defaultTopN       = 10
 	defaultClockTicks = 100
 	maxHealthErrors   = 16
@@ -120,6 +126,23 @@ func WithTopN(n int) Option {
 	}
 }
 
+// WithTrackedPIDs marks process identities whose loss must make an interval
+// partial. Host-wide process churn is expected, so an untracked PID that exits
+// between boundaries is ignored; a tracked PID that exits is measurement loss.
+// Non-positive PIDs are ignored.
+func WithTrackedPIDs(pids ...int) Option {
+	return func(c *Collector) {
+		if c.trackedPIDs == nil {
+			c.trackedPIDs = make(map[int]struct{}, len(pids))
+		}
+		for _, pid := range pids {
+			if pid > 0 {
+				c.trackedPIDs[pid] = struct{}{}
+			}
+		}
+	}
+}
+
 // WithClockTicks sets USER_HZ used to convert process jiffies to seconds.
 // Linux is normally 100; injection avoids a libc dependency and enables tests.
 func WithClockTicks(ticks uint64) Option {
@@ -151,18 +174,38 @@ func WithClock(now func() time.Time) Option {
 // Collector owns a baseline and produces interval snapshots. Reset and
 // Snapshot are serialized so a baseline cannot be changed mid-scan.
 type Collector struct {
-	mu         sync.Mutex
-	fs         fs.FS
-	topN       int
-	clockTicks uint64
-	pageSize   uint64
-	now        func() time.Time
+	mu          sync.Mutex
+	fs          fs.FS
+	topN        int
+	clockTicks  uint64
+	pageSize    uint64
+	now         func() time.Time
+	trackedPIDs map[int]struct{}
 
 	baseline       sample
 	baselineHealth Health
 	lastHealth     Health
 	baselineValid  bool
+
+	// runResults makes CaptureBaseline/CaptureFinal idempotent. The immutable
+	// boundary payload is carried by each handle; this map only remembers the
+	// first result for retries and is pruned when a newer epoch arrives.
+	runResults map[procRunKey]runctl.SampleResult
+	runEpoch   runctl.Epoch
 }
+
+type procRunKey struct {
+	runID string
+	epoch runctl.Epoch
+	phase runctl.Phase
+}
+
+type runBoundary struct {
+	baseline bool
+	snapshot Snapshot
+}
+
+var _ runctl.BaselineCollector = (*Collector)(nil)
 
 type sample struct {
 	at        time.Time
@@ -190,6 +233,7 @@ func New(options ...Option) *Collector {
 		pageSize:   uint64(os.Getpagesize()),
 		now:        time.Now,
 		lastHealth: healthy(),
+		runResults: make(map[procRunKey]runctl.SampleResult),
 	}
 	for _, option := range options {
 		if option != nil {
@@ -205,7 +249,10 @@ func New(options ...Option) *Collector {
 func (c *Collector) Reset() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.resetLocked()
+}
 
+func (c *Collector) resetLocked() error {
 	current, h, err := c.readSample(false)
 	if err != nil {
 		h.unavailable(err.Error())
@@ -227,7 +274,10 @@ func (c *Collector) Reset() error {
 func (c *Collector) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.snapshotLocked()
+}
 
+func (c *Collector) snapshotLocked() Snapshot {
 	result := Snapshot{EndedAt: c.now(), Health: cloneHealth(c.lastHealth)}
 	if !c.baselineValid {
 		if result.Health.Status == StatusOK {
@@ -302,7 +352,9 @@ func (c *Collector) Snapshot() Snapshot {
 			continue
 		}
 		if _, stillPresent := current.processes[pid]; !stillPresent {
-			h.drop(fmt.Sprintf("pid %d disappeared during interval", pid))
+			if _, tracked := c.trackedPIDs[pid]; tracked {
+				h.drop(fmt.Sprintf("tracked pid %d disappeared during interval", pid))
+			}
 		}
 	}
 
@@ -327,6 +379,121 @@ func (c *Collector) Snapshot() Snapshot {
 	result.Health = h
 	c.lastHealth = cloneHealth(h)
 	return result
+}
+
+// Name identifies the immutable section this collector contributes to a run.
+func (c *Collector) Name() string { return CollectorName }
+
+// CaptureBaseline resets procstats at the coordinated opening boundary. A
+// retry for the same run and epoch replays the first committed result instead
+// of moving the baseline forward.
+func (c *Collector) CaptureBaseline(ctx context.Context, runID string, ep runctl.Epoch) (runctl.SampleResult, error) {
+	return c.captureRunBoundary(ctx, runID, ep, runctl.PhaseStartBaseline)
+}
+
+// CaptureFinal freezes the process snapshot at the coordinated closing
+// boundary. Report rendering later reads this immutable value and never extends
+// the interval to dashboard/save time.
+func (c *Collector) CaptureFinal(ctx context.Context, runID string, ep runctl.Epoch) (runctl.SampleResult, error) {
+	return c.captureRunBoundary(ctx, runID, ep, runctl.PhaseFinishFinal)
+}
+
+func (c *Collector) captureRunBoundary(
+	ctx context.Context,
+	runID string,
+	ep runctl.Epoch,
+	phase runctl.Phase,
+) (runctl.SampleResult, error) {
+	if err := ctx.Err(); err != nil {
+		return runctl.SampleResult{At: c.now()}, fmt.Errorf("procstats: %s: %w", phase, err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := procRunKey{runID: runID, epoch: ep, phase: phase}
+	if ep < c.runEpoch {
+		return runctl.SampleResult{At: c.now()},
+			fmt.Errorf("%w: procstats: epoch %d, current %d", runctl.ErrStaleEpoch, ep, c.runEpoch)
+	}
+	if ep > c.runEpoch {
+		c.runEpoch = ep
+		for old := range c.runResults {
+			if old.epoch < ep {
+				delete(c.runResults, old)
+			}
+		}
+	}
+	if fixed, ok := c.runResults[key]; ok {
+		return fixed, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return runctl.SampleResult{At: c.now()}, fmt.Errorf("procstats: %s: %w", phase, err)
+	}
+
+	var boundary runBoundary
+	var at time.Time
+	switch phase {
+	case runctl.PhaseStartBaseline:
+		if err := c.resetLocked(); err != nil {
+			return runctl.SampleResult{At: c.now()}, err
+		}
+		at = c.baseline.at
+		boundary.baseline = true
+	case runctl.PhaseFinishFinal:
+		boundary.snapshot = cloneSnapshot(c.snapshotLocked())
+		at = boundary.snapshot.EndedAt
+	default:
+		return runctl.SampleResult{At: c.now()}, fmt.Errorf("procstats: unsupported boundary phase %q", phase)
+	}
+
+	result := runctl.SampleResult{
+		Handle:    runctl.NewBaselineHandle(runID, ep, CollectorName, phase, at, boundary),
+		At:        at,
+		Committed: true,
+	}
+	c.runResults[key] = result
+	return result, nil
+}
+
+// Collect returns the snapshot frozen by CaptureFinal. It reads only the two
+// handles, so neither a later dashboard refresh nor a delayed save can change
+// the measured process interval.
+func (c *Collector) Collect(base, final runctl.BaselineHandle) (any, error) {
+	if base.RunID != final.RunID || base.Epoch != final.Epoch {
+		return nil, fmt.Errorf("procstats: boundary handles name different runs")
+	}
+	baseValue, ok := base.Sample().(runBoundary)
+	if !ok || !baseValue.baseline {
+		return nil, fmt.Errorf("procstats: baseline handle carries %T, want procstats run boundary", base.Sample())
+	}
+	finalValue, ok := final.Sample().(runBoundary)
+	if !ok || finalValue.baseline {
+		return nil, fmt.Errorf("procstats: final handle carries %T, want procstats final boundary", final.Sample())
+	}
+	return cloneSnapshot(finalValue.snapshot), nil
+}
+
+// Release forgets retry bookkeeping. The handle itself retains a deep copy of
+// its boundary, so release cannot change an interval already being collected.
+func (c *Collector) Release(h runctl.BaselineHandle) {
+	if h.Zero() || h.Collector != CollectorName {
+		return
+	}
+	c.mu.Lock()
+	delete(c.runResults, procRunKey{runID: h.RunID, epoch: h.Epoch, phase: h.Phase})
+	c.mu.Unlock()
+}
+
+func cloneSnapshot(in Snapshot) Snapshot {
+	out := in
+	out.TopCPU = append([]Process(nil), in.TopCPU...)
+	out.TopRSS = append([]Process(nil), in.TopRSS...)
+	out.Health = cloneHealth(in.Health)
+	if in.CPUTotal != nil {
+		cpu := *in.CPUTotal
+		out.CPUTotal = &cpu
+	}
+	return out
 }
 
 // Health returns a copy of the most recent Reset or Snapshot health.

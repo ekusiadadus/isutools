@@ -171,6 +171,9 @@ type measurement struct {
 	ctrl *runctl.Controller
 	// proc is nil where procfs does not exist.
 	proc *procstats.Collector
+	// procManaged means proc is registered as a coordinated baseline collector,
+	// so both ResetNow and POST /reset use the same opening and closing boundary.
+	procManaged bool
 	// profiles lists the runtime profiles to capture at a run boundary, in
 	// capture order. Empty means profiling is off, which is the default.
 	profiles []string
@@ -296,6 +299,7 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		return m
 	}
 	registerCollectors(ctrl, getenv)
+	m.procManaged = registerProcCollector(ctrl, m.proc)
 	m.generationManaged = registerGenerationCollectorsStatus(ctrl, gens)
 	m.profiles = resolveProfileSettings(getenv).apply(collectorHealth)
 	// The capturer is built from the environment rather than from Handler(), so
@@ -310,6 +314,21 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		Health: collectorHealth,
 	})
 	return m
+}
+
+func registerProcCollector(ctrl *runctl.Controller, collector *procstats.Collector) bool {
+	if collector == nil {
+		collectorHealth.Set(procstats.CollectorName, health.StatusDisabled, "procfs is only available on Linux")
+		return false
+	}
+	err := ctrl.RegisterBaseline(runctl.Registration{Name: procstats.CollectorName}, collector)
+	if err != nil {
+		collectorHealth.Set(procstats.CollectorName, health.StatusFailed, err.Error())
+		log.Printf("isutools: %s collector not registered: %v", procstats.CollectorName, err)
+		return false
+	}
+	collectorHealth.Set(procstats.CollectorName, health.StatusOK, "")
+	return true
 }
 
 // composeEnrich combines independent snapshot enrichments. Both run even if
@@ -338,7 +357,7 @@ func newProcCollector() *procstats.Collector {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	return procstats.New()
+	return procstats.New(procstats.WithTrackedPIDs(os.Getpid()))
 }
 
 // registerCollectors wires the optional baseline collectors into the run
@@ -1534,6 +1553,7 @@ func Handler() http.Handler {
 		SQLGenerationManaged:      core.generationManaged.sql,
 		HTTPGenerationManaged:     core.generationManaged.http,
 		CountersGenerationManaged: core.generationManaged.counter,
+		ProcRunManaged:            core.procManaged,
 		Health:                    collectorHealth,
 		HTTP:                      httpstats.Default,
 		DataDir:                   os.Getenv(envDataDir),
@@ -1592,7 +1612,9 @@ func Handler() http.Handler {
 	}
 	if collector := core.proc; collector != nil {
 		provider.Proc = collector
-		if err := collector.Reset(); err != nil {
+		if core.procManaged {
+			collectorHealth.Set(procstats.CollectorName, health.StatusOK, "")
+		} else if err := collector.Reset(); err != nil {
 			collectorHealth.Set("proc", health.StatusDegraded, err.Error())
 		} else {
 			collectorHealth.Set("proc", health.StatusOK, "")
@@ -1763,29 +1785,236 @@ func inferProxyKindFromPath(path string) string {
 	}
 }
 
-// readProxyConf reads a config file, or concatenates *.conf files when path is
-// an nginx-style directory (best effort). Caddy/Envoy should pass a file.
+const (
+	maxProxyConfBytes = 4 << 20
+	maxProxyConfFiles = 256
+	maxProxyConfDepth = 32
+)
+
+// readProxyConf reads a proxy configuration with bounded, best-effort nginx
+// include expansion. A file is treated as the active entrypoint, so only its
+// reachable include graph is loaded. Directory mode retains the historical
+// *.conf discovery, but canonical-path de-duplication prevents a
+// sites-available file and its sites-enabled symlink from being counted twice.
+// Caddy/Envoy callers should continue to pass one file; their syntax has no
+// nginx "include" directive and is returned unchanged.
 func readProxyConf(path string) []byte {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil
 	}
+	loader := proxyConfLoader{seen: make(map[string]struct{})}
 	if !info.IsDir() {
-		data, _ := os.ReadFile(path)
-		return data
+		loader.load(path, 0)
+		return loader.out
 	}
-	var out []byte
-	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
 			return nil
 		}
-		if strings.HasSuffix(p, ".conf") {
-			if data, rerr := os.ReadFile(p); rerr == nil {
-				out = append(out, data...)
-				out = append(out, '\n')
-			}
+		if strings.HasSuffix(strings.ToLower(p), ".conf") {
+			loader.load(p, 0)
 		}
 		return nil
 	})
-	return out
+	return loader.out
+}
+
+type proxyConfLoader struct {
+	out   []byte
+	seen  map[string]struct{}
+	files int
+	bytes int
+}
+
+func (l *proxyConfLoader) load(path string, depth int) {
+	data := l.expand(path, depth)
+	if len(data) == 0 || len(data) > maxProxyConfBytes-len(l.out) {
+		return
+	}
+	l.out = append(l.out, data...)
+	if data[len(data)-1] != '\n' && len(l.out) < maxProxyConfBytes {
+		l.out = append(l.out, '\n')
+	}
+}
+
+func (l *proxyConfLoader) expand(path string, depth int) []byte {
+	if depth > maxProxyConfDepth || l.files >= maxProxyConfFiles || l.bytes >= maxProxyConfBytes {
+		return nil
+	}
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil
+	}
+	canonical, err = filepath.Abs(canonical)
+	if err != nil {
+		return nil
+	}
+	canonical = filepath.Clean(canonical)
+	if _, duplicate := l.seen[canonical]; duplicate {
+		return nil
+	}
+	info, err := os.Stat(canonical)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+
+	file, err := os.Open(canonical)
+	if err != nil {
+		return nil
+	}
+	remaining := maxProxyConfBytes - l.bytes
+	data, readErr := io.ReadAll(io.LimitReader(file, int64(remaining)+1))
+	_ = file.Close()
+	if readErr != nil || len(data) > remaining {
+		return nil
+	}
+	l.seen[canonical] = struct{}{}
+	l.files++
+	l.bytes += len(data)
+
+	// nginx -T already emits the entrypoint and every included file in one
+	// stream, prefixed by repeated "configuration file" markers. Expanding its
+	// still-visible include directives would load the live fragments a second
+	// time and recreate the duplicate-listener problem this loader prevents.
+	if nginxConfigDump(data) {
+		return data
+	}
+	directives := nginxIncludeDirectives(data)
+	if len(directives) == 0 {
+		return data
+	}
+	var expanded []byte
+	cursor := 0
+	for _, directive := range directives {
+		expanded = append(expanded, data[cursor:directive.start]...)
+		cursor = directive.end
+		target := directive.target
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(canonical), target)
+		}
+		matches, globErr := filepath.Glob(target)
+		if globErr != nil {
+			continue
+		}
+		for _, match := range matches {
+			expanded = append(expanded, l.expand(match, depth+1)...)
+		}
+	}
+	expanded = append(expanded, data[cursor:]...)
+	return expanded
+}
+
+func nginxConfigDump(data []byte) bool {
+	const marker = "# configuration file "
+	text := string(data)
+	count := strings.Count(text, "\n"+marker)
+	if strings.HasPrefix(text, marker) {
+		count++
+	}
+	return count >= 2
+}
+
+type nginxIncludeDirective struct {
+	start, end int
+	target     string
+}
+
+// nginxIncludeDirectives returns byte spans and targets for include
+// directives. Semicolons and braces inside quoted strings or comments are not
+// syntax, so a quoted path remains intact and inline contexts are supported.
+func nginxIncludeDirectives(data []byte) []nginxIncludeDirective {
+	var directives []nginxIncludeDirective
+	statementStart := 0
+	var quote byte
+	escaped := false
+	comment := false
+	for i, ch := range data {
+		if comment {
+			if ch == '\n' {
+				comment = false
+			}
+			continue
+		}
+		if quote != 0 {
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '#':
+			comment = true
+		case '\'', '"':
+			quote = ch
+		case '{', '}':
+			statementStart = i + 1
+		case ';':
+			statement := strings.TrimSpace(stripNginxComments(string(data[statementStart:i])))
+			fields := strings.Fields(statement)
+			if len(fields) == 0 || fields[0] != "include" {
+				statementStart = i + 1
+				continue
+			}
+			rest := strings.TrimSpace(statement[len("include"):])
+			if rest == "" {
+				statementStart = i + 1
+				continue
+			}
+			if (rest[0] == '"' && rest[len(rest)-1] == '"') ||
+				(rest[0] == '\'' && rest[len(rest)-1] == '\'') {
+				rest = rest[1 : len(rest)-1]
+			}
+			if rest != "" {
+				directives = append(directives, nginxIncludeDirective{
+					start: statementStart, end: i + 1, target: rest,
+				})
+			}
+			statementStart = i + 1
+		}
+	}
+	return directives
+}
+
+func stripNginxComments(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	var quote byte
+	escaped := false
+	comment := false
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if comment {
+			if ch == '\n' {
+				comment = false
+				out.WriteByte(ch)
+			}
+			continue
+		}
+		if quote != 0 {
+			out.WriteByte(ch)
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '#':
+			comment = true
+		case '\'', '"':
+			quote = ch
+			out.WriteByte(ch)
+		default:
+			out.WriteByte(ch)
+		}
+	}
+	return out.String()
 }

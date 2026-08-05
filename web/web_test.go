@@ -23,6 +23,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/netstats"
+	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
@@ -1294,6 +1295,9 @@ func TestRunIntervalSectionsOverlayTheLiveCollectors(t *testing.T) {
 			Entries: []accesslog.Entry{{Method: http.MethodGet, URI: "/items/1", Count: 3}},
 		},
 		counters.SectionName: counters.Frozen{Entries: []counters.Entry{{Name: "cache-hit", Count: 5}}},
+		procstats.CollectorName: procstats.Snapshot{
+			StartedAt: time.Unix(100, 0), EndedAt: time.Unix(160, 0), CPUs: 8,
+		},
 	}
 	var snap Snapshot
 	applyRunIntervalSections(&snap, sections)
@@ -1312,6 +1316,9 @@ func TestRunIntervalSectionsOverlayTheLiveCollectors(t *testing.T) {
 	if len(snap.Counters) != 1 || snap.Counters[0].Count != 5 {
 		t.Errorf("counters = %+v, want the frozen generation", snap.Counters)
 	}
+	if snap.Proc == nil || snap.Proc.CPUs != 8 || snap.Proc.StartedAt != time.Unix(100, 0) {
+		t.Errorf("proc = %+v, want the frozen run boundary", snap.Proc)
+	}
 
 	// A present frozen section is authoritative even when it is empty. Keeping
 	// live values here would attribute post-boundary traffic to the closed run.
@@ -1325,8 +1332,9 @@ func TestRunIntervalSectionsOverlayTheLiveCollectors(t *testing.T) {
 		httpstats.CollectorName: httpstats.Result{},
 		accesslog.SectionName:   accesslog.Snapshot{},
 		counters.SectionName:    counters.Frozen{},
+		procstats.CollectorName: procstats.Snapshot{},
 	})
-	if len(live.SQL) != 0 || len(live.HTTP) != 0 || len(live.Counters) != 0 || live.AccessLog == nil || live.Connections == nil {
+	if len(live.SQL) != 0 || len(live.HTTP) != 0 || len(live.Counters) != 0 || live.AccessLog == nil || live.Connections == nil || live.Proc == nil {
 		t.Errorf("empty frozen run did not replace live data: %+v", live)
 	}
 

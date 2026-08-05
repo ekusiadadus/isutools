@@ -14,9 +14,11 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/ekusiadadus/isutools/accesslog"
@@ -29,6 +31,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/internal/runctl"
 	"github.com/ekusiadadus/isutools/netstats"
+	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
@@ -924,6 +927,85 @@ func TestResetNowOpensARunOnTheSharedController(t *testing.T) {
 	}
 }
 
+func TestEmbeddedResetNowCoordinatesProcstatsBoundary(t *testing.T) {
+	files := fstest.MapFS{}
+	writeProc := func(total, processCPU uint64) {
+		files["stat"] = &fstest.MapFile{Data: []byte(fmt.Sprintf(
+			"cpu %d 0 0 0 0 0 0 0 0 0\ncpu0 %d 0 0 0 0 0 0 0 0 0\n", total, total,
+		))}
+		fields := make([]string, 20)
+		for i := range fields {
+			fields[i] = "0"
+		}
+		fields[0] = "S"
+		fields[11] = strconv.FormatUint(processCPU, 10)
+		fields[19] = "10"
+		files["1/stat"] = &fstest.MapFile{Data: []byte(fmt.Sprintf("1 (worker) %s\n", strings.Join(fields, " ")))}
+		files["1/statm"] = &fstest.MapFile{Data: []byte("100 2 0 0 0 0 0\n")}
+	}
+
+	now := time.Date(2026, 8, 5, 18, 0, 0, 0, time.UTC)
+	writeProc(100, 10)
+	collector := procstats.New(
+		procstats.WithFS(files),
+		procstats.WithClock(func() time.Time { return now }),
+	)
+	if err := collector.Reset(); err != nil {
+		t.Fatalf("service-start proc baseline: %v", err)
+	}
+
+	ctrl, err := runctl.New(runctl.Options{Now: func() time.Time { return now }, DisableWatchdog: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ctrl.Close)
+	if err := ctrl.RegisterBaseline(runctl.Registration{Name: procstats.CollectorName}, collector); err != nil {
+		t.Fatalf("register procstats: %v", err)
+	}
+	core := &measurement{
+		ctrl:        ctrl,
+		proc:        collector,
+		procManaged: true,
+		generation:  func() int64 { return 0 },
+	}
+
+	// The process has been alive for an hour before the embedded initialize.
+	// ResetNow, not Handler construction, must define proc.startedAt.
+	now = now.Add(time.Hour)
+	writeProc(200, 20)
+	benchmarkStart := now
+	started, err := core.resetNow(context.Background(), runctl.StartRunOptions{
+		Preempt: true, Reason: reasonInitialize, Trigger: "api",
+	})
+	if err != nil {
+		t.Fatalf("ResetNow: %v", err)
+	}
+
+	now = benchmarkStart.Add(75 * time.Second)
+	writeProc(350, 35)
+	if _, err := core.finishResetRun(context.Background()); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	if _, err := ctrl.Await(context.Background(), started.RunID); err != nil {
+		t.Fatalf("Await: %v", err)
+	}
+	snapshot, err := ctrl.SnapshotOf(started.RunID)
+	if err != nil {
+		t.Fatalf("SnapshotOf: %v", err)
+	}
+	section, ok := snapshot.Sections[procstats.CollectorName].(procstats.Snapshot)
+	if !ok {
+		t.Fatalf("proc section = %T, want procstats.Snapshot", snapshot.Sections[procstats.CollectorName])
+	}
+	if section.StartedAt != benchmarkStart || section.EndedAt != now {
+		t.Fatalf("proc interval = %s..%s, want ResetNow run %s..%s",
+			section.StartedAt, section.EndedAt, benchmarkStart, now)
+	}
+	if len(section.TopCPU) != 1 || section.TopCPU[0].DeltaJiffies != 15 {
+		t.Fatalf("proc TopCPU = %+v, want benchmark-only delta 15", section.TopCPU)
+	}
+}
+
 func TestResetNowWithNonceWhenOff(t *testing.T) {
 	t.Setenv("ISUTOOLS", "off")
 	result, err := ResetNowWithNonce(context.Background(), "nonce-off")
@@ -1003,6 +1085,111 @@ func TestReadProxyConf(t *testing.T) {
 	}
 	if readProxyConf(filepath.Join(dir, "missing.conf")) != nil {
 		t.Error("a missing path must read as no configuration")
+	}
+}
+
+func TestReadProxyConfFollowsNginxIncludesAndDeduplicatesSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	confD := filepath.Join(dir, "conf.d")
+	sitesAvailable := filepath.Join(dir, "sites-available")
+	sitesEnabled := filepath.Join(dir, "sites-enabled")
+	for _, path := range []string{confD, sitesAvailable, sitesEnabled} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(filepath.Join(confD, "transport.conf"), "worker_connections 4096;\n")
+	active := filepath.Join(sitesAvailable, "active.conf")
+	write(active, "server { listen 443 ssl; server_name active.example; }\n")
+	write(filepath.Join(sitesAvailable, "disabled.conf"), "server { listen 444 ssl; server_name disabled.example; }\n")
+	if err := os.Symlink(active, filepath.Join(sitesEnabled, "active.conf")); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "nginx.conf")
+	write(root, "http {\n include conf.d/*.conf;\n include sites-enabled/*;\n}\n")
+
+	entrypoint := string(readProxyConf(root))
+	if !strings.Contains(entrypoint, "worker_connections 4096") || !strings.Contains(entrypoint, "server_name active.example") {
+		t.Fatalf("entrypoint did not resolve its include graph: %q", entrypoint)
+	}
+	if strings.Contains(entrypoint, "disabled.example") {
+		t.Fatalf("entrypoint loaded a vhost outside its include graph: %q", entrypoint)
+	}
+	if got := strings.Count(entrypoint, "listen 443 ssl"); got != 1 {
+		t.Fatalf("entrypoint counted the active symlink target %d times, want 1: %q", got, entrypoint)
+	}
+
+	// Directory mode sees both sites-available/active.conf and the enabled
+	// symlink. They are one physical configuration and must be loaded once.
+	directory := string(readProxyConf(dir))
+	if got := strings.Count(directory, "listen 443 ssl"); got != 1 {
+		t.Fatalf("directory counted a symlinked vhost %d times, want 1: %q", got, directory)
+	}
+}
+
+func TestReadProxyConfBoundsIncludeCycles(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.conf")
+	second := filepath.Join(dir, "second.conf")
+	if err := os.WriteFile(first, []byte("include second.conf;\nfirst_marker on;\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("include first.conf;\nsecond_marker on;\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := string(readProxyConf(first))
+	if strings.Count(got, "first_marker") != 1 || strings.Count(got, "second_marker") != 1 {
+		t.Fatalf("cyclic include graph was not resolved exactly once: %q", got)
+	}
+}
+
+func TestReadProxyConfExpandsIncludeInsideItsNginxContext(t *testing.T) {
+	dir := t.TempDir()
+	snippet := filepath.Join(dir, "listen{tls}.conf")
+	if err := os.WriteFile(snippet, []byte("listen 443 ssl;\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "nginx.conf")
+	content := "http { server {\n# include missing.conf;\ninclude \"listen{tls}.conf\";\n} }\n"
+	if err := os.WriteFile(root, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := string(readProxyConf(root))
+	listen := strings.Index(got, "listen 443 ssl")
+	closeServer := strings.Index(got, "}")
+	if listen < 0 || closeServer < 0 || listen > closeServer {
+		t.Fatalf("included directive escaped its server context: %q", got)
+	}
+	if strings.Contains(got, "missing.conf") {
+		t.Fatalf("commented include was treated as active: %q", got)
+	}
+}
+
+func TestReadProxyConfDoesNotReexpandNginxTDump(t *testing.T) {
+	dir := t.TempDir()
+	fragmentDir := filepath.Join(dir, "conf.d")
+	if err := os.Mkdir(fragmentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fragment := filepath.Join(fragmentDir, "app.conf")
+	if err := os.WriteFile(fragment, []byte("server { listen 443 ssl; }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dump := filepath.Join(dir, "nginx-T.conf")
+	content := "# configuration file /etc/nginx/nginx.conf:\ninclude " + fragmentDir +
+		"/*.conf;\n# configuration file /etc/nginx/conf.d/app.conf:\nserver { listen 443 ssl; }\n"
+	if err := os.WriteFile(dump, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := string(readProxyConf(dump))
+	if count := strings.Count(got, "listen 443 ssl"); count != 1 {
+		t.Fatalf("nginx -T dump was expanded %d times, want exactly once: %q", count, got)
 	}
 }
 

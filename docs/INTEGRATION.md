@@ -141,6 +141,10 @@ protocol別5xx、p95をAdvisorへ渡します。`proto`は任意フィールド�
 reverse proxyがHTTP/3を終端する構成では、これがないとアプリ側`r.Proto`はupstream protocol
 しか表さず、HTTP/3利用率を判定できません。
 
+nginx が静的ファイルを直接返す場合、`$upstream_response_time` は `-` だけでなく空文字に
+なる構成があります。どちらも正常な「upstream timing なし」として数え、accesslog を partial
+にはしません。不正な数値や文字列だけを parse failure として partial にします。
+
 ### User Flow の `sess`
 
 同梱設定は `X-Isutools-Session` を `sess:` として記録します。これは認証 Cookie ではなく、
@@ -228,6 +232,11 @@ export ISUTOOLS_PROXY_KIND=nginx            # nginx / caddy / envoy
 
 `_KIND`を省略すると、明確な設定signatureまたはファイル名からだけ判別します。
 曖昧なら`skip`です。旧`ISUTOOLS_NGINX_CONF`は後方互換で、汎用変数がない場合だけ使います。
+
+nginx は directory より実際の entrypoint file(`/etc/nginx/nginx.conf` など)を指定してください。
+entrypoint mode は `include` の glob を再帰的に解決し、symlink target と cycle を一度だけ読みます
+(上限 256 files / 4 MiB / depth 32)。directory mode は全 `*.conf` を探索するため、symlink
+重複は除けても include されていない inactive fragment を実設定と区別できません。
 
 nginxは少なくともTCP fallback、QUIC listener、証明書、Alt-Svcを同じserverで用意します。
 
@@ -365,6 +374,16 @@ export ISUTOOLS_PPROF_SECONDS=30
 だけが見えます。ホスト全体を測りたい場合は、意図を確認したうえで host PID namespace と
 読み取り可能な `/proc` を与えてください。macOS では disabled と表示されます。
 
+ホスト全体の `/proc` では短命な補助プロセスの終了は通常の churn なので、それだけでは
+snapshot を partial にしません。自動配線はアプリ自身の PID を明示追跡し、その identity が
+失われた場合は partial にします。`procstats` を直接組み込む場合は
+`procstats.WithTrackedPIDs(...)` で同じ契約を追加できます。
+
+自動配線した procstats は run coordinator の baseline collector です。`POST /reset` と
+アプリ内の `ResetNow` のどちらで開始しても、その開始境界で baseline、`POST /finish` / save
+の終了境界で final を凍結します。Handler 構築時からの経過や、終了後に dashboard を開くまでの
+時間は CPU 差分に入りません。
+
 ### k6、curl、jq
 
 - k6: 負荷生成を行う場合だけ必要。isutools の Go dependency ではありません
@@ -467,6 +486,9 @@ Linux の procfs / sysfs / cgroup v2 だけを読みます。追加の外部プ�
 - ディスク使用量の statfs 対象は `/` だけです。v1.2 の配線ではデータディレクトリを
   第二の statfs 対象として渡していないため、DB のデータ volume だけが埋まる事象は
   この欄からは見えません
+- block device の区間カウンタがすべて不変なら disk 表から省略します。名前で
+  `loop*` / `ram*` を除外しないため、実際に動いた仮想 backing device は残ります。
+  区間中に出現した device と counter rewind のある device も診断証拠として残ります
 - cgroup 上限は **v2 のみ**です。v1 のホストでは
   `hoststats-cgroup-v1: cgroup v2 is not available; cgroup limits were skipped`
 

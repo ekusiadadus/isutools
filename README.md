@@ -178,7 +178,7 @@ DB を作り直すこと自体は止められない。だから `SerializeInitia
 | `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Docker ビルドで vcs 情報が埋まらない場合の rev 注入 |
 | `ISUTOOLS_PATH_RULES` | — | HTTP パス正規化ルール(`regex=replacement;...` 各ペアは最後の `=` で分割) |
 | `ISUTOOLS_NGINX_CONF` | — | advisor が検査する nginx conf(ファイル or ディレクトリ) |
-| `ISUTOOLS_PROXY_CONF` / `_KIND` | — / auto | HTTP/3 advisor が読む nginx/Caddy/Envoy 設定。汎用名を優先、kind は `nginx` / `caddy` / `envoy` |
+| `ISUTOOLS_PROXY_CONF` / `_KIND` | — / auto | HTTP/3 advisor が読む nginx/Caddy/Envoy 設定。nginx entrypoint file は include graph を追跡し、directory は `*.conf` を symlink 重複排除して読む。kind は `nginx` / `caddy` / `envoy` |
 | `ISUTOOLS_HTTP3_UDP443` | — | 外部clientからの結果を `reachable` / `blocked` で明示。プロセス内からfirewall/NATを推測しない |
 | `ISUTOOLS_HTTP3_EDGE` / `_EDGE_ENABLED` | — | LB/CDN名と、そのedgeでのHTTP/3有効状態(`true` / `false`)の明示evidence |
 | `ISUTOOLS_HTTP3_QUIC_METRICS` | — | snapshot時に再読込するproxy QUIC counter JSON。再送率とUDP dropを診断 |

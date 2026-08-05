@@ -157,6 +157,13 @@ func buildDisks(base, final *Sample, seconds float64, rates, hostChanged bool, c
 		case hostChanged:
 			// Counters restarted with the host; deltas stay zero.
 		default:
+			// Whole-device discovery deliberately admits virtual devices: active
+			// loop/dm devices can be the real backing store. Suppress only devices
+			// whose complete interval counters did not move, which also removes
+			// idle loop, ram and spare sd devices without name heuristics.
+			if end == start {
+				continue
+			}
 			disk.ReadBytes = mulSaturate(end.ReadSectors-start.ReadSectors, sectorSize)
 			disk.WriteBytes = mulSaturate(end.WriteSectors-start.WriteSectors, sectorSize)
 			disk.IOTimeMillis = end.IOTicksMS - start.IOTicksMS

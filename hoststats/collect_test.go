@@ -254,6 +254,35 @@ func TestHostStatsCollect_DeviceChurn(t *testing.T) {
 	}
 }
 
+func TestHostStatsCollect_OmitsInactiveDisksButKeepsEvidence(t *testing.T) {
+	t.Parallel()
+	base, final := intervalSamples(10 * time.Second)
+	base.Disks["loop0"] = DiskRaw{}
+	final.Disks["loop0"] = DiskRaw{}
+	base.Disks["ram0"] = DiskRaw{}
+	final.Disks["ram0"] = DiskRaw{}
+
+	// A newly appeared device and a device whose counters rewound carry
+	// evidence even when no usable interval delta can be derived.
+	final.Disks["sdb"] = DiskRaw{}
+	base.Disks["sdc"] = DiskRaw{ReadSectors: 10}
+	final.Disks["sdc"] = DiskRaw{ReadSectors: 5}
+
+	section := buildFrom(t, base, final)
+	if len(section.Disks) != 3 {
+		t.Fatalf("disks = %+v; want active sda plus appeared sdb and rewound sdc", section.Disks)
+	}
+	if section.Disks[0].Device != "sda" || section.Disks[1].Device != "sdb" || section.Disks[2].Device != "sdc" {
+		t.Fatalf("disks = %+v; inactive loop/ram devices must be omitted", section.Disks)
+	}
+	if !section.Disks[1].Appeared {
+		t.Fatalf("sdb = %+v; appeared-device evidence was lost", section.Disks[1])
+	}
+	if section.Disks[2].Code != CodeCounterRewind {
+		t.Fatalf("sdc = %+v; rewind evidence was lost", section.Disks[2])
+	}
+}
+
 func TestHostStatsCollect_CGroup(t *testing.T) {
 	t.Parallel()
 	t.Run("limit changed", func(t *testing.T) {
@@ -405,8 +434,11 @@ func TestHostStatsCollect_UsesFrozenSamplesOnly(t *testing.T) {
 	if !ok {
 		t.Fatalf("Collect() = %T, want *Section", value)
 	}
-	if section.Memory.TotalBytes == 0 || len(section.Disks) == 0 || section.PSI == nil {
+	if section.Memory.TotalBytes == 0 || section.PSI == nil {
 		t.Fatalf("section = %+v, want it built entirely from the handles", section)
+	}
+	if len(section.Disks) != 0 {
+		t.Fatalf("disks = %+v; unchanged frozen disk counters must be suppressed", section.Disks)
 	}
 	if len(section.Filesystems) != 2 || section.CGroup == nil {
 		t.Fatalf("section = %+v, want the statfs and cgroup readings from the samples", section)

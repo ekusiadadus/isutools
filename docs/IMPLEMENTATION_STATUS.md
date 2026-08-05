@@ -229,12 +229,12 @@ Stated explicitly so it is not read out of the sections above:
    pair together with an unconditional notice — unconditional on purpose, since
    a reader who sees the notice only on bad runs would read its absence as
    "this one is exact", which no pair ever is.
-4. **`nginx-listen-backlog` reads a concatenation, not an include tree.** The
-   check analyses the `.conf` text it was given and does not resolve `include`
-   relationships, so a disabled fragment that still ends in `.conf` can be
-   counted as live configuration. The check says so in its own output
-   (`解析対象: 連結された nginx conf(include 関係は未解決)`) rather than
-   presenting the verdict as authoritative.
+4. **nginx configuration inspection is static, not `nginx -T`.** When
+   `ISUTOOLS_PROXY_CONF` names an entrypoint file, its include graph is expanded
+   with cycle, file-count and byte bounds; symlink targets are de-duplicated.
+   Directory mode remains best-effort discovery of every `*.conf`, so an
+   inactive fragment can still be included. The advisor explicitly says that
+   the result is not proof of the running nginx master's effective settings.
 
 ## Not implemented
 

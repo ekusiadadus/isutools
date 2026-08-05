@@ -1,6 +1,7 @@
 package procstats
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -110,11 +111,52 @@ func TestCollectorHandlesAppearedDisappearedAndReusedPID(t *testing.T) {
 	if !byPID[3].Appeared || byPID[3].PIDReused || byPID[3].DeltaJiffies != 15 {
 		t.Fatalf("appeared process = %+v", byPID[3])
 	}
-	if got.Health.Status != StatusPartial || !got.Health.Partial || got.Health.Dropped != 2 {
-		t.Fatalf("health = %+v; want partial with two dropped baselines", got.Health)
+	if got.Health.Status != StatusPartial || !got.Health.Partial || got.Health.Dropped != 1 {
+		t.Fatalf("health = %+v; want only the reused PID marked partial", got.Health)
 	}
-	if joined := strings.Join(got.Health.Errors, "\n"); !strings.Contains(joined, "disappeared") || !strings.Contains(joined, "reused") {
-		t.Fatalf("health errors = %q; want disappeared and reused", joined)
+	if joined := strings.Join(got.Health.Errors, "\n"); strings.Contains(joined, "disappeared") || !strings.Contains(joined, "reused") {
+		t.Fatalf("health errors = %q; want only PID reuse, not ordinary exit", joined)
+	}
+}
+
+func TestCollectorIgnoresUntrackedProcessExit(t *testing.T) {
+	files := fixtureFS(1000, 2, map[int]procFixture{
+		1: {comm: "application", utime: 100, starttime: 10, rssPages: 4},
+		2: {comm: "short-lived helper", utime: 5, starttime: 20, rssPages: 1},
+	})
+	c := New(WithFS(files))
+	if err := c.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	setSystemStat(files, 1200, 2)
+	setProcess(files, 1, procFixture{comm: "application", utime: 120, starttime: 10, rssPages: 4})
+	deleteProcess(files, 2)
+
+	got := c.Snapshot()
+	if got.Health.Status != StatusOK || got.Health.Partial || got.Health.Dropped != 0 {
+		t.Fatalf("health = %+v; ordinary process churn must not make the run partial", got.Health)
+	}
+}
+
+func TestCollectorReportsTrackedProcessExit(t *testing.T) {
+	files := fixtureFS(1000, 2, map[int]procFixture{
+		1: {comm: "application", utime: 100, starttime: 10, rssPages: 4},
+		2: {comm: "tracked worker", utime: 50, starttime: 20, rssPages: 2},
+	})
+	c := New(WithFS(files), WithTrackedPIDs(2))
+	if err := c.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	setSystemStat(files, 1200, 2)
+	setProcess(files, 1, procFixture{comm: "application", utime: 120, starttime: 10, rssPages: 4})
+	deleteProcess(files, 2)
+
+	got := c.Snapshot()
+	if got.Health.Status != StatusPartial || !got.Health.Partial || got.Health.Dropped != 1 {
+		t.Fatalf("health = %+v; a lost explicitly tracked process must be partial", got.Health)
+	}
+	if message := strings.Join(got.Health.Errors, "\n"); !strings.Contains(message, "tracked pid 2 disappeared") {
+		t.Fatalf("health errors = %q; want the tracked process identified", message)
 	}
 }
 
@@ -136,8 +178,8 @@ func TestCollectorReportsReadAndParseFailuresWithoutPanicking(t *testing.T) {
 	if len(got.TopCPU) != 1 || got.TopCPU[0].PID != 1 || got.TopCPU[0].RSSBytes != 0 {
 		t.Fatalf("TopCPU = %+v; want pid 1 retained with unknown RSS", got.TopCPU)
 	}
-	if got.Health.Status != StatusPartial || got.Health.Dropped != 2 || len(got.Health.Errors) < 2 {
-		t.Fatalf("health = %+v; want partial with parse and RSS failures", got.Health)
+	if got.Health.Status != StatusPartial || got.Health.Dropped != 1 || len(got.Health.Errors) < 2 {
+		t.Fatalf("health = %+v; want one dropped process plus the RSS failure", got.Health)
 	}
 }
 
@@ -186,6 +228,66 @@ func TestCollectorResetStartsANewInterval(t *testing.T) {
 	setProcess(files, 1, procFixture{comm: "worker", utime: 25, starttime: 10, rssPages: 1})
 	if got := c.Snapshot().TopCPU[0].DeltaJiffies; got != 5 {
 		t.Fatalf("second interval delta = %d; want 5", got)
+	}
+}
+
+func TestCoordinatedRunUsesOpeningAndClosingBoundaries(t *testing.T) {
+	files := fixtureFS(100, 1, map[int]procFixture{
+		1: {comm: "worker", utime: 10, starttime: 10, rssPages: 1},
+	})
+	now := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
+	c := New(WithFS(files), WithClock(func() time.Time { return now }))
+	if err := c.Reset(); err != nil {
+		t.Fatalf("service-start Reset: %v", err)
+	}
+
+	// The service has already been alive for an hour when ResetNow opens the
+	// benchmark. CaptureBaseline must replace that old baseline.
+	now = now.Add(time.Hour)
+	setSystemStat(files, 150, 1)
+	setProcess(files, 1, procFixture{comm: "worker", utime: 15, starttime: 10, rssPages: 1})
+	base, err := c.CaptureBaseline(context.Background(), "run-1", 1)
+	if err != nil {
+		t.Fatalf("CaptureBaseline: %v", err)
+	}
+	benchmarkStart := now
+
+	// A retried boundary is idempotent and must not silently move the baseline.
+	now = now.Add(time.Second)
+	setSystemStat(files, 180, 1)
+	setProcess(files, 1, procFixture{comm: "worker", utime: 18, starttime: 10, rssPages: 1})
+	replayed, err := c.CaptureBaseline(context.Background(), "run-1", 1)
+	if err != nil || replayed.At != base.At {
+		t.Fatalf("replayed baseline = %+v, %v; want original %+v", replayed, err, base)
+	}
+
+	now = benchmarkStart.Add(time.Minute)
+	setSystemStat(files, 250, 1)
+	setProcess(files, 1, procFixture{comm: "worker", utime: 25, starttime: 10, rssPages: 2})
+	final, err := c.CaptureFinal(context.Background(), "run-1", 1)
+	if err != nil {
+		t.Fatalf("CaptureFinal: %v", err)
+	}
+
+	// Change procfs again after the closing boundary. Collect must return the
+	// frozen minute, not extend the run to report-render time.
+	now = benchmarkStart.Add(10 * time.Minute)
+	setSystemStat(files, 900, 1)
+	setProcess(files, 1, procFixture{comm: "worker", utime: 90, starttime: 10, rssPages: 3})
+	value, err := c.Collect(base.Handle, final.Handle)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	snapshot, ok := value.(Snapshot)
+	if !ok {
+		t.Fatalf("section type = %T, want procstats.Snapshot", value)
+	}
+	if snapshot.StartedAt != benchmarkStart || snapshot.EndedAt != benchmarkStart.Add(time.Minute) {
+		t.Fatalf("proc interval = %s..%s, want benchmark %s..%s",
+			snapshot.StartedAt, snapshot.EndedAt, benchmarkStart, benchmarkStart.Add(time.Minute))
+	}
+	if len(snapshot.TopCPU) != 1 || snapshot.TopCPU[0].DeltaJiffies != 10 {
+		t.Fatalf("frozen process delta = %+v, want 10 benchmark jiffies", snapshot.TopCPU)
 	}
 }
 

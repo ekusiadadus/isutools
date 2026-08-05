@@ -38,10 +38,11 @@ const (
 	maxDetailItems = 6
 )
 
-// concatCaveat records that the analysed input is a concatenation of conf
-// fragments: include relationships are not resolved here, so a disabled file
-// that still ends in .conf may be part of the input.
-const concatCaveat = "解析対象: 連結された nginx conf(include 関係は未解決)"
+// concatCaveat records that static configuration inspection is not proof of
+// nginx's resolved runtime state. The isutools entrypoint expands bounded
+// include graphs before calling the advisor, but it still does not execute
+// nginx -T or inspect a running master process.
+const concatCaveat = "解析対象: 設定text(ISUTOOLS entrypointはinclude解決、nginx -T未確認)"
 
 // nginxBlock is one open block ("server {", "upstream app {") enclosing a
 // directive. Args are needed to attribute upstream servers to their block.
