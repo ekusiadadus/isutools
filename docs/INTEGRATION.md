@@ -101,11 +101,18 @@ SQLite 等も、driver が `database/sql` へ登録する名前を渡せば SQL 
 
 ## 3. HTTP Handler
 
-ルーターの外側を一度だけ包みます。query string は保存せず、数値・UUID のパス要素は
-既定で `*` に正規化されます。
+ルーターの外側を一度だけ包みます。query string は保存せず、数値・UUID・ULID の
+パス要素は既定で `*` に正規化されます。
 
 ```go
 http.ListenAndServe(":8080", isutools.HTTP(router))
+```
+
+ULID 自動正規化がない旧リリースで、同じ route が ID ごとの行へ分裂する場合は、
+更新まで `ISUTOOLS_PATH_RULES` を明示します。各 `regex=replacement` は `;` 区切りです。
+
+```bash
+export ISUTOOLS_PATH_RULES='^/api/app/rides/[0-7][0-9A-HJKMNP-TV-Z]{25}/evaluation$=/api/app/rides/*/evaluation;^/api/chair/rides/[0-7][0-9A-HJKMNP-TV-Z]{25}/status$=/api/chair/rides/*/status'
 ```
 
 WebSocket は handshake が実際に 101 / Hijack へ成功した時だけ、SSE は
