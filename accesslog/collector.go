@@ -126,6 +126,10 @@ type Collector struct {
 	dropping bool
 	closed   bool
 	health   Health
+	// pendingBoundaries counts freeze points that have been fixed and not yet
+	// sealed by a drain. GenerationCollector maintains it; Peek reads it to
+	// find out whether refreshing the aggregate would cross one.
+	pendingBoundaries int
 }
 
 // New creates a collector and sets its generation baseline to the current EOF.
@@ -161,6 +165,13 @@ func (c *Collector) CollectContext(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.collectLocked(ctx)
+}
+
+// collectLocked is CollectContext's body, split out so a caller that has
+// already decided something under the collector's lock — Peek's freeze-point
+// test — can read without dropping it in between.
+func (c *Collector) collectLocked(ctx context.Context) error {
 	remaining := c.maxCollectBytes
 	if c.closed {
 		return errors.New("accesslog: collector is closed")
@@ -276,14 +287,41 @@ func (c *Collector) CollectUntilStable(ctx context.Context, quietFor, pollEvery 
 
 // Snapshot collects available lines and returns an immutable aggregate copy.
 // Any collection error is represented in the embedded Health value.
+//
+// It reads the log to end of file, so it must not be called between a
+// generation boundary and that generation's drain: the bytes it would pull in
+// belong to the generation after the boundary, and the drain would seal them
+// into the one it is cutting. A reader that only wants to display what has
+// already been consumed must use Peek instead. See GenerationCollector.
 func (c *Collector) Snapshot() Snapshot {
 	_ = c.Collect()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	snapshot := c.agg.Snapshot()
-	c.health.Offset = c.offset
-	snapshot.Health = c.health
-	return snapshot
+	return c.snapshotLocked()
+}
+
+// Peek returns an immutable copy of the current generation's aggregate for a
+// reader that only wants to display it.
+//
+// It is Snapshot without the one thing a display read must never do: while a
+// generation's freeze point is fixed and not yet drained, Peek does not read
+// the log at all. Reading there would carry the offset past the freeze point,
+// and the drain that follows would seal the bytes beyond it — traffic the
+// boundary was placed to exclude — into the generation it is cutting. With no
+// boundary outstanding there is nothing to cross, so Peek refreshes first and
+// the report stays live.
+//
+// The test and the read happen under one hold of the collector's lock, so a
+// boundary racing a peek either wins, and the peek reads nothing, or loses,
+// and the freeze point it records already accounts for the bytes just read.
+func (c *Collector) Peek() Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pendingBoundaries == 0 {
+		// Collection failures are reported through Health like Snapshot's.
+		_ = c.collectLocked(context.Background())
+	}
+	return c.snapshotLocked()
 }
 
 // Reset clears aggregates and baselines the next generation at current EOF.

@@ -40,3 +40,27 @@ jobs:
       # the target host before tagging a release (DESIGN.md §7).
       - name: benchmarks (informational)
         run: go test -run '^$' -bench . -benchmem ./internal/agg/
+
+  mysql-integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - name: sqlrows self-contamination
+        env:
+          ISUTOOLS_INTEGRATION_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/?parseTime=true
+        run: go test -tags=integration -count=1 ./sqlrows -run '^TestNoSelfContamination'

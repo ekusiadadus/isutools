@@ -311,7 +311,8 @@ func appendIssue(rec *Record, issue string) {
 }
 
 func parseUpstream(raw string) (total time.Duration, attempts int, complete, noTiming bool, err error) {
-	if strings.TrimSpace(raw) == "-" {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "-" {
 		return 0, 0, false, true, nil
 	}
 	complete = true

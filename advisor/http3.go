@@ -405,8 +405,8 @@ func WithProtocolTrafficEvidence(checks []Check, source string, clientFacing boo
 	parts := make([]string, 0, len(totals))
 	for _, protocol := range order {
 		if sample, ok := totals[protocol]; ok {
-			parts = append(parts, fmt.Sprintf("%s=%d(5xx %.2f%%, p95<=%s)", protocol, sample.Count,
-				percent(sample.Errors, sample.Count), sample.P95))
+			parts = append(parts, fmt.Sprintf("%s=%d(5xx %s, p95<=%s)", protocol, sample.Count,
+				formatErrorRate(sample.Errors, sample.Count), sample.P95))
 		}
 	}
 	c.Detail = strings.Join(parts, " / ")
@@ -478,6 +478,24 @@ func percent(n, total int64) float64 {
 		return 0
 	}
 	return float64(n) * 100 / float64(total)
+}
+
+// formatErrorRate keeps rare real errors visible. The numerator is always
+// present, while the percentage uses extra precision below 0.01% and a bound
+// when even four decimals would round a non-zero value back to zero.
+func formatErrorRate(errors, total int64) string {
+	if errors <= 0 || total <= 0 {
+		return fmt.Sprintf("%d/%d, 0%%", errors, total)
+	}
+	rate := percent(errors, total)
+	switch {
+	case rate < 0.0001:
+		return fmt.Sprintf("%d/%d, <0.0001%%", errors, total)
+	case rate < 0.01:
+		return fmt.Sprintf("%d/%d, %.4f%%", errors, total, rate)
+	default:
+		return fmt.Sprintf("%d/%d, %.2f%%", errors, total, rate)
+	}
 }
 
 func sortChecks(checks []Check) []Check {

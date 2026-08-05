@@ -1,0 +1,495 @@
+# isutools
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/ekusiadadus/isutools.svg)](https://pkg.go.dev/github.com/ekusiadadus/isutools)
+[![CI](https://github.com/ekusiadadus/isutools/actions/workflows/ci.yml/badge.svg)](https://github.com/ekusiadadus/isutools/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+
+**English** | [日本語](./README.md)
+
+All-in-one profiling module for ISUCON-style tuning. With a **one-line change**
+to your app it measures SQL / HTTP / nginx access logs / processes & CPU /
+DB schema / pprof, and lets you review every run through a **pre-sorted
+dashboard** and **self-contained snapshots**. Includes a reproducible ABBA
+overhead gate. v1.2 adds **SQL row efficiency (examined/sent), query plans,
+DB pool statistics, host resources, and network counters** — all inside the
+same run boundary.
+
+Per-benchmark run history is listed with score and git revision; clicking a
+row opens every measurement captured during that run:
+
+![isutools dashboard: per-benchmark run history with scores and git revisions](docs/images/dashboard-runs.png)
+
+- Integration details: **[DB, nginx/Apache, pprof, prerequisites](./docs/INTEGRATION.md)** (in Japanese)
+- Design doc: [DESIGN.md](./DESIGN.md) / Implementation status: [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md) (in Japanese)
+- License: MIT / Runtime: Go 1.24+
+- Track record (dogfooding): tuned private-isu for one day using only this
+  module's measurements — **score 0 → 541,650** (0 fails).
+  [Full write-up on the blog (Japanese)](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
+
+## Quick Start
+
+```go
+import "github.com/ekusiadadus/isutools"
+
+db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // just rewrite your existing sqlx.Open
+
+// To measure HTTP as well, wrap your existing handler once
+http.ListenAndServe(":8080", isutools.HTTP(handler))
+```
+
+Register the underlying driver with `database/sql` (e.g. via a blank import)
+before this call. MySQL / MariaDB / PostgreSQL (via database/sql) all use the
+same one line. On successful registration the admin server starts once on
+`127.0.0.1:19191`. If registration fails, `SQLDriverName` **fails open** to
+the raw driver name, and any missing data is always recorded in
+`meta.partial` / `meta.health` (it never breaks your app's startup).
+For per-driver imports, DSNs, and pgxpool constraints, see
+[Integration Guide §2](./docs/INTEGRATION.md#2-db-ドライバへの接続).
+
+## Go API (optional add-ons)
+
+The one-line integration is unchanged. Everything below is **opt-in**: if you
+never call it, nothing changes.
+
+```go
+// (1) Make initialize the start of the measured interval
+func postInitialize(w http.ResponseWriter, r *http.Request) {
+	err := isutools.SerializeInitialize(r.Context(), func(ctx context.Context) error {
+		if err := rebuildDB(ctx); err != nil {
+			return err
+		}
+		// ★ Call this BEFORE writing the initialize response. The benchmarker
+		//    starts loading the moment it sees the response, so a boundary
+		//    taken afterwards silently drops the opening seconds of the run.
+		run, err := isutools.ResetNow(ctx)
+		if err != nil || run.Validity == isutools.ValidityInvalid {
+			return fmt.Errorf("isutools: this run is not measurable: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		// If the measurement is required, fail the handler. An
+		// authoritative-looking wrong number is worse than a missing one.
+		http.Error(w, "initialize failed", http.StatusInternalServerError)
+		return
+	}
+	writeInitializeResponse(w) // only now write the response
+}
+
+// (2) Declare the database under a stable ID, then attach the pool and the
+//     EXPLAIN credential. Purpose lives in
+//     "github.com/ekusiadadus/isutools/sqlstats".
+isutools.RegisterDBTarget("app", "mysql", dsn) // call before sqlx.Open
+db, _ := sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
+isutools.WatchDBPool("app", db.DB)             // joins the NEXT run
+isutools.RegisterDBInspector("app", sqlstats.PurposeExplain, "mysql", explainDSN)
+```
+
+| Function | Signature and key points |
+|---|---|
+| `ResetNow` | `func ResetNow(ctx context.Context) (StartResult, error)`. Opens a new run immediately, preempting one already in flight so the last initialize deterministically wins. With `ISUTOOLS=off` it returns a zero `StartResult` and no error, so no branching is needed |
+| `ResetNowWithNonce` | `func ResetNowWithNonce(ctx context.Context, nonce string) (StartResult, error)`. Repeating a call with the same nonce replays the original `StartResult` instead of opening a second run, which makes a retried initialize safe |
+| `SerializeInitialize` | `func SerializeInitialize(ctx context.Context, fn func(context.Context) error) error`. Wrap the whole initialize body (schema rebuild + the `ResetNow` call). **Process-local only**; waiting is abandoned after 30s with `ErrInitializeBusy`. It keeps working with `ISUTOOLS=off` |
+| `RegisterDBTarget` | `func RegisterDBTarget(id, driverName, dsn string) error`. Names a logical database with a human-chosen, stable ID. Call it **before opening the DB**: once the proxy driver has observed the DSN it is auto-registered under a derived `name-hash` ID, and the explicit call then fails with `ErrDuplicateTarget` |
+| `RegisterDBInspector` | `func RegisterDBInspector(targetID string, purpose sqlstats.Purpose, driverName, dsn string) error`. Attaches a second credential to an existing target: `PurposeStats` (SHOW STATUS / performance_schema) or `PurposeExplain` (least-privilege EXPLAIN user). `PurposeExplain` **never falls back** to the application credential. The DSN must be in go-sql-driver/mysql form |
+| `WatchDBPool` / `UnwatchDBPool` | `func WatchDBPool(targetID string, db *sql.DB) error`. Reports the pool of an already registered TargetID, matched byte for byte. It never creates a target — an unknown ID returns `ErrUnknownTarget`, a nil handle `ErrNilDB`. Get the ID from `RegisterDBTarget` or `sqlstats.TargetIDForDSN`. The argument checks run even under `ISUTOOLS=off` / `ISUTOOLS_DBPOOL=off`, so a wiring bug surfaces in the configuration you ship rather than only in the one you benchmark |
+
+`ResetNow` only fixes the boundary; it cannot stop a second initialize from
+rebuilding the database into a run that already started. That is what
+`SerializeInitialize` is for. An initialize run opened outside the guard is
+recorded in health as `initialize-unserialized` (degraded).
+
+`ResetNowOpts` is exported too, but its options type lives in `internal/runctl`,
+which an application **cannot import — so the function cannot actually be
+called** from outside this module. (The returned `StartResult` / `Validity` are
+type aliases, which is why those *can* be named.) `ResetNow` and
+`ResetNowWithNonce` are the two an initialize handler needs.
+
+## Endpoints (admin server)
+
+| Route | Description |
+|---|---|
+| `GET /` | **Run list** (JST timestamp, gen, rev, score). Click a row for details |
+| `GET /<run-id>` | Details of a saved run (high-precision IDs with collision protection, alongside legacy second-precision IDs) |
+| `GET /live` | Live report of the current measurement (pre-sorted by total time, descending) |
+| `GET /snapshot.html` | Download a self-contained HTML snapshot (double-click to view locally) |
+| `GET /json` | Machine-readable snapshot (includes `prev` = previous generation) |
+| `GET /pprof/` | net/http/pprof (profiles of the app process) |
+| `GET /diff?a=<id>&b=<id>` | **Diff between two runs** (total/count/avg; rows with differing counts are not declared improvements) |
+| `POST /reset` | Reset the generation and open a run (call before a bench run). Also starts automatic CPU profiling |
+| `POST /collect` | Wait for and collect buffered nginx logs with a deadline |
+| `POST /finish` | Pin the end boundary of the current run and return `202` + boundary JSON without waiting for drain |
+| `POST /abort` | Abort the current run with an epoch fence (`204`, idempotent, no snapshot is created) |
+| `POST /save?score=N` | Pin the end boundary, wait for the immutable snapshot, and persist it as html+json staging with caps (the HTML appears in the list only after the JSON is published) |
+| `GET /files/<name>` | Fetch saved html / json / pprof files |
+
+`/reset`, `/finish`, `/abort` and `/save` return the ID of the run they opened
+or closed in the `X-Isutools-Run-Id` header. Log it from your bench script and
+you can match a run to the benchmark that produced it afterwards.
+
+## What's in the report
+
+- **meta**: time (**always JST**), git rev (+dirty), build source / provenance
+  verdict, generation number, score,
+  **host info (CPU model / core count / memory GB / OS)**
+- **Collector Health**: per-collector status and missing-data (`partial`) warnings
+- **DB Schema**: tables, row counts, and **index list** as of generation start
+  (evidence of "what indexes existed before the run")
+- **SQL**: per normalized query — total/count/errors/avg/p95/max (string and
+  numeric literals masked as `?`)
+- **SQL row efficiency**: per-digest rows examined / rows sent — "how many rows
+  did you read to return one", i.e. a measurement of whether your indexes work
+  (needs MySQL's performance_schema)
+- **Query Plans**: EXPLAIN output for the top digests — "why is the row
+  efficiency what it is", via type=ALL / Using filesort / Using temporary
+  (off by default)
+- **DB Pool**: `database/sql` pool statistics — tells "the database is slow"
+  apart from "requests are queueing on the pool limit", via waits and average
+  wait
+- **Host**: memory / disk IO / PSI / cgroup limits plus host identity — "did
+  the machine still have resources left" (Linux only)
+- **Network**: TCP socket summary and per-NIC throughput, errors, drops and MTU
+  — "did you saturate the NIC, or was it idle" (Linux only)
+- **Profiles**: mutex / block / heap profiles captured at both ends of a run,
+  with the `go tool pprof -diff_base` command to read them (off by default)
+- **HTTP**: per-request latency and byte counts as seen by the app
+- **Proxy Access Log**: nginx/Caddy/explicit JSON (separate reqtime/upstime,
+  bytes, cache, 304, etc.)
+- **Processes**: per-process CPU/RSS during the bench window (top-compatible,
+  1 core = 100%) plus **CPU total: N% busy (user/sys/iowait/idle)** — see at a
+  glance whether you are actually saturating the hardware
+- **User Flow**: top 20 page transitions per session (from the `sess:` field
+  in the proxy log — a measured view of how users actually navigate the app;
+  also useful for validating k6 scenarios)
+- **Scenario Stories**: aggregates the request sequence of each safe
+  `scenario` label + pseudo `sess` into top user stories per scenario
+  (a minimal foundation for GA4-style flows)
+- **Counters**: in-app counters via `isutools.Count("cache_hit")` (reset per
+  generation)
+- **Advisor**: flags unconfigured ISUCON staples, plus HTTP/3/QUIC migration
+  readiness (server/TLS/Alt-Svc/fallback/UDP/edge/measured protocol/
+  retransmission & drop evidence), cache strategy (`nginx-proxy-cache` /
+  `nginx-proxy-cache-lock` / `nginx-proxy-cache-set-cookie` /
+  `cache-app-telemetry`), ECH readiness (`ech-config` / `ech-key-rotation` /
+  `ech-logging`), same-host upstreams that could move to a
+  UNIX domain socket (`nginx-upstream-uds`), listen backlog against
+  `somaxconn` (`nginx-listen-backlog`), whether the binary was built with Go
+  PGO (`go-pgo`), and the query-plan findings `plan-full-scan` /
+  `plan-filesort` / `plan-temporary`. The three v1.2 transport checks report
+  opportunities rather than defects, so they only ever emit ok / info / skip
+  and **never warn**; the `plan-*` three do warn, because a measured execution
+  plan is evidence
+- **Snapshots / CPU Profiles**: list of past runs and profiles (selectable
+  from the dashboard; each row links to a diff against the previous run)
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ISUTOOLS` | (on) | `off` disables everything (returns the raw driver name; zero extra work on the query path) |
+| `ISUTOOLS_ADDR` | `127.0.0.1:19191` | Admin server bind. `off` disables only the admin server (SQL aggregation continues) |
+| `ISUTOOLS_ALLOW_UNAUTHENTICATED` | — | `1` explicitly allows a non-loopback bind. **Only for Docker setups with an SSH tunnel + publish restricted to `127.0.0.1`** (shows a security warning, kept separate from measurement `partial`) |
+| `ISUTOOLS_DATA_DIR` | — | Where snapshots / profiles are persisted (the backing store of the run list) |
+| `ISUTOOLS_ACCESS_LOG` | — | Path to the nginx/Caddy/Apache/Envoy log. **LTSV / JSON lines auto-detected** (see the integration guide for supported formats) |
+| `ISUTOOLS_NGINX_LOG` | — | Legacy name; used as a fallback only when `ACCESS_LOG` is unset |
+| `ISUTOOLS_PPROF_SECONDS` | 0 | Automatically capture an N-second CPU profile after reset (covers the entire bench window) |
+| `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Inject rev info when a Docker build lacks embedded VCS information |
+| `ISUTOOLS_PATH_RULES` | — | HTTP path normalization rules (`regex=replacement;...`, each pair split at the last `=`) |
+| `ISUTOOLS_NGINX_CONF` | — | nginx conf inspected by the advisor (file or directory) |
+| `ISUTOOLS_PROXY_CONF` / `_KIND` | — / auto | nginx/Caddy/Envoy config read by the HTTP/3 advisor. Prefer the generic name; kind is `nginx` / `caddy` / `envoy` |
+| `ISUTOOLS_HTTP3_UDP443` | — | State the result measured from an external client as `reachable` / `blocked`; firewall/NAT is never guessed from inside the process |
+| `ISUTOOLS_HTTP3_EDGE` / `_EDGE_ENABLED` | — | Explicit evidence of the LB/CDN name and whether HTTP/3 is enabled at that edge (`true` / `false`) |
+| `ISUTOOLS_HTTP3_QUIC_METRICS` | — | Proxy QUIC counter JSON reloaded at snapshot time. Diagnoses retransmission rate and UDP drops |
+| `ISUTOOLS_CACHE_METRICS` | — | App-side cache counter JSON (`hits` / `misses` / `evictions`) reloaded at snapshot time. Diagnoses hit rate and pre-expiry evictions |
+
+### Collector flags (all default on)
+
+Setting one to `off` means the collector is **not registered at all**: it
+issues no statement and consumes no phase budget. The flags exist so a run can
+be measured with one collector removed, which is what makes a single-feature
+overhead comparison (ABBA) possible — they are not a way to turn features off.
+
+The values read as false are `off` / `0` / `false` / `no` / `disabled`
+(surrounding space and case are ignored); anything else counts as on.
+**`ISUTOOLS_HOSTSTATS` is the one exception: it does not accept `disabled`**
+(only `off` / `0` / `false` / `no`), so `ISUTOOLS_HOSTSTATS=disabled` leaves
+host collection on.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ISUTOOLS_HOSTSTATS` | on | Host section (memory / disk / PSI / cgroup / identity). Off Linux — and anywhere `/proc/meminfo` cannot be read — construction returns `ErrUnsupportedOS` and the collector is not registered |
+| `ISUTOOLS_NETSTATS` | on | Network section (collector name `network`). Not registered off Linux, where there is no `/proc/net` |
+| `ISUTOOLS_SQLROWS` | on | SQL row-efficiency section. Produces numbers only on MySQL with performance_schema enabled |
+| `ISUTOOLS_DBPOOL` | on | DB Pool section. With no `WatchDBPool` call the section simply does not appear |
+
+### Runtime profiles (all default off)
+
+Captured at both ends of a run; only the difference is meaningful. A profile
+rate is a process-wide runtime setting, so **an unset variable never reaches a
+runtime setter** — a rate the application configured for itself is left alone.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ISUTOOLS_MUTEX_FRACTION` | (unset = left untouched) | Non-negative integer passed to `runtime.SetMutexProfileFraction`. A mutex profile is captured only while the effective fraction is greater than 0 |
+| `ISUTOOLS_BLOCK_RATE_NS` | (unset = left untouched) | Non-negative integer (nanoseconds) passed to `runtime.SetBlockProfileRate`. A block profile is captured only when this variable sets a rate above 0 |
+| `ISUTOOLS_HEAP_PROFILE` | off | `1` / `true` / `on` / `yes` captures a heap profile |
+
+An unparseable value is ignored (fail-open) and recorded under the `profile`
+health key as `ignored invalid values: ...`. Artifacts are written to
+`ISUTOOLS_DATA_DIR`, and the Profiles section prints the matching
+`go tool pprof -diff_base` command.
+
+### EXPLAIN (default off)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ISUTOOLS_EXPLAIN` | off | `1` / `on` / `true` / `yes` / `enabled` enables EXPLAIN capture; anything else is off. It is opt-in because it adds statements to the database being measured |
+| `ISUTOOLS_EXPLAIN_TOP` | 10 | Selection ceiling of SELECT digests per target. An unparseable or non-positive value falls back to 10; a value above 200 is clamped to 200 |
+| `ISUTOOLS_EXPLAIN_DSN` | — | DSN of the EXPLAIN credential (go-sql-driver/mysql form). Valid **only when exactly one target is registered** — with two there is no way to tell which database it belongs to, so it is refused and recorded in health. Use `RegisterDBInspector(id, PurposeExplain, ...)` per target instead |
+| `ISUTOOLS_EXPLAIN_DRIVER` | `mysql` | Driver the DSN above is opened with |
+
+### Host measurement helpers
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ISUTOOLS_ROLE` | — | Free-text role label for this agent (`app` / `db` / `proxy`, …). Displayed only; nothing branches on it |
+| `ISUTOOLS_CGROUP_SCOPE` | (auto) | Setting it to `host` declares that this agent lives in the initial cgroup namespace. It is never inferred — inside a cgroup namespace no in-process check can tell the two cases apart. Otherwise the scope is `visible-root` or `agent-cgroup`, whichever the visible tree shows |
+| `ISUTOOLS_CGROUP_PATH` | — | The cgroup to read, relative to the cgroup2 mount root (the agent and mysqld often live in different cgroups). An absolute path, a `..`, a symlink escaping the mount, or an unreadable path **fails closed**: cgroup reporting is skipped entirely and the rejection code is recorded in health |
+
+## Additional libraries and prerequisites
+
+pprof is part of the Go standard library, so the instrumented app needs no
+extra package. Automatic CPU profiling needs a writable `ISUTOOLS_DATA_DIR`,
+and `go tool pprof` only at analysis time. procstats also adds no package but
+requires Linux `/proc` and PID-namespace permissions. k6, curl, jq, and
+Graphviz are external commands for specific workflows, not runtime libraries
+of isutools. For the per-feature required/optional matrix, see
+[Integration Guide §1](./docs/INTEGRATION.md#1-必須任意の全体像).
+
+## SQL row efficiency (examined/sent)
+
+`performance_schema.events_statements_summary_by_digest` is read at both ends
+of a run, and the difference gives **rows examined / rows sent** per digest:
+how many rows the server read to return one. The **ISUCON13 winning team's
+working target is 5x or less**, and the dashboard highlights rows above that
+ratio as well as rows that hit no-index / tmp disk table / sort merge.
+
+The ratio is computed **only for SELECT digests that sent at least one row**;
+**DML and `rows_sent = 0` show `N/A`** rather than a number, because the
+alternative is dividing by zero or inventing the worst possible score for a
+query that simply found nothing. DML rows are read through the affected column
+instead.
+
+Requirements and limits:
+
+- MySQL with **performance_schema enabled**. A target without it produces no
+  numbers and reports a skip reason instead — having nothing to measure is not
+  treated as a failure, and sqlrows is not a required collector, so a target
+  that genuinely failed degrades the run to partial rather than invalidating
+  it.
+- The sampling connection deliberately has no default database, and the
+  collector **verifies** through `performance_schema.threads` that its own
+  statements cannot land in the application's numbers. A target where that
+  cannot be verified is skipped rather than measured with contaminated data.
+- If `performance_schema_digests_size` is too small, the digest table overflows
+  and a warning says that this target's aggregation is not complete.
+
+## Query Plans (EXPLAIN, off by default)
+
+With `ISUTOOLS_EXPLAIN=1`, EXPLAIN runs **once per run**, in the enrich phase
+after the benchmark, against the top digests. Opening the dashboard never
+re-runs it. Rows with type=ALL, Using filesort or Using temporary are
+highlighted, and they feed the advisor's `plan-full-scan` / `plan-filesort` /
+`plan-temporary` checks.
+
+- The statement text comes from MySQL's `QUERY_SAMPLE_TEXT`, so this is
+  **MySQL 8.0.17 or newer only**. Older MySQL and MariaDB have no such column
+  and are skipped as `explain-unsupported`.
+- A **dedicated least-privilege EXPLAIN user is required** (`PurposeExplain`).
+  It never falls back to the application credential, because EXPLAIN SELECT can
+  still have side effects through a stored function. Privileges are verified on
+  the very connection the EXPLAIN runs on — roles are neutralised and expanded
+  — and anything outside the allowlist (SELECT on the measured schema and on
+  performance_schema, and little else) causes a skip.
+- Statement text carrying literals never leaves the callback that read it. What
+  reaches a snapshot is the normalized DIGEST_TEXT plus, on failure, a closed
+  classification and the driver's numeric error code.
+
+## Host / Network / DB Pool
+
+- **Host** (`hoststats`) and **Network** (`netstats`) read procfs, sysfs and
+  cgroup v2, so they are **registered on Linux only**. Elsewhere they appear as
+  disabled in collector health.
+- Host always states which cgroup it read (scope) and the host identity
+  (hostname, hashed machine-id / boot-id, namespace IDs). Inside a container
+  the same files describe a namespace rather than the machine, so a number
+  without its scope cannot be read.
+- Network is **display-only**: no value feeds an advisor threshold. Interval
+  averages cannot see instantaneous saturation, and `/proc/net/sockstat` cannot
+  tell an inbound TIME_WAIT socket from an outbound one.
+- DB Pool has no thresholds either, for now. `wait total` is the sum of every
+  waiting goroutine's wait, so it can exceed the length of the run; compare
+  using the **average wait** (wait_duration ÷ waits). A non-zero wait count
+  means that wait was decided by the pool limit, not by the database.
+
+## nginx configuration (access-log collection)
+
+The LTSV format in
+[examples/nginx-isutools.conf](./examples/nginx-isutools.conf) is recommended.
+Do URI grouping with an nginx `map` and keep both the aggregation key as
+`uri:$uri_group` and the raw path as `rawuri:$uri` (the parser ignores unknown
+keys). JSON format (`log_format ... escape=json '{...}'`) works as-is with the
+same key names, or with **alp's default keys (`body_bytes` /
+`response_time`)**. JSON is not required: a line starting with `{` is parsed
+as JSON, anything else as LTSV. The standard combined log is never guessed.
+Apache needs explicit JSON and `%D` microsecond conversion, so example
+configs, permissions, Docker volumes, and how to build a safe `sess` are
+collected in
+[Integration Guide §4–5](./docs/INTEGRATION.md#4-nginx-アクセスログ).
+
+## HTTP/3 / QUIC migration advisor
+
+The advisor inspects nginx/Caddy/Envoy configs, local Linux UDP/443
+listeners, and per-`proto` counts, 5xx, and p95 in the proxy access log.
+When a reverse proxy terminates TLS, the app's `r.Proto` does not represent
+the client protocol, so the client-facing protocol from `ISUTOOLS_ACCESS_LOG`
+takes precedence. With an external LB/CDN terminating, however, even the
+origin log is not client-facing, so edge analytics or measurements from an
+external client are required.
+LB/CDN, external firewall/NAT, and QUIC retransmission counters are never
+auto-guessed; without explicit evidence the check reports `skip`. For example
+configs, judgment limits, Caddy native JSON, and Envoy telemetry, see
+[Integration Guide §6](./docs/INTEGRATION.md#6-http3--quic-readiness-advisor).
+
+This feature diagnoses migration readiness; isutools itself does not become
+an HTTP/3 server. It adds no runtime dependency such as `quic-go`, and
+connection testing with a real listener and external clients remains a
+separate task.
+
+## Benchmark script template
+
+```bash
+ADMIN=http://localhost:19191
+curl -X POST $ADMIN/reset                  # start a generation (auto CPU profiling begins)
+<run your benchmark>
+curl -X POST "$ADMIN/save?score=$score"    # persist → adds one row to the dashboard
+curl $ADMIN/json | jq '.sql[:5]'           # check the top 5 on the spot
+```
+
+Use `POST /finish` to pin the end boundary immediately without saving, and
+`POST /abort` to discard the measurement so the next run can start.
+`POST /collect` only flushes the access log; it does not end the run.
+
+## Screenshots
+
+**Advisor** — automatically detects "ISUCON staples that are not configured"
+(prepared statements, gzip, buffer pool, kernel parameters, GOMAXPROCS).
+A checklist that flips to ok as you fix each item:
+
+![isutools advisor: detects unconfigured ISUCON-critical settings](docs/images/report-advisor.png)
+
+**Diff view** — shows per-query / per-path total-time deltas between two
+runs. See at a glance whether you actually improved or the bottleneck merely
+moved:
+
+![isutools diff view: per-query total-time deltas between two runs](docs/images/diff-view.png)
+
+## Security model (summary)
+
+Viewing is designed around an **SSH tunnel**; there is no application-level
+token mechanism. Loopback binds work out of the box. Non-loopback binds are
+allowed only with an explicit `ALLOW_UNAUTHENTICATED=1` and reachability
+restricted via Docker publish, firewall, and SSH. Without the opt-in,
+non-loopback fails closed. The full contract and rationale are in DESIGN.md
+chapter 4. When mounting `isutools.Handler()` on your own router, access
+control is the caller's responsibility.
+
+## Scenario load testing with k6
+
+Load generation uses [k6](https://k6.io) as-is (nothing is reimplemented).
+[examples/k6-private-isu.js](./examples/k6-private-isu.js) contains an
+example scenario: login → timeline → post detail → author page.
+`POST /reset` → run k6 → `POST /save` lines up the scenario's SQL / HTTP /
+User Flow, as seen from the server, on the dashboard.
+The bundled example sends `X-Isutools-Session: k6-vu-N-iter-M` instead of a
+raw cookie, and the nginx example records only that non-secret ID as `sess:`.
+Additionally, recording `X-Isutools-Scenario: login_and_browse` as
+`scenario:` makes the number of pseudo-sessions following the same request
+sequence and the top journeys appear in Scenario Stories. Never put raw
+cookies, bearer tokens, emails, etc. into `sess` / `scenario`. These are
+spoofable measurement labels and must not be used for authentication or
+authorization. For real-user measurement, strip the external headers and
+overwrite the pseudo-ID at a trusted app/proxy. Details in
+[Integration Guide §4](./docs/INTEGRATION.md#scenario-stories最小のファネルフロー基盤).
+
+## Overhead validation (ABBA)
+
+[examples/abba.sh](./examples/abba.sh) runs blocks of four consecutive
+benches (off → on → on → off) at least three times. It records the identical
+binary/image fingerprint, a fixed warm-up, score, p95, error rate, and a
+paired 95% CI into TSV plus provenance, and gates on the CI upper bound. The
+required BENCH output format is documented at the top of the script and in
+[Integration Guide §7](./docs/INTEGRATION.md#7-pprofprocstats負荷生成ツール).
+
+**For v1.2.0 this gate is still pending.** The observation recorded in the
+[implementation status](./docs/IMPLEMENTATION_STATUS.md) — 2 blocks, 8 runs on
+private-isu — is off avg 556,196 / on avg 546,150, i.e. a **1.81% score cost**,
+measurably heavier than v1.0.0's −0.58%. And because `abba.sh` requires at
+least 3 blocks to form a confidence interval and exits 2 below that
+(`ABBA_BLOCKS must be >= 3 for a confidence interval`), that 1.81% is a point
+estimate with no interval attached. Four new collectors make an increase
+unsurprising, but it leaves very little room under the 2% ceiling in
+DESIGN.md §7.
+
+## v1.2 status
+
+Implemented: **run lifecycle** (`internal/runctl` — Start / Finish / Abort /
+Ack, epoch fencing, per-phase time budgets) / **DB target registry** (stable
+TargetIDs and the purposes `app` / `stats` / `explain`, with
+`RegisterDBTarget` / `RegisterDBInspector` / `Inspect` / `Targets` /
+`TargetIDForDSN`) / **SQL row efficiency** (performance_schema examined vs
+sent) / **hoststats** (memory / disk / PSI / cgroup / host identity, Linux
+only) / **netstats** (TCP summary, NIC throughput, MTU; collector name
+`network`, Linux only) / **dbpool** (`database/sql` pool statistics via
+`WatchDBPool`) / **queryplan** (EXPLAIN over `QUERY_SAMPLE_TEXT`, MySQL 8.0.17+,
+off by default) / **new advisor checks** (`nginx-upstream-uds`,
+`nginx-listen-backlog`, `go-pgo`, `plan-full-scan`, `plan-filesort`,
+`plan-temporary`) / **new dashboard sections** (SQL row efficiency, Host,
+Network, DB Pool, Query Plans, Profiles) / **Go API** (`ResetNow`,
+`ResetNowWithNonce`, `SerializeInitialize`, runtime profile pairs at both ends
+of a run).
+
+**Multi-host measurement (the peer protocol) is NOT implemented — it exists
+only as a plan** ([plans/10-multi-host.md](./plans/10-multi-host.md)).
+This release measures **a single host**. No code reads the planned
+`ISUTOOLS_PEER` / `ISUTOOLS_PEER_TOKEN` / `ISUTOOLS_AGENT_TARGETS_FILE`
+variables. For a multi-server setup, run isutools separately on each host and
+open one dashboard per host. `SerializeInitialize` is likewise process-local
+and cannot serialize an initialize across hosts.
+
+Other known limits: hoststats and netstats are Linux-only; SQL row efficiency
+needs MySQL's performance_schema; EXPLAIN needs MySQL 8.0.17+ plus a dedicated
+least-privilege credential and is off by default; the runtime profiles (mutex /
+block / heap) are off by default too.
+
+## v1.0 status
+
+Implemented: SQL (MySQL/MariaDB/PostgreSQL) / HTTP (h1/h2) / nginx logs
+(LTSV+JSON, rotation-following) / procstats + **CPU total** / dbinspect
+(MySQL) / pprof (endpoint + automatic capture) / snapshot-first dashboard
+(run list, timestamp-ID details, live) / fixed JST / score recording /
+collector health / generation management.
+
+v1.0's path normalization, diffs, counters, WebSocket/SSE separation, User
+Flow, and resource caps are implemented. A guessing parser for Apache
+combined logs, a gqlgen operation adapter, and HTTP/3 real-listener
+integration tests are explicit non-goals for 1.x. For the current local
+verification scope and the exact state including evidence added after the
+release tag, see the
+[implementation status](./docs/IMPLEMENTATION_STATUS.md).
+
+---
+
+"ISUCON" is a trademark or registered trademark of SAKURA internet Inc.
+This project is an unofficial tool unaffiliated with the operators of
+[isucon.net](https://isucon.net/).

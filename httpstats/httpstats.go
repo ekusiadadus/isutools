@@ -3,9 +3,7 @@
 package httpstats
 
 import (
-	"bufio"
 	"fmt"
-	"io"
 	"math/bits"
 	"net"
 	"net/http"
@@ -122,21 +120,21 @@ type table struct {
 	shards  [numShards]shard
 }
 
-type generation struct {
-	table    *table
-	inFlight int
-}
-
 // Collector owns HTTP measurements and generation boundaries. Reset swaps in
 // a fresh table and waits for requests already in flight, then returns their
-// completed generation.
+// completed generation; the same mechanism backs the runctl.GenerationCollector
+// implementation in generation.go.
+//
+// Lock order: mu may be held while acquiring connMu, never the reverse.
 type Collector struct {
 	mu      sync.Mutex
 	resetMu sync.Mutex
-	changed *sync.Cond
 	current *generation
 	maxKeys int
 	rules   []Rule
+
+	// gens is the boundary bookkeeping, guarded by mu.
+	gens generationState
 
 	connMu      sync.Mutex
 	connTotal   int64
@@ -162,9 +160,8 @@ func New(opts ...Option) *Collector {
 	c := &Collector{
 		maxKeys: cfg.maxKeys,
 		rules:   cfg.rules,
-		current: &generation{table: newTable(cfg.maxKeys)},
 	}
-	c.changed = sync.NewCond(&c.mu)
+	c.current = c.newGeneration()
 	return c
 }
 
@@ -271,6 +268,24 @@ func (c *Collector) Snapshot() Snapshot {
 func (c *Collector) Connections() ConnSnapshot {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
+	return c.connectionsLocked()
+}
+
+// takeConn returns the connection stats of the window that is closing and
+// clears the counters. Active is carried over because those connections are
+// still open and will be counted again when they close.
+func (c *Collector) takeConn() ConnSnapshot {
+	c.connMu.Lock()
+	snap := c.connectionsLocked()
+	c.connTotal, c.connDurSum, c.connDurMax = 0, 0, 0
+	c.connRead, c.connWrote = 0, 0
+	c.connBuckets = [64]int64{}
+	c.connMu.Unlock()
+	return snap
+}
+
+// connectionsLocked builds the connection summary. Callers hold connMu.
+func (c *Collector) connectionsLocked() ConnSnapshot {
 	snap := ConnSnapshot{
 		Total: c.connTotal, Active: c.connActive,
 		BytesRead: c.connRead, BytesWritten: c.connWrote,
@@ -323,54 +338,6 @@ func (c *Collector) connFinish(d time.Duration, bytesRead, bytesWritten int64) {
 		c.connDurMax = d
 	}
 	c.connMu.Unlock()
-}
-
-// Reset atomically starts a new generation, waits for requests that started in
-// the old one to finish, and returns the completed old generation.
-func (c *Collector) Reset() Snapshot {
-	c.connMu.Lock()
-	c.connTotal, c.connDurSum, c.connDurMax = 0, 0, 0
-	c.connRead, c.connWrote = 0, 0
-	c.connBuckets = [64]int64{}
-	c.connMu.Unlock()
-	c.resetMu.Lock()
-	defer c.resetMu.Unlock()
-	c.mu.Lock()
-	old := c.current
-	c.current = &generation{table: newTable(c.maxKeys)}
-	for old.inFlight != 0 {
-		c.changed.Wait()
-	}
-	c.mu.Unlock()
-	return old.table.snapshot()
-}
-
-func (c *Collector) begin() *generation {
-	c.mu.Lock()
-	g := c.current
-	g.inFlight++
-	c.mu.Unlock()
-	return g
-}
-
-// release ends an in-flight request without recording a latency row.
-func (c *Collector) release(g *generation) {
-	c.mu.Lock()
-	g.inFlight--
-	if g.inFlight == 0 {
-		c.changed.Broadcast()
-	}
-	c.mu.Unlock()
-}
-
-func (c *Collector) finish(g *generation, id identity, duration time.Duration, responseBytes int64) {
-	g.table.observe(id, duration, responseBytes)
-	c.mu.Lock()
-	g.inFlight--
-	if g.inFlight == 0 {
-		c.changed.Broadcast()
-	}
-	c.mu.Unlock()
 }
 
 // connectionTracker owns the one-way transition from an ordinary request to
@@ -499,6 +466,19 @@ func (t *table) observe(id identity, duration time.Duration, responseBytes int64
 	sh.mu.Unlock()
 }
 
+// clear drops every recorded identity and restores the key budget. A request
+// that lands here after its generation was released re-populates an empty map
+// instead of hitting a nil one.
+func (t *table) clear() {
+	for i := range t.shards {
+		sh := &t.shards[i]
+		sh.mu.Lock()
+		sh.stats = make(map[identity]*stat)
+		sh.mu.Unlock()
+	}
+	t.keys.Store(0)
+}
+
 func (t *table) reserveKey() bool {
 	for {
 		used := t.keys.Load()
@@ -594,7 +574,13 @@ func p95(s *stat) int64 {
 	return s.max
 }
 
-var uuidSegment = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var (
+	uuidSegment = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// A canonical ULID is 128 bits encoded as 26 Crockford Base32
+	// characters. The first character is limited to 0-7 so arbitrary
+	// 26-character slugs are not collapsed.
+	ulidSegment = regexp.MustCompile(`(?i)^[0-7][0-9a-hjkmnp-tv-z]{25}$`)
+)
 
 func (c *Collector) pathFor(r *http.Request) string {
 	if pattern := requestPatternPath(r.Pattern); pattern != "" {
@@ -640,7 +626,7 @@ func normalizePath(path string) string {
 		if dot := strings.LastIndexByte(segment, '.'); dot > 0 {
 			base, extension = segment[:dot], segment[dot:]
 		}
-		if isDecimal(base) || uuidSegment.MatchString(base) {
+		if isDecimal(base) || uuidSegment.MatchString(base) || ulidSegment.MatchString(base) {
 			segments[i] = "*" + extension
 		}
 	}
@@ -657,201 +643,4 @@ func isDecimal(value string) bool {
 		}
 	}
 	return true
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-	status   int
-	bytes    int64
-	onCommit func(int)
-	onHijack func(net.Conn) net.Conn
-}
-
-func (w *responseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
-
-func (w *responseWriter) WriteHeader(status int) {
-	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
-		w.ResponseWriter.WriteHeader(status)
-		return
-	}
-	if w.status != 0 {
-		return
-	}
-	w.status = status
-	if w.onCommit != nil {
-		w.onCommit(status)
-	}
-	w.ResponseWriter.WriteHeader(status)
-}
-
-func (w *responseWriter) Write(p []byte) (int, error) {
-	w.ensureStatus()
-	n, err := w.ResponseWriter.Write(p)
-	w.bytes += int64(n)
-	return n, err
-}
-
-func (w *responseWriter) ensureStatus() {
-	if w.status == 0 {
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-type flushFeature struct {
-	w *responseWriter
-	f http.Flusher
-}
-
-func (f flushFeature) Flush() {
-	f.w.ensureStatus()
-	f.f.Flush()
-}
-
-type hijackFeature struct {
-	h *responseWriter
-	u http.Hijacker
-}
-
-func (h hijackFeature) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	conn, rw, err := h.u.Hijack()
-	if err == nil && h.h.onHijack != nil {
-		conn = h.h.onHijack(conn)
-	}
-	return conn, rw, err
-}
-
-type pushFeature struct{ p http.Pusher }
-
-func (p pushFeature) Push(target string, opts *http.PushOptions) error { return p.p.Push(target, opts) }
-
-type readFromFeature struct {
-	w  *responseWriter
-	rf io.ReaderFrom
-}
-
-func (r readFromFeature) ReadFrom(src io.Reader) (int64, error) {
-	r.w.ensureStatus()
-	n, err := r.rf.ReadFrom(src)
-	r.w.bytes += n
-	return n, err
-}
-
-func preserveOptionalInterfaces(w *responseWriter) http.ResponseWriter {
-	f, hasF := w.ResponseWriter.(http.Flusher)
-	h, hasH := w.ResponseWriter.(http.Hijacker)
-	p, hasP := w.ResponseWriter.(http.Pusher)
-	rf, hasR := w.ResponseWriter.(io.ReaderFrom)
-	mask := 0
-	if hasF {
-		mask |= 1
-	}
-	if hasH {
-		mask |= 2
-	}
-	if hasP {
-		mask |= 4
-	}
-	if hasR {
-		mask |= 8
-	}
-	ff := flushFeature{w: w, f: f}
-	hf := hijackFeature{h: w, u: h}
-	pf := pushFeature{p: p}
-	rff := readFromFeature{w: w, rf: rf}
-	switch mask {
-	case 0:
-		return w
-	case 1:
-		return struct {
-			*responseWriter
-			flushFeature
-		}{w, ff}
-	case 2:
-		return struct {
-			*responseWriter
-			hijackFeature
-		}{w, hf}
-	case 3:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-		}{w, ff, hf}
-	case 4:
-		return struct {
-			*responseWriter
-			pushFeature
-		}{w, pf}
-	case 5:
-		return struct {
-			*responseWriter
-			flushFeature
-			pushFeature
-		}{w, ff, pf}
-	case 6:
-		return struct {
-			*responseWriter
-			hijackFeature
-			pushFeature
-		}{w, hf, pf}
-	case 7:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-			pushFeature
-		}{w, ff, hf, pf}
-	case 8:
-		return struct {
-			*responseWriter
-			readFromFeature
-		}{w, rff}
-	case 9:
-		return struct {
-			*responseWriter
-			flushFeature
-			readFromFeature
-		}{w, ff, rff}
-	case 10:
-		return struct {
-			*responseWriter
-			hijackFeature
-			readFromFeature
-		}{w, hf, rff}
-	case 11:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-			readFromFeature
-		}{w, ff, hf, rff}
-	case 12:
-		return struct {
-			*responseWriter
-			pushFeature
-			readFromFeature
-		}{w, pf, rff}
-	case 13:
-		return struct {
-			*responseWriter
-			flushFeature
-			pushFeature
-			readFromFeature
-		}{w, ff, pf, rff}
-	case 14:
-		return struct {
-			*responseWriter
-			hijackFeature
-			pushFeature
-			readFromFeature
-		}{w, hf, pf, rff}
-	default:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-			pushFeature
-			readFromFeature
-		}{w, ff, hf, pf, rff}
-	}
 }

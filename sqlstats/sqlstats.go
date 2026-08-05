@@ -52,6 +52,9 @@ func (d dsnCapturingDriver) Open(dsn string) (driver.Conn, error) {
 		firstName, firstDSN = d.base, dsn
 	}
 	connMu.Unlock()
+	// Register the endpoint in the DB target registry (fail-open, no-op
+	// once this DSN has been seen).
+	observeDSN(d.base, dsn)
 	return d.Driver.Open(dsn)
 }
 

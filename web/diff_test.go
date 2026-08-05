@@ -52,6 +52,9 @@ func TestDiffComparesTwoRuns(t *testing.T) {
 			t.Errorf("diff missing comparability information %q", want)
 		}
 	}
+	if !strings.Contains(body, "build provenance unverified") {
+		t.Error("diff of legacy/unknown builds must carry a provenance warning")
+	}
 	// "SELECT fixed" disappeared in b: its delta (-9000ms) must be shown.
 	if !strings.Contains(body, "-9000.0") {
 		t.Errorf("expected resolved-query negative delta in body")

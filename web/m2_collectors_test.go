@@ -290,6 +290,20 @@ func TestResetStoresCompletedM2GenerationInPrev(t *testing.T) {
 	}
 }
 
+func TestResetLeavesRunManagedProcBoundaryToController(t *testing.T) {
+	procCollector := &fakeProc{current: procstats.Snapshot{CPUs: 4}}
+	h := NewHandler(Provider{Proc: procCollector, ProcRunManaged: true})
+
+	reset := httptest.NewRecorder()
+	h.ServeHTTP(reset, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if reset.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d", reset.Code)
+	}
+	if procCollector.resets != 0 {
+		t.Fatalf("legacy proc resets = %d, want the run controller to own the boundary", procCollector.resets)
+	}
+}
+
 func decodeJSON(t *testing.T, rec *httptest.ResponseRecorder, dst any) {
 	t.Helper()
 	if rec.Code != http.StatusOK {
