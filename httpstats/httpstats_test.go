@@ -71,6 +71,34 @@ func TestMiddlewareNormalizesFallbackPathAndAggregates(t *testing.T) {
 	}
 }
 
+func TestMiddlewareNormalizesULIDPathAndAggregates(t *testing.T) {
+	c := New()
+	h := c.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+	for _, path := range []string{
+		"/api/app/rides/01ARZ3NDEKTSV4RRFFQ69G5FAV/evaluation",
+		"/api/app/rides/01BX5ZZKBKACTAV9WEVGEMMVRZ/evaluation",
+	} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, path, nil))
+	}
+
+	got := c.Snapshot()
+	if len(got) != 1 || got[0].Path != "/api/app/rides/*/evaluation" || got[0].Count != 2 {
+		t.Fatalf("Snapshot() = %#v, want two ULID routes aggregated under one path", got)
+	}
+}
+
+func TestNormalizePathPreservesNonULIDLength26Segments(t *testing.T) {
+	for _, path := range []string{
+		"/objects/81ARZ3NDEKTSV4RRFFQ69G5FAV", // first character exceeds ULID range
+		"/objects/01ARZ3NDEKTSV4RRFFQ69G5FAI", // I is not Crockford Base32
+	} {
+		if got := normalizePath(path); got != path {
+			t.Errorf("normalizePath(%q) = %q, want path preserved", path, got)
+		}
+	}
+}
+
 func TestWithPathRulesOverridesDefaultNormalization(t *testing.T) {
 	c := New(WithPathRules([]Rule{{
 		Pattern:     regexp.MustCompile(`/tenant/[^/]+`),

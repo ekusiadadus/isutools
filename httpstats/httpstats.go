@@ -574,7 +574,13 @@ func p95(s *stat) int64 {
 	return s.max
 }
 
-var uuidSegment = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var (
+	uuidSegment = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// A canonical ULID is 128 bits encoded as 26 Crockford Base32
+	// characters. The first character is limited to 0-7 so arbitrary
+	// 26-character slugs are not collapsed.
+	ulidSegment = regexp.MustCompile(`(?i)^[0-7][0-9a-hjkmnp-tv-z]{25}$`)
+)
 
 func (c *Collector) pathFor(r *http.Request) string {
 	if pattern := requestPatternPath(r.Pattern); pattern != "" {
@@ -620,7 +626,7 @@ func normalizePath(path string) string {
 		if dot := strings.LastIndexByte(segment, '.'); dot > 0 {
 			base, extension = segment[:dot], segment[dot:]
 		}
-		if isDecimal(base) || uuidSegment.MatchString(base) {
+		if isDecimal(base) || uuidSegment.MatchString(base) || ulidSegment.MatchString(base) {
 			segments[i] = "*" + extension
 		}
 	}
