@@ -20,7 +20,7 @@ ranked_opening_points AS (
          ROW_NUMBER() OVER (
            PARTITION BY cl.chair_id
            ORDER BY cl.created_at DESC, cl.id DESC
-         ) AS row_number
+         ) AS point_rank
   FROM chair_locations AS cl
   JOIN run_agents AS a ON a.id = cl.chair_id
   WHERE cl.created_at < @run_start
@@ -28,7 +28,7 @@ ranked_opening_points AS (
 run_points AS (
   SELECT chair_id, created_at, latitude, longitude
   FROM ranked_opening_points
-  WHERE row_number = 1
+  WHERE point_rank = 1
   UNION ALL
   SELECT cl.chair_id, cl.created_at, cl.latitude, cl.longitude
   FROM chair_locations AS cl
