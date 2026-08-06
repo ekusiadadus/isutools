@@ -6,41 +6,59 @@
 
 [English](./README.en.md) | **日本語**
 
-ISUCON 向けオールインワン計測モジュール。**アプリの変更1行**で SQL / HTTP /
-nginx アクセスログ / プロセス・CPU / DB スキーマ / pprof を計測し、
-**ソート済みダッシュボード**と**自己完結スナップショット**で振り返る。
-v1.2 では **SQL 行効率(examined/sent)・実行計画・DB プール・ホスト資源・
-ネットワーク**が同じ run 境界の中に並ぶ。
+**ISUCONの計測・比較・振り返りを、1つのダッシュボードに。**
 
-ベンチ毎の履歴がスコア・git rev 付きで並び、行クリックで当時の全計測が開く:
+isutoolsはGoアプリへ最小限の変更で組み込める、ISUCON向けのオールインワン計測モジュールです。SQL、HTTP、nginx/Caddy/Apacheログ、pprof、プロセス、ホスト、ネットワーク、DBプールを同じベンチマーク区間で収集し、スコアとgit revision付きで保存します。
 
 ![isutools dashboard: per-benchmark run history with scores and git revisions](docs/images/dashboard-runs.png)
 
-- 導入詳細: **[DB・nginx/Apache・pprof・事前準備](./docs/INTEGRATION.md)**
-- 設計書: [DESIGN.md](./DESIGN.md) / 実装状況: [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md)
-- License: MIT / Runtime: Go 1.24+
-- 実績(dogfooding): private-isu を本モジュールの計測だけで1日チューニングし
-  **score 0 → 541,650**(fail 0)。
-  [全記録はブログ記事に](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
-
-## クイックスタート
+## まず試す
 
 ```go
 import "github.com/ekusiadadus/isutools"
 
-db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // 既存の sqlx.Open を書き換えるだけ
-
-// HTTP も測るなら既存 Handler を1回包む
+db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
 http.ListenAndServe(":8080", isutools.HTTP(handler))
 ```
 
-対象 driver はこの呼び出しより前に blank import 等で `database/sql` へ登録して
-おく。MySQL / MariaDB / PostgreSQL(database/sql 経由)すべて同じ1行。
-登録成功時に管理サーバが `127.0.0.1:19191` へ一度だけ起動する。
-`SQLDriverName` は登録に失敗しても素の driver 名へ **fail-open** し、欠損は
-`meta.partial` / `meta.health` に必ず残す(アプリの起動を壊さない)。
-driver ごとの import・DSN・pgxpool の制約は
-[統合ガイド §2](./docs/INTEGRATION.md#2-db-ドライバへの接続)を参照。
+管理画面は`127.0.0.1:19191`で起動します。SSH転送したうえで、ベンチマークごとに次を実行します。
+
+```bash
+curl -fsS -X POST http://127.0.0.1:19191/reset
+# benchmark command
+curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
+```
+
+## 最初に分かること
+
+- どのSQLとHTTPパスが時間を使っているか
+- インデックスが効かず、何行を余計に読んでいるか
+- CPU、メモリ、ディスク、ネットワークを使い切っているか
+- DBではなくコネクションプールで待っていないか
+- 変更前後でスコア、エラー、total、count、averageがどう変わったか
+- 計測の欠損や汚染がなく、比較可能なrunだったか
+
+## 実利用の記録
+
+private-isuをisutoolsの計測だけで1日チューニングし、**score 0から541,650（fail 0）**まで改善しました。これは一般的な性能保証ではなく、同一環境でのdogfooding記録です。
+
+- [改善手順と全記録](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
+- [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
+- [導入ガイド](./docs/INTEGRATION.md)
+- [設計](./DESIGN.md) / [実装状況](./docs/IMPLEMENTATION_STATUS.md)
+
+## 対応範囲
+
+| 領域 | 対応 |
+|---|---|
+| Database | MySQL / MariaDB / PostgreSQL (`database/sql`) |
+| HTTP | Go `net/http` middleware |
+| Reverse proxy logs | nginx / Caddy / Apache / Envoyの明示形式 |
+| Runtime | pprof、CPU、mutex、block、heap |
+| Host | Linux procfs / sysfs / cgroup v2 |
+| Output | Live dashboard、JSON、自己完結HTML、run間diff |
+
+詳細設定は利用前に[導入ガイド](./docs/INTEGRATION.md)を確認してください。管理画面はloopback bindとSSH転送を前提にし、外部公開しません。
 
 ## 実行前チェック(最初の5分)
 
