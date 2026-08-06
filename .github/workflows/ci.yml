@@ -63,4 +63,8 @@ jobs:
       - name: sqlrows self-contamination
         env:
           ISUTOOLS_INTEGRATION_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/?parseTime=true
-        run: go test -tags=integration -count=1 ./sqlrows -run '^TestNoSelfContamination'
+        run: go test -tags=integration -count=1 ./sqlrows -run '^TestNoSelfContamination$'
+      - name: ISUCON14 trajectory export SQL
+        env:
+          ISUTOOLS_INTEGRATION_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/?parseTime=true
+        run: go test -tags=integration -count=1 ./integration/trajectorysql -run '^TestISUCON14TrajectoryExportExecutesOnMySQL8$'

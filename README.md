@@ -42,6 +42,85 @@ http.ListenAndServe(":8080", isutools.HTTP(handler))
 driver ごとの import・DSN・pgxpool の制約は
 [統合ガイド §2](./docs/INTEGRATION.md#2-db-ドライバへの接続)を参照。
 
+## 実行前チェック(最初の5分)
+
+以下を先に通すと、「ベンチは走ったが一部の数字だけ無い」を避けやすい。
+
+### 1. 管理画面は loopback のまま SSH 転送する
+
+```bash
+ssh -L 19191:127.0.0.1:19191 isucon@example-host
+```
+
+ブラウザでは <http://127.0.0.1:19191/> を開く。`0.0.0.0` へ公開する必要はない。
+アプリ側で `curl -fsS http://127.0.0.1:19191/ >/dev/null` が成功することも確認する。
+
+### 2. 計測境界は reset → benchmark → save
+
+```bash
+curl -fsS -X POST http://127.0.0.1:19191/reset
+# benchmark command
+curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
+```
+
+initialize handler へ組み込む場合は、DB 再構築後・レスポンス送信前に
+`ResetNow` を呼ぶ。`/reset` と `ResetNow` を同じ run で重ねない。
+
+### 3. EXPLAIN 用 MySQL ユーザーは3行を直接 GRANT する
+
+`ISUTOOLS_EXPLAIN=1` を使う場合、対象 schema の `SELECT` だけでは不足する。
+次の3権限を role 経由ではなく、専用ユーザーへ直接付与する(`isuride` は対象
+schema 名に置き換える)。
+
+```sql
+GRANT SELECT ON `isuride`.* TO 'isutools_explain'@'127.0.0.1';
+GRANT SELECT ON `performance_schema`.* TO 'isutools_explain'@'127.0.0.1';
+GRANT UPDATE ON `performance_schema`.`threads` TO 'isutools_explain'@'127.0.0.1';
+SHOW GRANTS FOR 'isutools_explain'@'127.0.0.1';
+```
+
+isutools は接続後に `SET ROLE NONE` で実効権限を検査するため、role だけの付与は
+使えない。2行目が無いと権限検査、3行目が無いと EXPLAIN セッションの自己計装停止に
+失敗する。パスワードは README や shell history に書かず、権限を絞った env file から
+DSN へ渡す。詳しい安全性と許可リストは[統合ガイド §11](./docs/INTEGRATION.md#11-explain-取得計画09)。
+
+### 4. nginx advisor には実際に読み込まれる設定を渡す
+
+現在版は entrypoint の include graph を追うため、まず実際の entrypoint を指定する。
+
+```bash
+export ISUTOOLS_NGINX_CONF=/etc/nginx/nginx.conf
+export ISUTOOLS_PROXY_CONF=/etc/nginx/nginx.conf
+export ISUTOOLS_PROXY_KIND=nginx
+```
+
+古いリリース、複雑な include、symlink が混在する構成では、`nginx -T` で実効設定を
+1ファイルに固定すると確実。設定変更後は必ず作り直してからアプリを再起動する。
+
+```bash
+sudo sh -c 'nginx -T 2>/dev/null > /etc/nginx/isutools-effective.conf'
+sudo chmod 0644 /etc/nginx/isutools-effective.conf
+export ISUTOOLS_NGINX_CONF=/etc/nginx/isutools-effective.conf
+export ISUTOOLS_PROXY_CONF=/etc/nginx/isutools-effective.conf
+```
+
+`/etc/nginx` 全体を古い版へ渡すと `sites-available` と `sites-enabled` の symlink を
+二重に読むことがある。一方、include を追わない版へ `nginx.conf` だけ渡すと vhost を
+見落とす。実効設定スナップショットは両方を避ける互換手段である。
+
+### 5. 動的 ID が行ごとに分裂していないか確認する
+
+現在版は数値・UUID・ULID の path segment を自動正規化する。旧版で ULID route が
+HTTP 表に1 ID ずつ出る場合は、リリース更新まで `ISUTOOLS_PATH_RULES` でまとめる。
+
+```bash
+export ISUTOOLS_PATH_RULES='^/api/app/rides/[0-7][0-9A-HJKMNP-TV-Z]{25}/evaluation$=/api/app/rides/*/evaluation;^/api/chair/rides/[0-7][0-9A-HJKMNP-TV-Z]{25}/status$=/api/chair/rides/*/status'
+```
+
+実機でこれらの確認項目が必要になった経緯と、score 9,511 の artifact から
+matcher・notification polling の順に改善した判断は
+[ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)に一次記録として残している。
+
 ## Go API(任意の追加連携)
 
 1行導入はそのまま。以下は **すべて opt-in** で、呼ばなければ従来どおり動く。
@@ -124,6 +203,9 @@ DB を作り直すこと自体は止められない。だから `SerializeInitia
 
 - **meta**: 時刻(**常に JST**)・git rev(+dirty)・build source / provenance 判定・世代番号・score・
   **ホスト情報(CPU モデル / コア数 / メモリ GB / OS)**
+- **Bottleneck Overview**: HTTP / SQL の累計 demand、5xx / 499、CPU 区間の
+  信頼性と飽和度、DB pool wait、SQL 行効率、Host I/O を「最初に見る順」で要約。
+  原因を自動断定せず、各詳細セクションへ降りるための triage として表示
 - **Collector Health**: 各コレクターの状態・欠損(`partial`)警告
 - **DB Schema**: 世代開始時点のテーブル・行数・**インデックス一覧**(「実行前に何が
   貼ってあったか」の証跡)

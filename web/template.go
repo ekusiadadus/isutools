@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"html/template"
 	"sort"
 	"strconv"
@@ -71,6 +72,13 @@ a { color: #0b57d0; }
 {{range .Profiles}}<li><a href="files/{{.}}">{{.}}</a></li>{{end}}
 </ul>
 {{else}}<p class="empty">no profiles yet (set ISUTOOLS_PPROF_SECONDS; captured automatically after POST /reset). Live profiling: <a href="pprof/">pprof/</a></p>{{end}}
+
+<h2>Trajectories <span class="meta">(post-benchmark agent / job animation)</span></h2>
+{{if .Trajectories}}
+<ul class="files">
+{{range .Trajectories}}<li><a href="files/{{.}}">{{.}}</a></li>{{end}}
+</ul>
+{{else}}<p class="empty">no trajectory viewers yet (generate a trajectory_*.html with isutools-trajectory)</p>{{end}}
 </body>
 </html>
 `))
@@ -85,6 +93,267 @@ const sqlRowsRatioWarn = 5.0
 // stays reachable through the cell's title attribute, so truncation never
 // destroys information.
 const queryDisplayRunes = 120
+
+// bottleneckSignal is one evidence-backed triage row shown before the full
+// report. It deliberately says where to look next rather than claiming that
+// one metric proves causality.
+type bottleneckSignal struct {
+	Order      string
+	Level      string
+	Signal     string
+	Evidence   string
+	NextAction string
+}
+
+// bottleneckOverview reduces the full report to the first checks that answer
+// two questions: where request time accumulates, and whether a resource limit
+// can explain it. Every row remains traceable to a detailed section below.
+func bottleneckOverview(snapshot Snapshot) []bottleneckSignal {
+	rows := make([]bottleneckSignal, 0, 8)
+
+	if len(snapshot.HTTP) > 0 {
+		top := snapshot.HTTP[0]
+		for _, entry := range snapshot.HTTP[1:] {
+			if entry.Total > top.Total {
+				top = entry
+			}
+		}
+		rows = append(rows, bottleneckSignal{
+			Order:      "1",
+			Level:      "hot",
+			Signal:     "HTTP demand",
+			Evidence:   fmt.Sprintf("%s · count %d · total %s · avg %s · p95 %s", top.Key, top.Count, humanDuration(top.Total), humanDuration(top.Avg), humanDuration(top.P95)),
+			NextAction: "累計時間が最大の endpoint。polling 回数、handler 内の fan-out、待ちを最初に確認します。total は並行リクエストの合計で、run の経過時間とは別です。",
+		})
+	}
+
+	if len(snapshot.SQL) > 0 {
+		top := snapshot.SQL[0]
+		for _, entry := range snapshot.SQL[1:] {
+			if entry.Total > top.Total {
+				top = entry
+			}
+		}
+		rows = append(rows, bottleneckSignal{
+			Order:      "2",
+			Level:      "hot",
+			Signal:     "SQL demand",
+			Evidence:   fmt.Sprintf("count %d · total %s · avg %s · p95 %s · %s", top.Count, humanDuration(top.Total), humanDuration(top.Avg), humanDuration(top.P95), truncateRunes(top.Key, 100)),
+			NextAction: "累計DB時間が最大の query。HTTP 1回あたりの実行回数と、SQL 行効率・Query Plans を照合します。",
+		})
+	}
+
+	if row, ok := requestFailureSignal(snapshot); ok {
+		rows = append(rows, row)
+	}
+	if row, ok := cpuSignal(snapshot); ok {
+		rows = append(rows, row)
+	}
+	if row, ok := dbPoolSignal(snapshot); ok {
+		rows = append(rows, row)
+	}
+	if row, ok := sqlRowsSignal(snapshot); ok {
+		rows = append(rows, row)
+	}
+	if row, ok := hostIOSignal(snapshot); ok {
+		rows = append(rows, row)
+	}
+
+	if len(rows) == 0 {
+		rows = append(rows, bottleneckSignal{
+			Order:      "-",
+			Level:      "warn",
+			Signal:     "measurement unavailable",
+			Evidence:   "HTTP / SQL / process / host sections are empty",
+			NextAction: "POST /reset → benchmark → POST /save の順で計測区間を作成します。",
+		})
+	}
+	return rows
+}
+
+func requestFailureSignal(snapshot Snapshot) (bottleneckSignal, bool) {
+	var requests, status5xx, status499 int64
+	if snapshot.AccessLog != nil && len(snapshot.AccessLog.Entries) > 0 {
+		for _, entry := range snapshot.AccessLog.Entries {
+			requests += entry.Count
+			status5xx += entry.Status5xx
+			status499 += entry.Status499
+		}
+	} else {
+		for _, entry := range snapshot.HTTP {
+			requests += entry.Count
+			if entry.Status >= 500 {
+				status5xx += entry.Count
+			}
+		}
+	}
+	if requests == 0 {
+		return bottleneckSignal{}, false
+	}
+
+	level := "ok"
+	next := "観測された応答に 5xx はありません。proxy に到達しなかった request はこの数字だけでは判定できません。"
+	if status5xx > 0 {
+		level = "hot"
+		next = "5xx の URI と upstream timing を確認し、app 未到達・接続枯渇・handler error を切り分けます。"
+	} else if status499 > 0 {
+		level = "warn"
+		next = "client abort (499) があります。長い p95 と同じ URI かを確認します。"
+	}
+	return bottleneckSignal{
+		Order:      "gate",
+		Level:      level,
+		Signal:     "unserved / failed",
+		Evidence:   fmt.Sprintf("observed %d · 5xx %d · 499 %d", requests, status5xx, status499),
+		NextAction: next,
+	}, true
+}
+
+func cpuSignal(snapshot Snapshot) (bottleneckSignal, bool) {
+	if snapshot.Proc == nil || snapshot.Proc.CPUTotal == nil {
+		return bottleneckSignal{}, false
+	}
+	cpu := snapshot.Proc.CPUTotal
+	evidence := fmt.Sprintf("busy %.1f%% · user %.1f%% · sys %.1f%% · iowait %.1f%% · idle %.1f%%", cpu.BusyPercent, cpu.UserPercent, cpu.SystemPercent, cpu.IOWaitPercent, cpu.IdlePercent)
+	if !procIntervalMatchesRun(snapshot) {
+		return bottleneckSignal{
+			Order:      "capacity",
+			Level:      "warn",
+			Signal:     "CPU interval",
+			Evidence:   fmt.Sprintf("区間不一致: proc %s→%s · run %s→%s · %s", clockTime(snapshot.Proc.StartedAt), clockTime(snapshot.Proc.EndedAt), clockTime(snapshot.Meta.Run.StartedAt), clockTime(snapshot.Meta.Run.FinishedAt), evidence),
+			NextAction: "この CPU% では run の飽和を判断できません。proc collector を run boundary で reset/freeze します。",
+		}, true
+	}
+
+	level := "ok"
+	next := "CPU には余力があります。直列待ち、外部I/O、pool、polling/fan-out を優先します。"
+	if cpu.BusyPercent >= 90 {
+		level = "hot"
+		next = "CPU 飽和候補です。Top CPU と pprof の CPU profile で関数へ降ります。"
+	} else if cpu.BusyPercent >= 70 {
+		level = "warn"
+		next = "CPU 使用率は高めです。Top CPU と pressure を確認します。"
+	}
+	return bottleneckSignal{Order: "capacity", Level: level, Signal: "CPU", Evidence: evidence, NextAction: next}, true
+}
+
+func procIntervalMatchesRun(snapshot Snapshot) bool {
+	if snapshot.Proc == nil || snapshot.Meta.Run == nil || snapshot.Meta.Run.StartedAt.IsZero() || snapshot.Meta.Run.FinishedAt.IsZero() {
+		return true
+	}
+	const tolerance = 5 * time.Second
+	return absDuration(snapshot.Proc.StartedAt.Sub(snapshot.Meta.Run.StartedAt)) <= tolerance &&
+		absDuration(snapshot.Proc.EndedAt.Sub(snapshot.Meta.Run.FinishedAt)) <= tolerance
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func dbPoolSignal(snapshot Snapshot) (bottleneckSignal, bool) {
+	if len(snapshot.DBPool) == 0 {
+		return bottleneckSignal{}, false
+	}
+	var waits int64
+	var waitDuration time.Duration
+	var open, maxOpen int
+	for _, entry := range snapshot.DBPool {
+		waits += entry.WaitCount
+		waitDuration += entry.WaitDuration
+		open += entry.Open
+		maxOpen += entry.MaxOpen
+	}
+	level := "ok"
+	next := "pool wait はありません。DB接続上限は現在の主要因ではありません。"
+	if waits > 0 {
+		level = "hot"
+		next = "pool 上限が request latency を決めています。平均wait、in-use、DB max_connections を確認します。"
+	}
+	avg := time.Duration(0)
+	if waits > 0 {
+		avg = waitDuration / time.Duration(waits)
+	}
+	return bottleneckSignal{
+		Order:      "capacity",
+		Level:      level,
+		Signal:     "DB pool",
+		Evidence:   fmt.Sprintf("waits %d · total %s · avg %s · open %d / max %d", waits, humanDuration(waitDuration), humanDuration(avg), open, maxOpen),
+		NextAction: next,
+	}, true
+}
+
+func sqlRowsSignal(snapshot Snapshot) (bottleneckSignal, bool) {
+	if snapshot.SQLRows == nil {
+		return bottleneckSignal{}, false
+	}
+	var query string
+	var total time.Duration
+	var ratio float64
+	var examined, sent, noIndex uint64
+	for _, target := range snapshot.SQLRows.Targets {
+		for _, digest := range target.Digests {
+			problem := (digest.HasRatio && digest.ExaminedPerSent > sqlRowsRatioWarn) || digest.NoIndexUsed > 0 || digest.NoGoodIndexUsed > 0 || digest.SortMergePasses > 0 || digest.CreatedTmpDiskTables > 0
+			if !problem || (query != "" && digest.TotalTime <= total) {
+				continue
+			}
+			query = digest.Query
+			total = digest.TotalTime
+			ratio = digest.ExaminedPerSent
+			examined = digest.RowsExamined
+			sent = digest.RowsSent
+			noIndex = digest.NoIndexUsed
+		}
+	}
+	if query == "" {
+		return bottleneckSignal{}, false
+	}
+	return bottleneckSignal{
+		Order:      "scan",
+		Level:      "hot",
+		Signal:     "SQL row efficiency",
+		Evidence:   fmt.Sprintf("total %s · examined/sent %.1f · rows %d/%d · no-index %d · %s", humanDuration(total), ratio, examined, sent, noIndex, truncateRunes(query, 32)),
+		NextAction: "返す行より読む行が多い query です。filter/order と複合index、pollで0行を繰り返す設計を区別します。",
+	}, true
+}
+
+func hostIOSignal(snapshot Snapshot) (bottleneckSignal, bool) {
+	if snapshot.Host == nil {
+		return bottleneckSignal{}, false
+	}
+	var device string
+	var maxUtil float64
+	for _, disk := range snapshot.Host.Disks {
+		if disk.UtilPercent != nil && (device == "" || *disk.UtilPercent > maxUtil) {
+			device, maxUtil = disk.Device, *disk.UtilPercent
+		}
+	}
+	var ioStall float64
+	if snapshot.Host.PSI != nil && snapshot.Host.PSI.IO.SomeStallRatio != nil {
+		ioStall = *snapshot.Host.PSI.IO.SomeStallRatio
+	}
+	level := "ok"
+	next := "強い I/O pressure は見えていません。disk util は multi-queue では飽和率そのものではありません。"
+	if maxUtil >= 80 || ioStall >= 0.10 {
+		level = "hot"
+		next = "I/O 待ち候補です。device、queue、PSI、SQLの読み書き量を同じ区間で確認します。"
+	} else if maxUtil >= 50 || ioStall >= 0.02 || snapshot.Host.Memory.PageMajorFaults > 100 {
+		level = "warn"
+		next = "I/O またはメモリ pressure の兆候があります。Host 詳細で区間deltaを確認します。"
+	}
+	if device == "" {
+		device = "-"
+	}
+	return bottleneckSignal{
+		Order:      "capacity",
+		Level:      level,
+		Signal:     "Host I/O",
+		Evidence:   fmt.Sprintf("max disk util %.1f%% (%s) · IO PSI stall %.1f%% · major faults %d", maxUtil, device, ioStall*100, snapshot.Host.Memory.PageMajorFaults),
+		NextAction: next,
+	}, true
+}
 
 // humanBytes renders a byte count in the largest unit that keeps it readable.
 // Raw byte counts are the one thing a reader cannot compare at a glance, and
@@ -477,6 +746,7 @@ var reportFuncs = template.FuncMap{
 	"ratioHot":     digestRatioHot,
 	"indexHot":     digestIndexHot,
 	"planTables":   planTables,
+	"bottlenecks":  bottleneckOverview,
 	"diskUtilNote": func() string { return hoststats.DiskUtilNote },
 	"cgroupNote":   func() string { return hoststats.CGroupScopeNote },
 }
@@ -502,6 +772,10 @@ tbody tr:nth-child(odd) { background: #fafafa; }
 tr.hot > td { background: #fef3c7; }
 tr.stale > td { color: #999; }
 td.flag { color: #b45309; font-weight: bold; }
+.signal { display: inline-block; border-radius: .25rem; padding: .1rem .35rem; font-weight: bold; }
+.signal.hot { color: #9a3412; background: #ffedd5; }
+.signal.warn { color: #92400e; background: #fef3c7; }
+.signal.ok { color: #166534; background: #dcfce7; }
 details { font-size: .8rem; margin: .4rem 0; }
 summary { cursor: pointer; color: #666; }
 ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
@@ -513,6 +787,15 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} ({{.Snapshot.Meta.BuildSource}}) &middot; gen {{.Snapshot.Meta.Generation}}{{if .Snapshot.Meta.Score}} &middot; score {{.Snapshot.Meta.Score}}{{end}}{{if not .Snapshot.Meta.ProvenanceValid}} &middot; build provenance unverified{{end}}</p>
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
+
+<h2>Bottleneck Overview <span class="meta">(原因の断定ではなく、最初に見る順)</span></h2>
+<p class="meta">累計 demand と capacity / failure signal を同じ区間で比較します。各行の根拠は下の詳細セクションに残っています。</p>
+<table>
+<thead><tr><th>見る順</th><th>signal</th><th>evidence</th><th>次に確認すること</th></tr></thead>
+<tbody>{{range bottlenecks .Snapshot}}<tr>
+<td>{{.Order}}</td><td class="l"><span class="signal {{.Level}}">{{.Signal}}</span></td><td class="l">{{.Evidence}}</td><td class="l">{{.NextAction}}</td>
+</tr>{{end}}</tbody>
+</table>
 
 <h2>Collector Health</h2>
 {{if .Snapshot.Meta.Partial}}<p class="warn">partial snapshot: one or more collectors reported incomplete data</p>{{end}}
