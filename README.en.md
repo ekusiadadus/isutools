@@ -6,45 +6,59 @@
 
 **English** | [日本語](./README.md)
 
-All-in-one profiling module for ISUCON-style tuning. With a **one-line change**
-to your app it measures SQL / HTTP / nginx access logs / processes & CPU /
-DB schema / pprof, and lets you review every run through a **pre-sorted
-dashboard** and **self-contained snapshots**. Includes a reproducible ABBA
-overhead gate. v1.2 adds **SQL row efficiency (examined/sent), query plans,
-DB pool statistics, host resources, and network counters** — all inside the
-same run boundary.
+**Measure, compare, and review an ISUCON run in one dashboard.**
 
-Per-benchmark run history is listed with score and git revision; clicking a
-row opens every measurement captured during that run:
+isutools is an all-in-one profiling module that integrates into a Go application with minimal changes. It captures SQL, HTTP, reverse-proxy logs, pprof, processes, host resources, network counters, and DB-pool statistics inside the same benchmark boundary, then saves the result with its score and git revision.
 
 ![isutools dashboard: per-benchmark run history with scores and git revisions](docs/images/dashboard-runs.png)
 
-- Integration details: **[DB, nginx/Apache, pprof, prerequisites](./docs/INTEGRATION.md)** (in Japanese)
-- Design doc: [DESIGN.md](./DESIGN.md) / Implementation status: [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md) (in Japanese)
-- License: MIT / Runtime: Go 1.24+
-- Track record (dogfooding): tuned private-isu for one day using only this
-  module's measurements — **score 0 → 541,650** (0 fails).
-  [Full write-up on the blog (Japanese)](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
-
-## Quick Start
+## Try it first
 
 ```go
 import "github.com/ekusiadadus/isutools"
 
-db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // just rewrite your existing sqlx.Open
-
-// To measure HTTP as well, wrap your existing handler once
+db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
 http.ListenAndServe(":8080", isutools.HTTP(handler))
 ```
 
-Register the underlying driver with `database/sql` (e.g. via a blank import)
-before this call. MySQL / MariaDB / PostgreSQL (via database/sql) all use the
-same one line. On successful registration the admin server starts once on
-`127.0.0.1:19191`. If registration fails, `SQLDriverName` **fails open** to
-the raw driver name, and any missing data is always recorded in
-`meta.partial` / `meta.health` (it never breaks your app's startup).
-For per-driver imports, DSNs, and pgxpool constraints, see
-[Integration Guide §2](./docs/INTEGRATION.md#2-db-ドライバへの接続).
+The dashboard starts on `127.0.0.1:19191`. Keep it on loopback, connect through SSH forwarding, and wrap each benchmark in one reset/save boundary:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:19191/reset
+# benchmark command
+curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
+```
+
+## What it answers first
+
+- Which SQL statements and HTTP paths consume the run
+- Whether indexes are avoiding unnecessary row reads
+- Whether CPU, memory, disk, or network resources are saturated
+- Whether requests wait on the database or the connection pool
+- What changed between two runs in score, errors, total time, count, and average
+- Whether missing or contaminated measurements make a run unsafe to compare
+
+## Recorded dogfooding result
+
+Using only isutools measurements, one day of private-isu tuning improved the score from **0 to 541,650 with zero failures**. This is a record from one controlled environment, not a general performance guarantee.
+
+- [Full tuning record (Japanese)](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
+- [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
+- [Integration guide](./docs/INTEGRATION.md)
+- [Design](./DESIGN.md) / [Implementation status](./docs/IMPLEMENTATION_STATUS.md)
+
+## Coverage
+
+| Area | Support |
+|---|---|
+| Database | MySQL / MariaDB / PostgreSQL through `database/sql` |
+| HTTP | Go `net/http` middleware |
+| Reverse-proxy logs | Explicit nginx / Caddy / Apache / Envoy formats |
+| Runtime | pprof, CPU, mutex, block, and heap profiles |
+| Host | Linux procfs / sysfs / cgroup v2 |
+| Output | Live dashboard, JSON, self-contained HTML, and run-to-run diff |
+
+Read the [integration guide](./docs/INTEGRATION.md) before use. The dashboard security model assumes loopback binding and SSH forwarding, not public exposure.
 
 ## Five-minute preflight
 
