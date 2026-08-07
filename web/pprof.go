@@ -1,21 +1,28 @@
 package web
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	netpprof "net/http/pprof"
 	"os"
-	"path/filepath"
 	rpprof "runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/internal/health"
+	"github.com/ekusiadadus/isutools/internal/safefs"
 )
 
 // pprofHandler exposes the process profiles under /pprof/ on the admin
@@ -44,43 +51,197 @@ func pprofHandler(w http.ResponseWriter, r *http.Request) {
 // can run at a time).
 var cpuCaptureActive atomic.Bool
 
+const fixedCPUProfileSchema = "isutools.fixed-cpu-profile/v1"
+
+// FixedCPUProfileRecord is the immutable evidence record for the legacy
+// timer-only CPU capture mode. It deliberately contains no RunID because fixed
+// mode is not aligned to a run boundary and must not be mistaken for one.
+type FixedCPUProfileRecord struct {
+	Schema           string    `json:"schema"`
+	Mode             string    `json:"mode"`
+	CaptureID        string    `json:"capture_id"`
+	Generation       int64     `json:"generation"`
+	RequestedAt      time.Time `json:"requested_at"`
+	StartCompletedAt time.Time `json:"start_completed_at,omitzero"`
+	StopRequestedAt  time.Time `json:"stop_requested_at,omitzero"`
+	StopCompletedAt  time.Time `json:"stop_completed_at,omitzero"`
+	DurationNs       int64     `json:"duration_ns,omitempty"`
+	File             string    `json:"file,omitempty"`
+	SHA256           string    `json:"sha256,omitempty"`
+	Bytes            int64     `json:"bytes,omitempty"`
+	Status           string    `json:"status"`
+	Code             string    `json:"code,omitempty"`
+	Visibility       string    `json:"visibility,omitempty"`
+	Durability       string    `json:"durability,omitempty"`
+}
+
 // captureCPUProfile records a CPU profile for the given duration into
 // DataDir, named after the generation it measures. Failures are logged and
 // otherwise ignored: profiling must never break measurement or the app.
-func (h *handler) captureCPUProfile(generation int64) {
+func (h *handler) captureCPUProfile(generation int64) bool {
 	if h.p.PprofDuration <= 0 || h.p.DataDir == "" {
-		return
+		return false
 	}
 	if !cpuCaptureActive.CompareAndSwap(false, true) {
 		log.Print("isutools: CPU capture already running; skipping")
-		return
+		return false
 	}
 	name := fmt.Sprintf("%s_gen%d_cpu.pprof",
 		time.Now().In(reportTZ).Format("20060102-150405"), generation)
-	path := filepath.Join(h.p.DataDir, name)
-	f, err := os.Create(path)
+	base := strings.TrimSuffix(name, profileArtifactExt)
+	h.pruneProfiles(base)
+	root, err := safefs.Open(h.p.DataDir, safefs.Options{RequireStrongVisibility: true, Exclusive: false})
 	if err != nil {
 		cpuCaptureActive.Store(false)
-		log.Printf("isutools: CPU profile create failed: %v", err)
-		return
+		log.Printf("isutools: CPU profile data root failed: %v", err)
+		return false
 	}
-	if err := rpprof.StartCPUProfile(f); err != nil {
+	tmp := name + profileTempExt
+	record := FixedCPUProfileRecord{
+		Schema: fixedCPUProfileSchema, Mode: "fixed", CaptureID: newFixedCPUCaptureID(),
+		Generation: generation, RequestedAt: time.Now(), Status: "failed",
+	}
+	finishRecord := func() {
+		if err := publishFixedCPUSidecar(root, base+profileSidecarExt, record); err != nil {
+			log.Printf("isutools: fixed CPU sidecar publish failed: %v", err)
+		}
+		h.pruneProfiles("")
+	}
+	f, err := root.CreateExclusive(tmp, 0o600)
+	if err != nil {
+		record.Code = "artifact-create-failed"
+		finishRecord()
+		_ = root.Close()
+		cpuCaptureActive.Store(false)
+		log.Printf("isutools: CPU profile create failed: %v", err)
+		return false
+	}
+	hasher := sha256.New()
+	writer := &boundedRuntimeProfileWriter{writer: io.MultiWriter(f, hasher), max: runtimeProfileMaxBytes}
+	if err := rpprof.StartCPUProfile(writer); err != nil {
 		_ = f.Close()
-		_ = os.Remove(path)
+		_ = root.Remove(tmp)
+		record.Code = "start-failed"
+		finishRecord()
+		_ = root.Close()
 		cpuCaptureActive.Store(false)
 		log.Printf("isutools: CPU profile start failed: %v", err)
-		return
+		return false
 	}
+	record.StartCompletedAt = time.Now()
 	go func() {
 		defer cpuCaptureActive.Store(false)
+		defer func() { _ = root.Close() }()
 		time.Sleep(h.p.PprofDuration)
+		record.StopRequestedAt = time.Now()
 		rpprof.StopCPUProfile()
+		record.StopCompletedAt = time.Now()
+		record.DurationNs = record.StopCompletedAt.Sub(record.StartCompletedAt).Nanoseconds()
+		if writer.err != nil {
+			_ = f.Close()
+			_ = root.Remove(tmp)
+			record.Code = "write-failed"
+			finishRecord()
+			log.Printf("isutools: CPU profile write failed: %v", writer.err)
+			return
+		}
+		if err := f.Sync(); err != nil {
+			_ = f.Close()
+			_ = root.Remove(tmp)
+			record.Code = "sync-failed"
+			finishRecord()
+			log.Printf("isutools: CPU profile sync failed: %v", err)
+			return
+		}
 		if err := f.Close(); err != nil {
+			_ = root.Remove(tmp)
+			record.Code = "close-failed"
+			finishRecord()
 			log.Printf("isutools: CPU profile close failed: %v", err)
 			return
 		}
+		publication, err := root.PublishNoReplace(tmp, name)
+		if err != nil && !publication.Visible {
+			_ = root.Remove(tmp)
+			record.Code = "publish-failed"
+			finishRecord()
+			log.Printf("isutools: CPU profile publish failed: %v", err)
+			return
+		}
+		record.File, record.SHA256, record.Bytes = name, hex.EncodeToString(hasher.Sum(nil)), writer.written
+		record.Status, record.Visibility, record.Durability = "published", "visible", string(publication.Durability)
+		if err != nil {
+			record.Code = "durability-unknown"
+			log.Printf("isutools: CPU profile visible with unknown durability: %v", err)
+		}
+		finishRecord()
 		log.Printf("isutools: CPU profile saved: %s", name)
 	}()
+	return true
+}
+
+// FixedCPUProfiler is the process-shared entry point for timer-only fixed
+// capture. Handler and ResetNow can hold the same instance; the package-wide
+// runtime guard also preserves compatibility for independently constructed
+// legacy handlers.
+type FixedCPUProfiler struct{ h *handler }
+
+func NewFixedCPUProfiler(dataDir string, duration time.Duration) *FixedCPUProfiler {
+	if dataDir == "" || duration <= 0 {
+		return nil
+	}
+	return &FixedCPUProfiler{h: newHandler(Provider{DataDir: dataDir, PprofDuration: duration})}
+}
+
+func (p *FixedCPUProfiler) Capture(generation int64) bool {
+	return p != nil && p.h != nil && p.h.captureCPUProfile(generation)
+}
+
+func newFixedCPUCaptureID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	return hex.EncodeToString(sum[:16])
+}
+
+func publishFixedCPUSidecar(root *safefs.Root, name string, record FixedCPUProfileRecord) error {
+	body, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	if uint64(len(body)) > profileSidecarMaxBytes {
+		return errors.New("fixed CPU sidecar exceeds byte ceiling")
+	}
+	temp := name + profileTempExt
+	file, err := root.CreateExclusive(temp, 0o600)
+	if err != nil {
+		_ = root.RemoveTemp(temp)
+		return err
+	}
+	failed := true
+	defer func() {
+		_ = file.Close()
+		if failed {
+			_ = root.Remove(temp)
+		}
+	}()
+	if _, err := file.Write(body); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	publication, err := root.PublishNoReplace(temp, name)
+	if publication.Visible {
+		failed = false
+	}
+	return err
 }
 
 // ProfilePoint names the run boundary a runtime profile was captured at. A
@@ -203,7 +364,8 @@ type ProfileCapture struct {
 	Point ProfilePoint `json:"point"`
 	Kind  string       `json:"kind"`
 	// File is the published ".pprof" name, empty when nothing was published.
-	File string `json:"file,omitempty"`
+	File   string `json:"file,omitempty"`
+	SHA256 string `json:"sha256,omitempty"`
 	// Sidecar is this record's own file name, so a manifest entry can be
 	// followed back to the record on disk.
 	Sidecar  string `json:"sidecar"`
@@ -247,10 +409,12 @@ type ProfileCapture struct {
 // (TailExcessNs, included), because both halves are taken by the caller after
 // the coordinator has already fixed the boundary.
 type ProfilePair struct {
-	Kind      string `json:"kind"`
-	OpenFile  string `json:"open_file"`
-	CloseFile string `json:"close_file"`
-	OpenGate  string `json:"open_gate,omitempty"`
+	Kind        string `json:"kind"`
+	OpenFile    string `json:"open_file"`
+	CloseFile   string `json:"close_file"`
+	OpenSHA256  string `json:"open_sha256"`
+	CloseSHA256 string `json:"close_sha256"`
+	OpenGate    string `json:"open_gate,omitempty"`
 	// RunSpanNs is the distance between the two boundaries themselves.
 	RunSpanNs int64 `json:"run_span_ns"`
 	// HeadLossNs is the run's beginning that the difference does not contain.
@@ -273,7 +437,25 @@ type ProfileManifest struct {
 	// Pairs holds only the kinds whose two halves both exist. A kind with one
 	// half is deliberately absent: a difference cannot be taken from it, and
 	// listing it would invite the reader to try.
-	Pairs []ProfilePair `json:"pairs,omitempty"`
+	Pairs    []ProfilePair        `json:"pairs,omitempty"`
+	Expected []ProfileExpectation `json:"expected,omitempty"`
+	// CPU is the separately owned interval profile. Unlike Captures/Pairs it
+	// has one run-aligned input rather than cumulative open/close halves.
+	CPU                *CPUIntervalCapture           `json:"cpu,omitempty"`
+	CPULabelDictionary *CPULabelDictionary           `json:"cpu_label_dictionary,omitempty"`
+	Executable         *buildinfo.ExecutableIdentity `json:"executable,omitempty"`
+}
+
+type ProfileExpectation struct {
+	Kind   string                 `json:"kind"`
+	Mode   string                 `json:"mode"`
+	Inputs []ProfileExpectedInput `json:"inputs"`
+}
+
+type ProfileExpectedInput struct {
+	Kind  string `json:"kind"`
+	Point string `json:"point"`
+	File  string `json:"file"`
 }
 
 // Lagging reports whether either half of the pair was taken too far from the
@@ -708,14 +890,44 @@ func (h *handler) abortRunProfiles(runID string) {
 // nothing. It is what a snapshot embeds so a saved report can be read back
 // with its profiles.
 func (h *handler) profileManifest(runID string) *ProfileManifest {
+	return h.profileManifestFor(runID, 0)
+}
+
+func (h *handler) profileManifestFor(runID string, epoch uint64) *ProfileManifest {
 	if h.p.DataDir == "" || runID == "" {
 		return nil
 	}
 	run := boundaryProfiles.find(h.p.DataDir, runID, 0)
-	if run == nil {
-		return nil
+	var manifest *ProfileManifest
+	if run != nil {
+		manifest = run.manifest()
 	}
-	return run.manifest()
+	if h.p.CPUProfiles != nil && epoch != 0 {
+		if cpu := h.p.CPUProfiles.Manifest(runID, epoch); cpu != nil {
+			if manifest == nil {
+				manifest = &ProfileManifest{RunID: runID, Epoch: epoch}
+			}
+			manifest.CPU = cpu
+			if cpu.ExpectedFile != "" {
+				manifest.Expected = append(manifest.Expected, ProfileExpectation{
+					Kind: "cpu", Mode: "interval",
+					Inputs: []ProfileExpectedInput{{Kind: "cpu", Point: "interval", File: cpu.ExpectedFile}},
+				})
+			}
+		}
+		if dictionary := h.p.CPUProfiles.LabelDictionary(runID, epoch); dictionary != nil {
+			if manifest == nil {
+				manifest = &ProfileManifest{RunID: runID, Epoch: epoch}
+			}
+			manifest.CPULabelDictionary = dictionary
+		}
+	}
+	if manifest != nil && h.p.Executable != nil {
+		copy := *h.p.Executable
+		copy.Settings = append([]buildinfo.BuildSetting(nil), h.p.Executable.Settings...)
+		manifest.Executable = &copy
+	}
+	return manifest
 }
 
 // captureBoundary is the common path of both halves.
@@ -824,7 +1036,7 @@ func (h *handler) captureKind(run *profileRun, spec profileCaptureSpec, kind str
 	}
 	name := profileBaseName(run.prefix, kind, spec.point) + profileArtifactExt
 	capture.StartedAt = time.Now()
-	size, err := h.publishProfile(name, profile)
+	publication, err := h.publishProfile(name, profile)
 	capture.FinishedAt = time.Now()
 	capture.LagFromRefNs = elapsedNs(spec.ref.at, capture.StartedAt)
 	capture.DurationNs = capture.FinishedAt.Sub(capture.StartedAt).Nanoseconds()
@@ -833,7 +1045,7 @@ func (h *handler) captureKind(run *profileRun, spec profileCaptureSpec, kind str
 		log.Printf("isutools: %s %s profile capture failed: %v", kind, spec.point, err)
 		return capture
 	}
-	capture.Status, capture.File, capture.Bytes = profileStatusOK, name, size
+	capture.Status, capture.File, capture.Bytes, capture.SHA256 = profileStatusOK, name, publication.Bytes, publication.SHA256
 	return capture
 }
 
@@ -898,6 +1110,15 @@ func (r *profileRun) manifest() *ProfileManifest {
 		Validity: r.validity,
 		Captures: append([]ProfileCapture(nil), r.captures...),
 	}
+	for _, kind := range r.kindsLocked() {
+		manifest.Expected = append(manifest.Expected, ProfileExpectation{
+			Kind: kind, Mode: "cumulative-delta",
+			Inputs: []ProfileExpectedInput{
+				{Kind: kind, Point: "open", File: profileBaseName(r.prefix, kind, ProfilePointOpen) + profileArtifactExt},
+				{Kind: kind, Point: "close", File: profileBaseName(r.prefix, kind, ProfilePointClose) + profileArtifactExt},
+			},
+		})
+	}
 	span := elapsedNs(r.openRef.at, r.closeRef.at)
 	for _, kind := range r.kindsLocked() {
 		open := r.captureLocked(ProfilePointOpen, kind)
@@ -909,6 +1130,8 @@ func (r *profileRun) manifest() *ProfileManifest {
 			Kind:          kind,
 			OpenFile:      open.File,
 			CloseFile:     closing.File,
+			OpenSHA256:    open.SHA256,
+			CloseSHA256:   closing.SHA256,
 			OpenGate:      open.OpenGate,
 			RunSpanNs:     span,
 			HeadLossNs:    open.LagFromRefNs,
@@ -1019,20 +1242,45 @@ func (h *handler) writeProfileSidecar(capture ProfileCapture) {
 		log.Printf("isutools: profile sidecar encode failed: %v", err)
 		return
 	}
-	final := filepath.Join(h.p.DataDir, capture.Sidecar)
-	tmp := final + profileTempExt
-	if err := os.WriteFile(tmp, append(body, '\n'), 0o600); err != nil {
+	root, err := safefs.Open(h.p.DataDir, safefs.Options{RequireStrongVisibility: true, Exclusive: false})
+	if err != nil {
+		log.Printf("isutools: profile sidecar root failed: %v", err)
+		return
+	}
+	defer func() { _ = root.Close() }()
+	tmp := capture.Sidecar + profileTempExt
+	file, err := root.CreateExclusive(tmp, 0o600)
+	if err != nil {
 		// The write is create-truncate-write-close, so a failure anywhere after
 		// the create leaves the file behind. Reap it here exactly as the rename
 		// path below does: nothing else ever will. A ".tmp" is not an artifact,
 		// so retention never groups it with a run, and it would otherwise sit in
 		// the data directory for the life of the host.
-		_ = os.Remove(tmp)
+		_ = root.RemoveTemp(tmp)
 		log.Printf("isutools: profile sidecar write failed: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
+	content := append(body, '\n')
+	if _, err := file.Write(content); err != nil {
+		_ = file.Close()
+		_ = root.Remove(tmp)
+		log.Printf("isutools: profile sidecar write failed: %v", err)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = root.Remove(tmp)
+		log.Printf("isutools: profile sidecar sync failed: %v", err)
+		return
+	}
+	if err := file.Close(); err != nil {
+		_ = root.Remove(tmp)
+		log.Printf("isutools: profile sidecar close failed: %v", err)
+		return
+	}
+	publication, err := root.Replace(tmp, capture.Sidecar)
+	if err != nil && !publication.Visible {
+		_ = root.Remove(tmp)
 		log.Printf("isutools: profile sidecar publish failed: %v", err)
 	}
 }
@@ -1057,31 +1305,71 @@ func (h *handler) writeRuntimeProfile(kind string, run RunStart, point ProfilePo
 // a half-written profile is structurally impossible to download, and every
 // failure path removes the temporary file rather than leaving it to be
 // mistaken for one.
-func (h *handler) publishProfile(name string, profile *rpprof.Profile) (int64, error) {
-	final := filepath.Join(h.p.DataDir, name)
-	tmp := final + profileTempExt
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+type runtimeProfilePublication struct {
+	Bytes  int64
+	SHA256 string
+}
+
+const runtimeProfileMaxBytes = 32 << 20
+
+func (h *handler) publishProfile(name string, profile *rpprof.Profile) (runtimeProfilePublication, error) {
+	root, err := safefs.Open(h.p.DataDir, safefs.Options{RequireStrongVisibility: true, Exclusive: false})
 	if err != nil {
-		return 0, fmt.Errorf("create %s: %w", tmp, err)
+		return runtimeProfilePublication{}, err
 	}
-	if err := profile.WriteTo(f, 0); err != nil {
+	defer func() { _ = root.Close() }()
+	tmp := name + profileTempExt
+	f, err := root.CreateExclusive(tmp, 0o600)
+	if err != nil {
+		return runtimeProfilePublication{}, fmt.Errorf("create %s: %w", tmp, err)
+	}
+	hasher := sha256.New()
+	writer := &boundedRuntimeProfileWriter{writer: io.MultiWriter(f, hasher), max: runtimeProfileMaxBytes}
+	if err := profile.WriteTo(writer, 0); err != nil {
 		_ = f.Close()
-		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("write %s: %w", tmp, err)
+		_ = root.Remove(tmp)
+		return runtimeProfilePublication{}, fmt.Errorf("write %s: %w", tmp, err)
 	}
-	var size int64
-	if info, err := f.Stat(); err == nil {
-		size = info.Size()
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = root.Remove(tmp)
+		return runtimeProfilePublication{}, fmt.Errorf("sync %s: %w", tmp, err)
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("close %s: %w", tmp, err)
+		_ = root.Remove(tmp)
+		return runtimeProfilePublication{}, fmt.Errorf("close %s: %w", tmp, err)
 	}
-	if err := os.Rename(tmp, final); err != nil {
-		_ = os.Remove(tmp)
-		return 0, fmt.Errorf("publish %s: %w", name, err)
+	publication, err := root.PublishNoReplace(tmp, name)
+	if err != nil {
+		if !publication.Visible {
+			_ = root.Remove(tmp)
+		}
+		return runtimeProfilePublication{}, fmt.Errorf("publish %s: %w", name, err)
 	}
-	return size, nil
+	return runtimeProfilePublication{Bytes: writer.written, SHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+type boundedRuntimeProfileWriter struct {
+	writer  io.Writer
+	written int64
+	max     int64
+	err     error
+}
+
+func (w *boundedRuntimeProfileWriter) Write(body []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if int64(len(body)) > w.max-w.written {
+		w.err = fmt.Errorf("runtime profile exceeds %d bytes", w.max)
+		return 0, w.err
+	}
+	n, err := w.writer.Write(body)
+	w.written += int64(n)
+	if err != nil {
+		w.err = err
+	}
+	return n, err
 }
 
 // orderProfileKinds fixes the capture order at mutex, block, heap and drops
@@ -1147,6 +1435,12 @@ func profileBaseName(prefix, kind string, point ProfilePoint) string {
 // with a different meaning — and a directory holding both generations must
 // still produce only correct pairs.
 func profileArtifactPrefix(name string) (string, bool) {
+	if runCPU, ok := runCPUArtifactPrefix(name); ok {
+		return runCPU, true
+	}
+	if fixed, ok := fixedCPUArtifactPrefix(name); ok {
+		return fixed, true
+	}
 	var base string
 	switch {
 	case strings.HasSuffix(name, profileSidecarExt):
@@ -1171,6 +1465,77 @@ func profileArtifactPrefix(name string) (string, bool) {
 		return "", false
 	}
 	return rest[:cut], true
+}
+
+func runCPUArtifactPrefix(name string) (string, bool) {
+	const prefixLength = len("cpu_") + 32
+	if len(name) <= prefixLength || !strings.HasPrefix(name, "cpu_") || !lowerHexText(name[len("cpu_"):prefixLength]) {
+		return "", false
+	}
+	prefix, suffix := name[:prefixLength], name[prefixLength:]
+	if suffix == profileArtifactExt || suffix == profileSidecarExt {
+		return prefix, true
+	}
+	const coveragePrefix = ".coverage."
+	if !strings.HasPrefix(suffix, coveragePrefix) || !strings.HasSuffix(suffix, ".json") {
+		return "", false
+	}
+	identity := strings.TrimSuffix(strings.TrimPrefix(suffix, coveragePrefix), ".json")
+	parts := strings.Split(identity, ".")
+	if len(parts) != 2 || len(parts[0]) != 6 || len(parts[1]) != 64 || !decimalText(parts[0]) || !lowerHexText(parts[1]) {
+		return "", false
+	}
+	return prefix, true
+}
+
+func decimalText(value string) bool {
+	return value != "" && strings.IndexFunc(value, func(r rune) bool { return r < '0' || r > '9' }) < 0
+}
+
+func lowerHexText(value string) bool {
+	return value != "" && strings.IndexFunc(value, func(r rune) bool {
+		return (r < '0' || r > '9') && (r < 'a' || r > 'f')
+	}) < 0
+}
+
+// fixedCPUArtifactPrefix recognizes only the compatibility filename emitted
+// by captureCPUProfile. Fixed CPU captures participate in retention, but never
+// in cumulative open/close pairing.
+func fixedCPUArtifactPrefix(name string) (string, bool) {
+	var base string
+	switch {
+	case strings.HasSuffix(name, profileSidecarExt):
+		base = strings.TrimSuffix(name, profileSidecarExt)
+	case strings.HasSuffix(name, profileArtifactExt):
+		base = strings.TrimSuffix(name, profileArtifactExt)
+	default:
+		return "", false
+	}
+	if len(base) < len("20060102-150405_gen0_cpu") || !strings.HasSuffix(base, "_cpu") {
+		return "", false
+	}
+	stamp := base[:15]
+	for index, value := range stamp {
+		if index == 8 {
+			if value != '-' {
+				return "", false
+			}
+			continue
+		}
+		if value < '0' || value > '9' {
+			return "", false
+		}
+	}
+	generation := strings.TrimSuffix(base[15:], "_cpu")
+	if !strings.HasPrefix(generation, "_gen") || len(generation) == len("_gen") {
+		return "", false
+	}
+	for _, value := range generation[len("_gen"):] {
+		if value < '0' || value > '9' {
+			return "", false
+		}
+	}
+	return base, true
 }
 
 // runIDPrefix shortens a run id to the leading 8 characters used in artifact
@@ -1209,11 +1574,21 @@ func (h *handler) pruneProfiles(protect string) {
 		protect, boundaryProfiles.invalidPrefixes(h.p.DataDir))
 }
 
+// PruneProfileArtifacts applies the shared raw-profile retention after a
+// run-aligned CPU completion that may occur without any cumulative profile
+// capture to trigger the handler-local path.
+func PruneProfileArtifacts(dataDir, protectFile string) {
+	protect, _ := profileArtifactPrefix(protectFile)
+	pruneProfileArtifacts(dataDir, profileRetentionRuns, profileRetentionBytes,
+		protect, boundaryProfiles.invalidPrefixes(dataDir))
+}
+
 // profileGroup is one run's artifacts as they exist on disk.
 type profileGroup struct {
 	files    []string
 	bytes    int64
 	hasClose bool
+	order    int64
 }
 
 // pruneProfileArtifacts enforces "the most recent runs, up to a total size".
@@ -1226,7 +1601,12 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 	if dir == "" {
 		return
 	}
-	entries, err := os.ReadDir(dir)
+	root, err := safefs.Open(dir, safefs.Options{RequireStrongVisibility: false, Exclusive: false})
+	if err != nil {
+		return
+	}
+	defer func() { _ = root.Close() }()
+	entries, err := root.ReadDir()
 	if err != nil {
 		return
 	}
@@ -1243,7 +1623,7 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 		// artifacts, so keeping them until the directory happens to overflow
 		// would leave a crash's leftovers behind forever.
 		if strings.HasSuffix(entry.Name(), profileTempExt) {
-			sweepStaleProfileTemp(dir, entry, now)
+			sweepStaleProfileTemp(root, entry, now)
 			continue
 		}
 		prefix, ok := profileArtifactPrefix(entry.Name())
@@ -1252,7 +1632,7 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 		}
 		group := groups[prefix]
 		if group == nil {
-			group = &profileGroup{}
+			group = &profileGroup{order: profileGroupOrder(prefix)}
 			groups[prefix] = group
 			prefixes = append(prefixes, prefix)
 		}
@@ -1261,12 +1641,20 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 			group.bytes += info.Size()
 			total += info.Size()
 		}
-		if strings.HasSuffix(entry.Name(), "_"+string(ProfilePointClose)+profileArtifactExt) {
+		_, fixedCPU := fixedCPUArtifactPrefix(entry.Name())
+		_, runCPU := runCPUArtifactPrefix(entry.Name())
+		if strings.HasSuffix(entry.Name(), "_"+string(ProfilePointClose)+profileArtifactExt) ||
+			((fixedCPU || runCPU) && strings.HasSuffix(entry.Name(), profileArtifactExt)) {
 			group.hasClose = true
 		}
 	}
-	// The prefix begins with a sortable timestamp, so this is oldest first.
-	sort.Strings(prefixes)
+	sort.Slice(prefixes, func(i, j int) bool {
+		left, right := groups[prefixes[i]], groups[prefixes[j]]
+		if left.order != right.order {
+			return left.order < right.order
+		}
+		return prefixes[i] < prefixes[j]
+	})
 	count := len(prefixes)
 	if count <= keepRuns && total <= keepBytes {
 		return
@@ -1292,11 +1680,25 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 			return
 		}
 		for _, name := range groups[prefix].files {
-			_ = os.Remove(filepath.Join(dir, name))
+			_ = root.Remove(name)
 		}
 		count--
 		total -= groups[prefix].bytes
 	}
+}
+
+func profileGroupOrder(prefix string) int64 {
+	if strings.HasPrefix(prefix, "cpu_") && len(prefix) == len("cpu_")+32 {
+		if millis, err := strconv.ParseUint(prefix[len("cpu_"):len("cpu_")+12], 16, 64); err == nil && millis <= uint64(^uint64(0)>>1) {
+			return int64(millis)
+		}
+	}
+	if len(prefix) >= 15 {
+		if stamp, err := time.ParseInLocation("20060102-150405", prefix[:15], reportTZ); err == nil {
+			return stamp.UnixMilli()
+		}
+	}
+	return 0
 }
 
 // sweepStaleProfileTemp removes one unpublished temporary file whose writer is
@@ -1308,7 +1710,7 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 // own owner. profileArtifactPrefix deliberately refuses a ".tmp" name — the
 // pairing and the retention grouping must never see one — so the suffix is
 // stripped before it is asked.
-func sweepStaleProfileTemp(dir string, entry os.DirEntry, now time.Time) {
+func sweepStaleProfileTemp(root *safefs.Root, entry os.DirEntry, now time.Time) {
 	if _, ok := profileArtifactPrefix(strings.TrimSuffix(entry.Name(), profileTempExt)); !ok {
 		return
 	}
@@ -1316,7 +1718,7 @@ func sweepStaleProfileTemp(dir string, entry os.DirEntry, now time.Time) {
 	if err != nil || now.Sub(info.ModTime()) < profileTempMaxAge {
 		return
 	}
-	_ = os.Remove(filepath.Join(dir, entry.Name()))
+	_ = root.RemoveTemp(entry.Name())
 }
 
 // BoundaryProfiler captures the opening half of a profile pair for a run that
@@ -1374,14 +1776,10 @@ func (h *handler) listProfiles() []string {
 	if h.p.DataDir == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(h.p.DataDir)
-	if err != nil {
-		return nil
-	}
 	names := []string{}
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), profileArtifactExt) {
-			names = append(names, e.Name())
+	for _, entry := range h.dataEntries() {
+		if strings.HasSuffix(entry.name, profileArtifactExt) {
+			names = append(names, entry.name)
 		}
 	}
 	for i, j := 0, len(names)-1; i < j; i, j = i+1, j-1 {

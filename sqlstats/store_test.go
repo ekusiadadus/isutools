@@ -9,6 +9,46 @@ import (
 	"github.com/ekusiadadus/isutools/internal/runctl"
 )
 
+type recordingSQLObserver struct {
+	key      string
+	duration time.Duration
+	failed   bool
+	calls    int
+}
+
+func (o *recordingSQLObserver) SQLStart(time.Time) any { return "token" }
+func (o *recordingSQLObserver) SQLFinish(_ time.Time, token any, key string, duration time.Duration, failed bool) {
+	if token != "token" {
+		panic("wrong token")
+	}
+	o.key, o.duration, o.failed = key, duration, failed
+	o.calls++
+}
+func (o *recordingSQLObserver) SQLCancel(time.Time, any) {}
+
+type panickingSQLObserver struct{}
+
+func (panickingSQLObserver) SQLStart(time.Time) any { panic("observer") }
+func (panickingSQLObserver) SQLFinish(time.Time, any, string, time.Duration, bool) {
+	panic("observer")
+}
+func (panickingSQLObserver) SQLCancel(time.Time, any) { panic("observer") }
+
+func TestStoreEventObserverIsExactAndPanicContained(t *testing.T) {
+	s := NewStore(100)
+	observer := &recordingSQLObserver{}
+	s.SetEventObserver(observer)
+	s.ObserveResult("SELECT ?", 3*time.Millisecond, true)
+	if observer.calls != 1 || observer.key != "SELECT ?" || observer.duration != 3*time.Millisecond || !observer.failed {
+		t.Fatalf("observer = %#v", observer)
+	}
+	s.SetEventObserver(panickingSQLObserver{})
+	s.Observe("SELECT safe", time.Millisecond)
+	if got := s.Snapshot(); len(got) != 2 {
+		t.Fatalf("observer panic corrupted store: %#v", got)
+	}
+}
+
 func TestStoreObserveAndSnapshot(t *testing.T) {
 	s := NewStore(100)
 	s.Observe("SELECT 1", 3*time.Millisecond)

@@ -1,6 +1,7 @@
 package dbpool
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -192,6 +193,26 @@ func TestWatchedIsSorted(t *testing.T) {
 	want := []string{"alpha", "mu", "zeta"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("Watched() = %v, want %v", got, want)
+	}
+}
+
+func TestPointsAreSortedAndContainPanic(t *testing.T) {
+	c := New()
+	beta := newScript(sql.DBStats{MaxOpenConnections: 20, OpenConnections: 7, InUse: 6, Idle: 1, WaitCount: 8, WaitDuration: 9})
+	alpha := newScript(sql.DBStats{MaxOpenConnections: 10, OpenConnections: 4, InUse: 3, Idle: 1, WaitCount: 5, WaitDuration: 6})
+	exploding := newScript()
+	exploding.panicAfter = 0
+	for id, script := range map[string]*scriptedStats{"beta": beta, "alpha": alpha, "exploding": exploding} {
+		if err := c.watchStats(id, "display", script.stats); err != nil {
+			t.Fatalf("watchStats(%q) = %v", id, err)
+		}
+	}
+	points := c.Points()
+	if len(points) != 2 || points[0].TargetID != "alpha" || points[1].TargetID != "beta" {
+		t.Fatalf("Points() = %#v", points)
+	}
+	if got := points[0]; got.MaxOpen != 10 || got.Open != 4 || got.InUse != 3 || got.Idle != 1 || got.WaitCount != 5 || got.WaitDuration != 6 {
+		t.Fatalf("alpha point = %#v", got)
 	}
 }
 

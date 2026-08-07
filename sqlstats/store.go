@@ -3,11 +3,24 @@ package sqlstats
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/generation"
 )
+
+// EventObserver receives already-normalized SQL completion events. Observer
+// panics are contained so diagnostics can never fail an application query.
+type EventObserver interface {
+	SQLStart(time.Time) any
+	SQLFinish(time.Time, any, string, time.Duration, bool)
+	SQLCancel(time.Time, any)
+}
+
+type eventObserverSlot struct {
+	observer EventObserver
+}
 
 // Frozen is a completed SQL generation.
 type Frozen struct {
@@ -31,7 +44,8 @@ const RotateDrainBudget = generation.DefaultCompatWait
 
 // Store owns generation-scoped SQL aggregation tables.
 type Store struct {
-	manager *generation.Manager[*agg.Table, []agg.Entry]
+	manager  *generation.Manager[*agg.Table, []agg.Entry]
+	observer atomic.Pointer[eventObserverSlot]
 }
 
 // NewStore constructs a generation-scoped SQL store.
@@ -43,12 +57,30 @@ func NewStore(maxKeys int) *Store {
 }
 
 type measurement struct {
-	lease *generation.Lease[*agg.Table, []agg.Entry]
-	once  sync.Once
+	lease    *generation.Lease[*agg.Table, []agg.Entry]
+	observer EventObserver
+	token    any
+	once     sync.Once
 }
 
 func (s *Store) begin() *measurement {
-	return &measurement{lease: s.manager.Acquire()}
+	m := &measurement{lease: s.manager.Acquire()}
+	slot := s.observer.Load()
+	if slot == nil || slot.observer == nil {
+		return m
+	}
+	observer := slot.observer
+	var token any
+	started := false
+	func() {
+		defer func() { _ = recover() }()
+		token = observer.SQLStart(time.Now())
+		started = true
+	}()
+	if started {
+		m.observer, m.token = observer, token
+	}
+	return m
 }
 
 func (s *Store) finish(m *measurement, query string, duration time.Duration, failed bool) {
@@ -58,14 +90,41 @@ func (s *Store) finish(m *measurement, query string, duration time.Duration, fai
 	m.once.Do(func() {
 		defer m.lease.Done()
 		m.lease.Value().ObserveResult(query, duration, failed)
+		m.finishEvent(time.Now(), query, duration, failed)
 	})
+}
+
+// SetEventObserver replaces the optional timeline/event observer.
+func (s *Store) SetEventObserver(observer EventObserver) {
+	if s == nil {
+		return
+	}
+	if observer == nil {
+		s.observer.Store(nil)
+		return
+	}
+	s.observer.Store(&eventObserverSlot{observer: observer})
+}
+
+func (m *measurement) finishEvent(at time.Time, query string, duration time.Duration, failed bool) {
+	if m.observer == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	m.observer.SQLFinish(at, m.token, query, duration, failed)
 }
 
 func (s *Store) discard(m *measurement) {
 	if m == nil {
 		return
 	}
-	m.once.Do(m.lease.Done)
+	m.once.Do(func() {
+		m.lease.Done()
+		if m.observer != nil {
+			defer func() { _ = recover() }()
+			m.observer.SQLCancel(time.Now(), m.token)
+		}
+	})
 }
 
 // Observe adds an already-normalized query to the current generation.

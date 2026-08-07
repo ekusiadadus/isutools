@@ -16,7 +16,7 @@ func main() {
 	output := flag.String("output", "trajectory.html", "self-contained HTML output path, or - for stdout")
 	flag.Parse()
 	if err := run(*input, *output); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -28,7 +28,7 @@ func run(input, output string) error {
 		if err != nil {
 			return fmt.Errorf("open input: %w", err)
 		}
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 		in = file
 	}
 	dataset, err := trajectoryviz.ParseNDJSON(in)

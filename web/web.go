@@ -4,11 +4,12 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -27,7 +28,9 @@ import (
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/health"
+	"github.com/ekusiadadus/isutools/internal/safefs"
 	"github.com/ekusiadadus/isutools/internal/sysinfo"
+	"github.com/ekusiadadus/isutools/internal/timeline"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
@@ -168,10 +171,19 @@ type Provider struct {
 		Reset()
 	}
 	// DataDir persists snapshots for the dashboard history ("" = disabled).
-	DataDir string
+	DataDir    string
+	Executable *buildinfo.ExecutableIdentity
+	// ProfileAnalysis enables the opt-in derived analysis publication endpoint.
+	// Original snapshot bytes remain immutable regardless of this setting.
+	ProfileAnalysis bool
 	// PprofDuration > 0 captures a CPU profile for that long after every
 	// reset (i.e. covering the benchmark), stored in DataDir (0 = disabled).
 	PprofDuration time.Duration
+	// CPUProfiles is the process-wide managed CPU profiler owner. Nil preserves
+	// the standalone fixed-duration compatibility path.
+	CPUProfiles CPUCaptureCoordinator
+	// CPUProfileMode is "run", "fixed", or empty/off.
+	CPUProfileMode string
 	// StartRun opens a measurement run at the reset boundary and names it in
 	// the reset response. Nil keeps the legacy behaviour, in which a reset
 	// only rotates the collector generations and no run id exists.
@@ -213,6 +225,9 @@ type Provider struct {
 	// evidence that makes a completed run auditable. When set it supersedes
 	// Sections; the older callback remains for custom-provider compatibility.
 	RunSnapshot func() *RunSnapshot
+	// Timeline resolves the bounded, run/epoch-aligned phase analysis. Nil is
+	// the default-off compatibility path.
+	Timeline func(runID string, epoch uint64) *timeline.Section
 	// RuntimeProfiles lists the runtime profiles ("mutex", "block", "heap")
 	// captured at a run boundary, in capture order. Empty — the default —
 	// captures nothing. The rates themselves are process-wide runtime
@@ -229,6 +244,10 @@ type RunStart struct {
 	// Epoch is the coordinator fencing token. It prevents a delayed boundary
 	// artifact from being attached to a newer incarnation of the same run id.
 	Epoch uint64
+	// State is the coordinator state at the completed opening boundary. A
+	// managed reset is allowed to begin profiling only for "started"; notably,
+	// a required collector failure returns "aborted" with a nil error.
+	State string
 	// StartedAt is the opening boundary's moment. Boundary artifacts are named
 	// after it rather than after the moment they are written, so an opening
 	// and a closing artifact of one run share a filename prefix.
@@ -254,9 +273,21 @@ type RunFinish struct {
 	// Validity is the run's data-quality verdict ("valid", "partial",
 	// "invalid"), copied verbatim like RunStart.Validity.
 	Validity string `json:"validity,omitempty"`
+	// State is normally omitted. Recovery saves set it to the terminal state
+	// that prevented a normal finish, so an expired run can never look like a
+	// successfully completed interval.
+	State string `json:"state,omitempty"`
+	// StartedAt is copied from the opening boundary for a recovery save. Normal
+	// completions obtain the same value from RunSnapshot instead.
+	StartedAt time.Time `json:"started_at,omitzero"`
 	// AcceptedAt is the measured moment the closing boundary was fixed. It is
 	// the end of the interval every section of this run describes.
 	AcceptedAt time.Time `json:"accepted_at,omitzero"`
+	// Recovered marks the explicit fail-open path used when StartedTTL already
+	// abandoned the run before /save arrived. RecoveryReason is the stable
+	// lifecycle reason (currently "started-ttl").
+	Recovered      bool   `json:"recovered,omitempty"`
+	RecoveryReason string `json:"recovery_reason,omitempty"`
 	// GenerationWindow and BoundaryWindow preserve the coordinator's measured
 	// uncertainty at the closing boundary for profile residual accounting.
 	GenerationWindow BoundaryWindow `json:"generation_window,omitzero"`
@@ -300,6 +331,9 @@ type RunInfo struct {
 	RunID            string                 `json:"run_id"`
 	Epoch            uint64                 `json:"epoch"`
 	Validity         string                 `json:"validity"`
+	State            string                 `json:"state,omitempty"`
+	Recovered        bool                   `json:"recovered,omitempty"`
+	RecoveryReason   string                 `json:"recovery_reason,omitempty"`
 	Trigger          string                 `json:"trigger,omitempty"`
 	Collectors       []RunCollectorBoundary `json:"collectors,omitempty"`
 	GenerationWindow BoundaryWindow         `json:"generation_window"`
@@ -330,11 +364,12 @@ type Meta struct {
 	ProvenanceValid bool   `json:"provenance_valid"`
 	// Score is the benchmark score supplied via POST /save?score=; persisted
 	// snapshots always carry it so every report is attributable to a result.
-	Score   string         `json:"score,omitempty"`
-	Host    sysinfo.Info   `json:"host"`
-	Partial bool           `json:"partial"`
-	Health  []health.Entry `json:"health,omitempty"`
-	Run     *RunInfo       `json:"run,omitempty"`
+	Score         string         `json:"score,omitempty"`
+	BenchmarkPass *bool          `json:"benchmark_pass,omitempty"`
+	Host          sysinfo.Info   `json:"host"`
+	Partial       bool           `json:"partial"`
+	Health        []health.Entry `json:"health,omitempty"`
+	Run           *RunInfo       `json:"run,omitempty"`
 	// Profiles is the run's runtime-profile record: every capture attempted at
 	// either boundary and the pairs that can be differenced. It is filled when
 	// a run is persisted, because that is the first moment both halves exist;
@@ -354,6 +389,7 @@ type Snapshot struct {
 	HTTP        httpstats.Snapshot      `json:"http,omitempty"`
 	AccessLog   *accesslog.Snapshot     `json:"accesslog,omitempty"`
 	Proc        *procstats.Snapshot     `json:"proc,omitempty"`
+	Timeline    *timeline.Section       `json:"timeline,omitempty"`
 
 	// The sections below come from the run coordinator's baseline collectors
 	// rather than from a live collector read, so they describe the interval
@@ -594,7 +630,9 @@ type handler struct {
 	// test uses to hold a flush inside the window where a concurrent /finish
 	// can fix the closing boundary, which is the interleaving the second check
 	// under resetMu exists to refuse.
-	collectPause func()
+	collectPause      func()
+	profileAnalysisMu sync.Mutex
+	publishSeq        atomic.Uint64
 }
 
 // NewHandler returns the report handler. Routes are relative:
@@ -617,7 +655,7 @@ func (h *handler) routes() http.Handler {
 	mux.HandleFunc("/", h.root)
 	mux.HandleFunc("/live", h.live)
 	mux.HandleFunc("/diff", h.diff)
-	mux.HandleFunc("/pprof/", pprofHandler)
+	mux.HandleFunc("/pprof/", h.pprof)
 	mux.HandleFunc("/snapshot.html", h.static)
 	mux.HandleFunc("/json", h.json)
 	mux.HandleFunc("/reset", h.reset)
@@ -626,6 +664,10 @@ func (h *handler) routes() http.Handler {
 	mux.HandleFunc("/abort", h.abort)
 	mux.HandleFunc("/save", h.save)
 	mux.HandleFunc("/files/", h.files)
+	if h.p.ProfileAnalysis {
+		mux.HandleFunc("/profile-analysis", h.profileAnalysis)
+		mux.HandleFunc("/profile-analysis-capabilities", h.profileAnalysisCapabilities)
+	}
 	return mux
 }
 
@@ -1005,16 +1047,19 @@ var runIDPattern = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}(?:\.[0-9]{9}-[0-9]{6,}
 
 // root serves the run index at "/" and stored run details at "/<run-id>".
 func (h *handler) root(w http.ResponseWriter, r *http.Request) {
-	if !requireMethod(w, r, http.MethodGet) {
-		return
-	}
 	if r.URL.Path == "/" {
+		if !requireMethod(w, r, http.MethodGet) {
+			return
+		}
 		h.index(w)
 		return
 	}
 	id := strings.Trim(r.URL.Path, "/")
 	if !runIDPattern.MatchString(id) {
 		http.NotFound(w, r)
+		return
+	}
+	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
 	matches := make([]string, 0, 1)
@@ -1027,7 +1072,10 @@ func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 	case 0:
 		http.NotFound(w, r)
 	case 1:
-		http.ServeFile(w, r, filepath.Join(h.p.DataDir, matches[0]))
+		if h.p.ProfileAnalysis && h.serveCurrentDerived(w, r, strings.TrimSuffix(matches[0], ".html")) {
+			return
+		}
+		h.serveDataFile(w, r, matches[0])
 	default:
 		http.Error(w, "run id is ambiguous; use a collision-free saved run", http.StatusConflict)
 	}
@@ -1133,31 +1181,35 @@ func (h *handler) listFiles() []string {
 	if h.p.DataDir == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(h.p.DataDir)
-	if err != nil {
-		return nil
-	}
 	names := []string{}
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".html") {
-			names = append(names, e.Name())
+	for _, entry := range h.dataEntries() {
+		if isOriginalSnapshotHTML(entry.name) {
+			names = append(names, entry.name)
 		}
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(names)))
 	return names
 }
 
+func isOriginalSnapshotHTML(name string) bool {
+	if !strings.HasSuffix(name, ".html") || strings.Contains(name, ".profile.") {
+		return false
+	}
+	first, _, ok := strings.Cut(name, "_")
+	return ok && runIDPattern.MatchString(first)
+}
+
 // listTrajectories returns portable post-benchmark viewers deliberately named
 // with the trajectory_ prefix. They share /files/ with the other artifacts but
 // are not snapshots and must never enter run history or diff selection.
 func (h *handler) listTrajectories() []string {
-	files := h.listFiles()
 	trajectories := make([]string, 0)
-	for _, name := range files {
-		if strings.HasPrefix(name, "trajectory_") {
-			trajectories = append(trajectories, name)
+	for _, entry := range h.dataEntries() {
+		if strings.HasPrefix(entry.name, "trajectory_") && strings.HasSuffix(entry.name, ".html") {
+			trajectories = append(trajectories, entry.name)
 		}
 	}
+	sort.Sort(sort.Reverse(sort.StringSlice(trajectories)))
 	return trajectories
 }
 
@@ -1171,6 +1223,15 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ISUTOOLS_DATA_DIR is not configured", http.StatusBadRequest)
 		return
 	}
+	score := ""
+	if value := r.URL.Query().Get("score"); value != "" {
+		score = sanitizeName(value)
+	}
+	benchmarkPass, passSet, err := parseBenchmarkPass(r.URL.Query().Get("pass"))
+	if err != nil {
+		http.Error(w, "isutools: save failed: pass must be true, false, 1, or 0", http.StatusBadRequest)
+		return
+	}
 	if !h.beginOperation(w) {
 		return
 	}
@@ -1182,46 +1243,104 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	// Fix the boundary before waiting for the immutable snapshot. Runtime
 	// profiles must close here, while the background drain is still in flight;
 	// taking them after CompleteRun would include the collector's own teardown.
-	var run RunFinish
+	var (
+		run               RunFinish
+		cpuTicket         CPUStopTicket
+		completeAttempted bool
+	)
 	if h.p.FinishRun != nil {
 		accepted, err := h.p.FinishRun(r.Context())
 		if err != nil {
-			if h.p.Health != nil {
-				h.p.Health.Set("runctl", health.StatusDegraded, err.Error())
+			// A StartedTTL termination deliberately has no immutable runctl
+			// snapshot, but the live collector generation still contains real
+			// measurements. CompleteRun can prove that one specific terminal
+			// event through its bounded recovery ledger. No other FinishRun error
+			// is converted into a successful save.
+			recovered := h.completeRun(r.Context())
+			completeAttempted = true
+			if !validRecoveryRun(recovered) {
+				if h.p.Health != nil {
+					h.p.Health.Set("runctl", health.StatusDegraded, err.Error())
+				}
+				http.Error(w, "isutools: no run to save: "+err.Error(), http.StatusConflict)
+				return
 			}
-			http.Error(w, "isutools: no run to save: "+err.Error(), http.StatusConflict)
-			return
+			run = recovered
+			cpuTicket = h.requestCPUStop(run.RunID, run.Epoch, run.State, run.Validity, run.RecoveryReason, cpuFinishBoundary(run))
+			h.abortRunProfiles(run.RunID)
+		} else {
+			run = accepted
+			cpuTicket = h.requestCPUStop(run.RunID, run.Epoch, "finishing", run.Validity, "finish-accepted", cpuFinishBoundary(run))
+			h.captureCloseProfiles(run)
 		}
-		run = accepted
-		h.captureCloseProfiles(run)
 	}
 	// End the run first. Everything below then renders the run's immutable
 	// snapshot instead of the live collectors, which is the whole point of
 	// having a closing boundary: a report saved after the boundary must
 	// describe the interval, not the empty generation that replaced it.
-	completed := h.completeRun(r.Context())
-	if completed.RunID != "" {
-		run = completed
+	if !completeAttempted {
+		completed := h.completeRun(r.Context())
+		if completed.RunID != "" {
+			run = completed
+		}
+	}
+	if cpuTicket.CaptureID == "" {
+		state, reason := "finishing", "finish-accepted"
+		if run.Recovered {
+			state, reason = run.State, run.RecoveryReason
+		}
+		cpuTicket = h.requestCPUStop(run.RunID, run.Epoch, state, run.Validity, reason, cpuFinishBoundary(run))
 	}
 	// Legacy/custom providers may expose CompleteRun without FinishRun. Their
 	// capture is necessarily late, but still produces a complete, explicit pair.
-	h.captureCloseProfiles(run)
+	if run.Recovered {
+		h.abortRunProfiles(run.RunID)
+	} else {
+		h.captureCloseProfiles(run)
+	}
+	// Only save waits for the CPU publication budget. Finish/abort merely
+	// request the asynchronous stop so their lifecycle latency stays bounded.
+	h.awaitCPUStop(cpuTicket)
 	if run.RunID != "" {
 		h.runEnded.Store(true)
 		w.Header().Set(runIDHeader, run.RunID)
 	}
 	snap := h.take()
+	snap.Meta.Score = score
+	if passSet {
+		snap.Meta.BenchmarkPass = &benchmarkPass
+	}
+	if h.p.Timeline != nil && run.RunID != "" && run.Epoch != 0 {
+		snap.Timeline = h.p.Timeline(run.RunID, run.Epoch)
+		if snap.Timeline != nil {
+			snap.Timeline.Outcome = timeline.Outcome{
+				Score: score, Pass: snap.Meta.BenchmarkPass, Validity: run.Validity,
+			}
+		}
+	}
+	if validRecoveryRun(run) && snap.Meta.Run == nil {
+		applyRunInfo(&snap, RunInfo{
+			RunID: run.RunID, Epoch: run.Epoch, Validity: run.Validity,
+			State: run.State, Recovered: true, RecoveryReason: run.RecoveryReason,
+			StartedAt: run.StartedAt, FinishedAt: run.AcceptedAt,
+		})
+		mergeHealth(&snap.Meta, health.Entry{
+			Collector: "runctl", Status: health.StatusDegraded,
+			Message: "recovery save after " + run.RecoveryReason + "; live collector data is partial and no immutable run snapshot exists",
+		})
+		snap.Meta.Partial = true
+	}
 	// The run's profile record is attached here rather than in take(): both
 	// halves of a pair exist only once the run has been closed, and a live
 	// report has no run id to look one up by.
-	snap.Meta.Profiles = h.profileManifest(run.RunID)
+	snap.Meta.Profiles = h.profileManifestFor(run.RunID, run.Epoch)
 	base := fmt.Sprintf("%s_gen%d_%s",
 		h.nextRunID(), snap.Meta.Generation, fileSafeRevision(snap.Meta))
-	if score := r.URL.Query().Get("score"); score != "" {
-		snap.Meta.Score = sanitizeName(score)
+	if snap.Meta.Score != "" {
 		base += "_score" + snap.Meta.Score
 	}
-	if err := h.writeSnapshot(snap, base); err != nil {
+	publication, err := h.writeSnapshot(snap, base)
+	if err != nil {
 		if errors.Is(err, errSnapshotTooLarge) {
 			http.Error(w, "isutools: save failed: "+err.Error(), http.StatusRequestEntityTooLarge)
 			return
@@ -1230,7 +1349,53 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]string{"file": base + ".html"})
+	w.Header().Set("X-Isutools-Snapshot-SHA256", publication.SnapshotSHA256)
+	_ = json.NewEncoder(w).Encode(SaveResponse{
+		File: base + ".html", SnapshotBase: base, SnapshotFile: base + ".json",
+		SnapshotSchemaVersion: snap.Meta.SchemaVersion, RunID: run.RunID,
+		SnapshotSHA256: publication.SnapshotSHA256,
+		Visibility:     publication.Visibility,
+		Durability:     publication.Durability,
+	})
+}
+
+func parseBenchmarkPass(value string) (bool, bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return false, false, nil
+	case "true", "1":
+		return true, true, nil
+	case "false", "0":
+		return false, true, nil
+	default:
+		return false, false, errors.New("invalid benchmark pass value")
+	}
+}
+
+func validRecoveryRun(run RunFinish) bool {
+	return run.Recovered && run.RunID != "" && run.Epoch != 0 && run.State == "aborted" &&
+		run.Validity == "invalid" && run.RecoveryReason == "started-ttl" &&
+		!run.StartedAt.IsZero() && !run.AcceptedAt.IsZero()
+}
+
+// SaveResponse pins the exact raw snapshot bytes at the moment /save
+// publishes them. Callers can put this hash into an ABBA ledger without a
+// later fetch racing retention or another generation.
+type SaveResponse struct {
+	File                  string `json:"file"`
+	SnapshotBase          string `json:"snapshot_base"`
+	SnapshotFile          string `json:"snapshot_file"`
+	SnapshotSchemaVersion int    `json:"snapshot_schema_version"`
+	RunID                 string `json:"run_id,omitempty"`
+	SnapshotSHA256        string `json:"snapshot_sha256"`
+	Visibility            string `json:"visibility"`
+	Durability            string `json:"durability"`
+}
+
+type snapshotPublication struct {
+	SnapshotSHA256 string
+	Visibility     string
+	Durability     string
 }
 
 func (h *handler) nextRunID() string {
@@ -1239,21 +1404,26 @@ func (h *handler) nextRunID() string {
 }
 
 // writeSnapshot persists html+json atomically (tmp + rename).
-func (h *handler) writeSnapshot(snap Snapshot, base string) error {
+func (h *handler) writeSnapshot(snap Snapshot, base string) (snapshotPublication, error) {
 	jsonBytes, err := json.MarshalIndent(jsonPayload{Snapshot: snap}, "", " ")
 	if err != nil {
-		return err
+		return snapshotPublication{}, err
 	}
 	if len(jsonBytes) > maxSnapshotBytes {
-		return errSnapshotTooLarge
+		return snapshotPublication{}, errSnapshotTooLarge
 	}
 	var htmlBuf strings.Builder
 	if err := reportTmpl.Execute(&htmlBuf, page{Snapshot: snap, Sortable: true}); err != nil {
-		return err
+		return snapshotPublication{}, err
 	}
 	if htmlBuf.Len() > maxSnapshotBytes {
-		return errSnapshotTooLarge
+		return snapshotPublication{}, errSnapshotTooLarge
 	}
+	root, err := safefs.Open(h.p.DataDir, safefs.Options{RequireStrongVisibility: true, Exclusive: false})
+	if err != nil {
+		return snapshotPublication{}, err
+	}
+	defer func() { _ = root.Close() }()
 	// Prepare both files first, then publish JSON followed by HTML. The run
 	// index only lists HTML, so it can never expose a run before its JSON pair.
 	outputs := []struct {
@@ -1264,24 +1434,47 @@ func (h *handler) writeSnapshot(snap Snapshot, base string) error {
 		{ext: ".html", content: []byte(htmlBuf.String())},
 	}
 	for _, output := range outputs {
-		tmp := filepath.Join(h.p.DataDir, base+output.ext+".tmp")
-		if err := os.WriteFile(tmp, output.content, 0o600); err != nil {
-			return err
+		tmp := base + output.ext + ".tmp"
+		file, err := root.CreateExclusive(tmp, 0o600)
+		if err != nil {
+			return snapshotPublication{}, err
+		}
+		if _, err := file.Write(output.content); err != nil {
+			_ = file.Close()
+			_ = root.Remove(tmp)
+			return snapshotPublication{}, err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			_ = root.Remove(tmp)
+			return snapshotPublication{}, err
+		}
+		if err := file.Close(); err != nil {
+			_ = root.Remove(tmp)
+			return snapshotPublication{}, err
 		}
 	}
 	defer func() {
 		for _, output := range outputs {
-			_ = os.Remove(filepath.Join(h.p.DataDir, base+output.ext+".tmp"))
+			_ = root.Remove(base + output.ext + ".tmp")
 		}
 	}()
+	durability := string(safefs.DurabilityDurable)
 	for _, output := range outputs {
-		ext := output.ext
-		tmp := filepath.Join(h.p.DataDir, base+ext+".tmp")
-		if err := os.Rename(tmp, filepath.Join(h.p.DataDir, base+ext)); err != nil {
-			return err
+		publication, err := root.PublishNoReplace(base+output.ext+".tmp", base+output.ext)
+		if publication.Durability != safefs.DurabilityDurable {
+			durability = string(safefs.DurabilityUnknown)
+		}
+		if err != nil {
+			return snapshotPublication{}, err
 		}
 	}
-	return nil
+	hash := sha256.Sum256(jsonBytes)
+	return snapshotPublication{
+		SnapshotSHA256: hex.EncodeToString(hash[:]),
+		Visibility:     "visible",
+		Durability:     durability,
+	}, nil
 }
 
 func (h *handler) files(w http.ResponseWriter, r *http.Request) {
@@ -1294,12 +1487,13 @@ func (h *handler) files(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimPrefix(r.URL.Path, "/files/")
 	if name != filepath.Base(name) || name == "" ||
+		strings.Contains(name, ".profile.") ||
 		(!strings.HasSuffix(name, ".html") && !strings.HasSuffix(name, ".json") &&
 			!strings.HasSuffix(name, ".pprof")) {
 		http.Error(w, "invalid file name", http.StatusBadRequest)
 		return
 	}
-	http.ServeFile(w, r, filepath.Join(h.p.DataDir, name))
+	h.serveDataFile(w, r, name)
 }
 
 // sanitizeName keeps only characters safe for a filename component.
@@ -1412,20 +1606,37 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: run could not be started: "+err.Error(), http.StatusConflict)
 		return
 	}
-	// The generations are fresh again, so a flush has somewhere to land even
-	// when the run itself could not be opened.
-	h.runEnded.Store(false)
 	if run.RunID != "" {
 		w.Header().Set(runIDHeader, run.RunID)
 	}
-	// Profile the fresh generation (i.e. the benchmark that follows).
-	h.captureCPUProfile(h.currentGeneration())
+	if h.p.StartRun != nil && !runStartCanMeasure(run) {
+		message := "run did not enter started state"
+		if h.p.Health != nil {
+			h.p.Health.Set("runctl", health.StatusDegraded, message)
+		}
+		http.Error(w, "isutools: "+message, http.StatusInternalServerError)
+		return
+	}
+	// The generations are fresh again, so a flush has somewhere to land even
+	// when the run itself could not be opened.
+	h.runEnded.Store(false)
 	// The opening runtime profiles are taken here, after the boundary is fixed
 	// and immediately before the response: the benchmarker starts loading when
 	// it sees the response, so anything captured later would already contain
 	// benchmark traffic.
-	h.captureRuntimeProfiles(run, ProfilePointOpen, h.currentGeneration())
+	generation := h.currentGeneration()
+	h.captureRuntimeProfiles(run, ProfilePointOpen, generation)
+	// CPU starts after cumulative profiles so their serialization is not
+	// charged to the run-aligned CPU interval.
+	h.startCPUProfiles(r.Context(), run, generation)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func runStartCanMeasure(run RunStart) bool {
+	if run.State != "started" {
+		return false
+	}
+	return run.Validity == "valid" || run.Validity == "partial"
 }
 
 // rebaselineAccessLog re-opens the access log at the current end of file so
@@ -1500,7 +1711,11 @@ func (h *handler) completeRun(ctx context.Context) RunFinish {
 		return RunFinish{}
 	}
 	if h.p.Health != nil && run.RunID != "" {
-		h.p.Health.Set("runctl", health.StatusOK, "")
+		if run.Recovered {
+			h.p.Health.Set("runctl", health.StatusDegraded, "recovery save after "+run.RecoveryReason)
+		} else {
+			h.p.Health.Set("runctl", health.StatusOK, "")
+		}
 	}
 	return run
 }
@@ -1537,6 +1752,7 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: no run to finish: "+err.Error(), http.StatusConflict)
 		return
 	}
+	h.requestCPUStop(run.RunID, run.Epoch, "finishing", run.Validity, "finish-accepted", cpuFinishBoundary(run))
 	// The closing half of the run's profile pair, taken on this line and not
 	// one later. FinishRun returns the accepted boundary without waiting for
 	// the drain, the collect or the snapshot build, so a capture taken after
@@ -1583,6 +1799,7 @@ func (h *handler) abort(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: run could not be aborted: "+err.Error(), http.StatusConflict)
 		return
 	}
+	h.requestCPUStop(run.RunID, run.Epoch, "aborting", "invalid", run.Reason, run.AbortedAt)
 	h.abortRunProfiles(run.RunID)
 	if h.p.Health != nil {
 		h.p.Health.Set("runctl", health.StatusOK, "")

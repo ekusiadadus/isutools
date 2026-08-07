@@ -3,9 +3,84 @@ package hoststats
 import (
 	"context"
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/ekusiadadus/isutools/internal/runctl"
 )
+
+// TimelinePoint is a cumulative, whole-device disk reading for bucket deltas.
+type TimelinePoint struct {
+	ReadBytes  uint64
+	WriteBytes uint64
+	IOTicks    time.Duration
+	WeightedIO time.Duration
+}
+
+// Point reads only diskstats for the optional high-frequency timeline. It does
+// not invoke statfs, PSI, identity or cgroup reads from the boundary collector.
+func (c *Collector) Point(ctx context.Context) (TimelinePoint, error) {
+	if c == nil {
+		return TimelinePoint{}, fmt.Errorf("hoststats: nil collector")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return TimelinePoint{}, err
+	}
+	data, err := readFile(c.opt.ProcFS, pathDiskstats)
+	if err != nil {
+		return TimelinePoint{}, err
+	}
+	disks, err := parseDiskstats(data, wholeDeviceFilter(c.opt.SysFS))
+	if err != nil {
+		return TimelinePoint{}, err
+	}
+	var point TimelinePoint
+	for _, disk := range disks {
+		readBytes, ok := sectorBytes(disk.ReadSectors)
+		if !ok {
+			return TimelinePoint{}, fmt.Errorf("hoststats: disk read byte counter overflows")
+		}
+		writeBytes, ok := sectorBytes(disk.WriteSectors)
+		if !ok {
+			return TimelinePoint{}, fmt.Errorf("hoststats: disk write byte counter overflows")
+		}
+		ioTicks, ok := millisecondsDuration(disk.IOTicksMS)
+		if !ok {
+			return TimelinePoint{}, fmt.Errorf("hoststats: disk io time counter overflows")
+		}
+		weighted, ok := millisecondsDuration(disk.WeightedMS)
+		if !ok {
+			return TimelinePoint{}, fmt.Errorf("hoststats: disk weighted time counter overflows")
+		}
+		if point.ReadBytes > math.MaxUint64-readBytes || point.WriteBytes > math.MaxUint64-writeBytes ||
+			point.IOTicks > time.Duration(math.MaxInt64)-ioTicks ||
+			point.WeightedIO > time.Duration(math.MaxInt64)-weighted {
+			return TimelinePoint{}, fmt.Errorf("hoststats: aggregate disk counter overflows")
+		}
+		point.ReadBytes += readBytes
+		point.WriteBytes += writeBytes
+		point.IOTicks += ioTicks
+		point.WeightedIO += weighted
+	}
+	return point, nil
+}
+
+func millisecondsDuration(milliseconds uint64) (time.Duration, bool) {
+	if milliseconds > uint64(math.MaxInt64/int64(time.Millisecond)) {
+		return 0, false
+	}
+	return time.Duration(milliseconds) * time.Millisecond, true
+}
+
+func sectorBytes(sectors uint64) (uint64, bool) {
+	if sectors > math.MaxUint64/512 {
+		return 0, false
+	}
+	return sectors * 512, true
+}
 
 // A Collector is registered through runctl.RegisterBaseline, so the contract
 // is asserted here rather than discovered at the call site.

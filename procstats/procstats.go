@@ -85,6 +85,17 @@ type CPUTotal struct {
 	IdlePercent   float64 `json:"idlePercent"`
 }
 
+// Point is one cumulative process/host CPU reading for time-bucket deltas.
+// It intentionally contains no command names or per-PID rows.
+type Point struct {
+	TotalJiffies   uint64
+	BusyJiffies    uint64
+	IOWaitJiffies  uint64
+	ProcessJiffies uint64
+	CPUs           int
+	RSSBytes       uint64
+}
+
 // cpuTimes is the aggregate /proc/stat cpu line split into categories.
 type cpuTimes struct {
 	total  uint64
@@ -501,6 +512,49 @@ func (c *Collector) Health() Health {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return cloneHealth(c.lastHealth)
+}
+
+// TimelinePoint reads the cumulative counters needed by the optional
+// run-aligned timeline. It shares the collector lock with boundary snapshots
+// so procfs reads cannot interleave with a reset.
+func (c *Collector) TimelinePoint() (Point, error) {
+	if c == nil {
+		return Point{}, errors.New("procstats: nil collector")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current, _, err := c.readSample(true)
+	if err != nil {
+		return Point{}, err
+	}
+	point := Point{
+		TotalJiffies: current.total, IOWaitJiffies: current.times.iowait,
+		CPUs: current.cpus,
+	}
+	idleAndWait, ok := checkedUintAdd(current.times.idle, current.times.iowait)
+	if !ok || idleAndWait > current.total {
+		return Point{}, errors.New("procstats: aggregate busy counter is invalid")
+	}
+	point.BusyJiffies = current.total - idleAndWait
+	for _, process := range current.processes {
+		var added bool
+		point.ProcessJiffies, added = checkedUintAdd(point.ProcessJiffies, process.cpu)
+		if !added {
+			return Point{}, errors.New("procstats: process CPU counter sum overflows")
+		}
+		point.RSSBytes, added = checkedUintAdd(point.RSSBytes, process.rssBytes)
+		if !added {
+			return Point{}, errors.New("procstats: process RSS sum overflows")
+		}
+	}
+	return point, nil
+}
+
+func checkedUintAdd(a, b uint64) (uint64, bool) {
+	if ^uint64(0)-a < b {
+		return 0, false
+	}
+	return a + b, true
 }
 
 func (c *Collector) readSample(readRSS bool) (sample, Health, error) {

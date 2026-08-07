@@ -588,7 +588,10 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 
 ### v1.0 に入れない(1.x 以降)
 
-- pprof top 関数のレポート内表示(現状のファイル DL + `go tool pprof -http` で実用十分)
+- pprof top 関数のレポート内表示はopt-in derived analysisとしてcode実装済み・release未承認。
+  schema/worker/CLI/CAS/UI/sidecar/fixed retentionはコード化済みでGo 1.24 test、Linux cgroup v2
+  hard-limit/OOM、実`runtime/pprof` CPU profile解析も通過したが、Darwin crash faultとABBA release
+  gateは未完了
 - JSON→Markdown フォーマッタ(Discord/GitHub 連携強化)
 - Apache ログ(`%D`/`%O`)対応・gqlstats(必要になった時点で)
 - HTTP/3 統合テスト(quic-go 環境依存)

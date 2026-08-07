@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,7 +57,8 @@ func TestResetTriggersCPUCapture(t *testing.T) {
 		matches, _ := filepath.Glob(filepath.Join(dir, "*.pprof"))
 		if len(matches) > 0 {
 			info, err := os.Stat(matches[0])
-			if err == nil && info.Size() > 0 {
+			sidecar := strings.TrimSuffix(matches[0], profileArtifactExt) + profileSidecarExt
+			if _, sidecarErr := os.Stat(sidecar); err == nil && info.Size() > 0 && sidecarErr == nil {
 				break
 			}
 		}
@@ -69,6 +71,32 @@ func TestResetTriggersCPUCapture(t *testing.T) {
 	// The captured profile must be listed on the index and downloadable.
 	matches, _ := filepath.Glob(filepath.Join(dir, "*.pprof"))
 	name := filepath.Base(matches[0])
+	body, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sidecarName := strings.TrimSuffix(name, profileArtifactExt) + profileSidecarExt
+	sidecarBody, err := os.ReadFile(filepath.Join(dir, sidecarName))
+	if err != nil {
+		t.Fatalf("fixed CPU sidecar was not published: %v", err)
+	}
+	var fixed FixedCPUProfileRecord
+	if err := json.Unmarshal(sidecarBody, &fixed); err != nil {
+		t.Fatal(err)
+	}
+	if fixed.Schema != fixedCPUProfileSchema || fixed.Mode != "fixed" || fixed.Status != "published" ||
+		fixed.File != name || fixed.SHA256 != hashBytes(body) || fixed.Bytes != int64(len(body)) || fixed.CaptureID == "" {
+		t.Fatalf("fixed CPU sidecar = %#v", fixed)
+	}
+	for _, artifact := range []string{name, sidecarName} {
+		info, err := os.Stat(filepath.Join(dir, artifact))
+		if err != nil {
+			t.Fatalf("fixed artifact %s stat: %v", artifact, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("fixed artifact %s mode=%v", artifact, info.Mode().Perm())
+		}
+	}
 
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -321,6 +349,11 @@ func TestProfilePairMetadataRecordsTheResidual(t *testing.T) {
 	if manifest == nil || len(manifest.Pairs) != 1 {
 		t.Fatalf("manifest = %+v, want one pair", manifest)
 	}
+	for _, capture := range manifest.Captures {
+		if capture.Status == profileStatusOK && len(capture.SHA256) != 64 {
+			t.Fatalf("successful capture has no full SHA-256: %#v", capture)
+		}
+	}
 	pair := manifest.Pairs[0]
 	if pair.HeadLossNs < 0 || pair.TailExcessNs < 0 {
 		t.Errorf("residuals must be non-negative: %+v", pair)
@@ -547,9 +580,8 @@ func TestProfileRetentionDropsOrphansFirst(t *testing.T) {
 		write(prefix+"_heap_open.pprof", prefix+"_heap_open.meta.json",
 			prefix+"_heap_close.pprof", prefix+"_heap_close.meta.json")
 	}
-	// None of these belong to the pair naming and none may be deleted.
+	// None of these belong to a managed profile group and none may be deleted.
 	bystanders := []string{
-		"20260805-120000_gen2_cpu.pprof",
 		older + "_heap_save.pprof",
 		"20260805-120000-000001_gen2_abc1234.html",
 		"20260805-120000-000001_gen2_abc1234.json",
@@ -584,6 +616,26 @@ func TestProfileRetentionDropsOrphansFirst(t *testing.T) {
 	}
 }
 
+func TestProfileRetentionTreatsFixedCPUAndSidecarAsOneCompleteGroup(t *testing.T) {
+	dir := t.TempDir()
+	older := "20260805-120000_gen1_cpu"
+	newer := "20260805-120100_gen2_cpu"
+	for _, base := range []string{older, newer} {
+		for _, suffix := range []string{profileArtifactExt, profileSidecarExt} {
+			if err := os.WriteFile(filepath.Join(dir, base+suffix), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	pruneProfileArtifacts(dir, 1, 1<<30, "", nil)
+	if files := globNames(t, dir, older+"*"); len(files) != 0 {
+		t.Fatalf("old fixed CPU group retained: %v", files)
+	}
+	if files := globNames(t, dir, newer+"*"); len(files) != 2 {
+		t.Fatalf("new fixed CPU group = %v, want profile and sidecar", files)
+	}
+}
+
 // TestProfileRetentionNeverDropsTheRunBeingCaptured guards the one group that
 // is not safe to reclaim: the pair currently being assembled.
 func TestProfileRetentionNeverDropsTheRunBeingCaptured(t *testing.T) {
@@ -601,8 +653,8 @@ func TestProfileRetentionNeverDropsTheRunBeingCaptured(t *testing.T) {
 }
 
 // TestProfileArtifactPrefixIgnoresEverythingElse is what keeps the superseded
-// "_save"/"_reset" artifacts, CPU profiles and saved snapshots out of both the
-// pairing and the retention sweep.
+// "_save"/"_reset" artifacts and saved snapshots out of both pairing and
+// retention. Fixed CPU files are intentionally retention-only groups.
 func TestProfileArtifactPrefixIgnoresEverythingElse(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -613,7 +665,12 @@ func TestProfileArtifactPrefixIgnoresEverythingElse(t *testing.T) {
 		{name: "20260805-120000_gen7_run-a1b2_heap_close.meta.json", want: "20260805-120000_gen7_run-a1b2", wantOK: true},
 		{name: "20260805-120000_gen7_run-a1b2_heap_save.pprof"},
 		{name: "20260805-120000_gen7_run-a1b2_heap_reset.pprof"},
-		{name: "20260805-120000_gen2_cpu.pprof"},
+		{name: "20260805-120000_gen2_cpu.pprof", want: "20260805-120000_gen2_cpu", wantOK: true},
+		{name: "20260805-120000_gen2_cpu.meta.json", want: "20260805-120000_gen2_cpu", wantOK: true},
+		{name: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa.pprof", want: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa", wantOK: true},
+		{name: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa.meta.json", want: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa", wantOK: true},
+		{name: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa.coverage.000001." + strings.Repeat("b", 64) + ".json", want: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa", wantOK: true},
+		{name: "cpu_019876543210aaaaaaaaaaaaaaaaaaaa.coverage.1." + strings.Repeat("b", 64) + ".json"},
 		{name: "20260805-120000-000001_gen2_abc1234.json"},
 		{name: "20260805-120000-000001_gen2_abc1234.html"},
 		{name: "20260805-120000_gen7_run-a1b2_heap_open.pprof.tmp"},
@@ -626,6 +683,30 @@ func TestProfileArtifactPrefixIgnoresEverythingElse(t *testing.T) {
 				t.Errorf("prefix = %q,%v, want %q,%v", got, ok, tt.want, tt.wantOK)
 			}
 		})
+	}
+}
+
+func TestProfileRetentionOrdersRunCPUAndTimestampGroupsChronologically(t *testing.T) {
+	dir := t.TempDir()
+	oldTime := time.Date(2026, 8, 5, 11, 59, 0, 0, reportTZ)
+	oldID := fmt.Sprintf("%012x%s", oldTime.UnixMilli(), strings.Repeat("a", 20))
+	oldCPU := "cpu_" + oldID
+	newer := "20260805-120000_gen2_run-bbbb"
+	for _, name := range []string{
+		oldCPU + profileArtifactExt, oldCPU + profileSidecarExt,
+		newer + "_heap_open.pprof", newer + "_heap_open.meta.json",
+		newer + "_heap_close.pprof", newer + "_heap_close.meta.json",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneProfileArtifacts(dir, 1, 1<<30, "", nil)
+	if files := globNames(t, dir, oldCPU+"*"); len(files) != 0 {
+		t.Fatalf("older run CPU retained: %v", files)
+	}
+	if files := globNames(t, dir, newer+"*"); len(files) != 4 {
+		t.Fatalf("newer cumulative group = %v", files)
 	}
 }
 
@@ -730,6 +811,10 @@ func TestCaptureWriteFailureIsRecordedAndNonFatal(t *testing.T) {
 	// published an opening half simply captures nothing.
 	if names := h.captureCloseProfiles(RunFinish{RunID: run.RunID, AcceptedAt: time.Now()}); names != nil {
 		t.Errorf("close artifacts = %v, want none", names)
+	}
+	manifest := h.profileManifest(run.RunID)
+	if manifest == nil || len(manifest.Expected) != 1 || len(manifest.Expected[0].Inputs) != 2 || manifest.Expected[0].Inputs[0].File == "" {
+		t.Fatalf("failed capture lost expected inputs: %#v", manifest)
 	}
 }
 

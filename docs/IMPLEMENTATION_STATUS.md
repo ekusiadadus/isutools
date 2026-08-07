@@ -1,10 +1,53 @@
 # Implementation and verification status
 
-Updated: 2026-08-05 (Asia/Tokyo) — current release: **v1.2.0**
+Updated: 2026-08-07 (Asia/Tokyo) — current release: **v1.3.0**
 
-`v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1). v1.2.0 is
-the `feat/v1.2.0-foundation` tree; every number under
-[Test evidence](#test-evidence) was measured on that tree, not copied forward.
+`v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1),
+`v1.2.0` tag = `833515e`, and `v1.3.0` tag = `26aa2bb` (merge of PR #14).
+The existing v1.2 sections below remain historical evidence; their numbers are
+not silently reused for the current working tree.
+
+## Unreleased working-tree implementation (2026-08-06)
+
+The `feat/v1.2.0-foundation` working tree after v1.3.0 contains these additional
+changes. They are implemented and locally verified, but are not described as
+released until a PR is merged and a later tag exists:
+
+- issue #12 documentation: SSH loopback forwarding now states the network-
+  namespace prerequisite, gives an SSH-lifetime-scoped WSL2 guest relay,
+  keepalive/fail-fast options, four-layer diagnostics, and explicitly forbids
+  exposing unauthenticated port 19191 on `0.0.0.0`
+- issue #15 recovery: `/save` may recover only an exact `(RunID, Epoch)` whose
+  bounded in-process ledger proves a `started-ttl` terminal event; it persists
+  the supplied score/pass plus aborted/invalid/partial recovery provenance and
+  leaves other terminal causes fail-closed at HTTP 409
+- issue #16 timeline: bounded run/epoch-fenced HTTP, SQL, DB-pool, process, and
+  host-resource buckets; deterministic phase detection; evidence-windowed
+  `correlation-suspect` critical-path candidates; secret-safe route identities;
+  persisted score/pass outcome; and evidence-backed diff contradictions
+- pprof external analysis: opt-in run-aligned CPU ownership, cumulative
+  profiles, immutable capture evidence, hard-isolated external analysis,
+  binary provenance, root-scoped artifact I/O, explicit publication CAS, and
+  derived HTML
+
+Current-tree verification:
+
+| check | environment | result |
+|---|---|---|
+| race + shuffle + coverage | Go 1.26.5, darwin/arm64 | PASS, aggregate **87.1%** |
+| vet | Go 1.26.5, darwin/arm64 | PASS |
+| lint | `golangci-lint run ./...` | PASS, **0 issues** |
+| Actions lint | actionlint v1.7.12 | PASS |
+| vulnerability scan | govulncheck v1.6.0 | PASS, **0 reachable vulnerabilities** (one required-module advisory is unreachable from this code) |
+| new direct dependency licenses | google/pprof Apache-2.0; x/sys BSD-3-Clause | compatible; license files inspected in the resolved module versions |
+| scripts | shellcheck, `bash -n`, ABBA contract | PASS |
+| minimum Go | Go 1.24.x, Linux/arm64 Docker | all-package test + vet PASS |
+| hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
+
+The pprof external-analysis Darwin crash-fault test, private-isu ABBA release
+gate, remote GitHub Actions result for the new cgroup job, and deployment
+behavior are still unverified. Plan 10 multi-host aggregation remains
+intentionally unimplemented.
 
 ## Implemented and released
 

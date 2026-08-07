@@ -785,6 +785,7 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <body>
 <h1>isutools report{{if .Snapshot.Meta.Score}} — score {{.Snapshot.Meta.Score}}{{end}}</h1>
 <p class="meta">{{.Snapshot.Meta.Time}} &middot; rev {{.Snapshot.Meta.Revision}} ({{.Snapshot.Meta.BuildSource}}) &middot; gen {{.Snapshot.Meta.Generation}}{{if .Snapshot.Meta.Score}} &middot; score {{.Snapshot.Meta.Score}}{{end}}{{if not .Snapshot.Meta.ProvenanceValid}} &middot; build provenance unverified{{end}}</p>
+{{with .Snapshot.Meta.BenchmarkPass}}<p class="meta">benchmark pass: {{.}}</p>{{end}}
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
 
@@ -807,6 +808,34 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 </tr>{{end}}</tbody>
 </table>
 {{else}}<p class="empty">no core collector warnings</p>{{end}}
+
+{{with .Snapshot.Timeline}}
+<h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
+<p class="meta">{{ns .IntervalNs}} buckets &middot; {{len .Buckets}} / {{.MaxBuckets}} retained{{if .Truncated}} &middot; <span class="warn">truncated</span>{{end}}{{if .OverflowedEvents}} &middot; overflowed events {{.OverflowedEvents}}{{end}}</p>
+{{if .Analysis.Available}}
+{{if .Analysis.Phases}}
+<table>
+<thead><tr><th>bucket</th><th>phase</th><th>window</th><th>signal</th><th>metric</th><th>value</th><th>formula / limitation</th></tr></thead>
+<tbody>{{range .Analysis.Phases}}{{$phase := .}}{{range .Evidence}}<tr>
+<td>{{.BucketIndex}}</td><td class="l">{{$phase.Kind}}</td><td>{{.WindowStart}} – {{.WindowEnd}}</td><td class="l">{{.Signal}}</td><td class="l">{{.Metric}}</td><td>{{f1 .Value}}</td><td class="l">{{.Formula}}; limitation: {{.Limitation}}</td>
+</tr>{{end}}{{end}}</tbody>
+</table>
+{{end}}
+{{if .Analysis.Suspects}}
+<table>
+<thead><tr><th>score</th><th>label</th><th>kind</th><th>candidate</th><th>signal</th><th>evidence</th></tr></thead>
+<tbody>{{range .Analysis.Suspects}}<tr>
+<td data-v="{{.Score}}">{{.Score}}</td><td>{{.Label}}</td><td>{{.Kind}}</td><td class="l">{{.Key}}</td><td class="l">{{.Signal}}</td>
+<td class="l">{{range .Evidence}}bucket {{.BucketIndex}} {{.Metric}}={{f1 .Value}}; {{.Formula}}; limitation: {{.Limitation}}{{end}}</td>
+</tr>{{end}}</tbody>
+</table>
+{{else}}<p class="empty">no correlation suspects met the published rules</p>{{end}}
+{{else}}<p class="empty">time-aware analysis unavailable: {{.Analysis.Reason}}. Aggregate SQL/HTTP/resource tables remain authoritative.</p>{{end}}
+<details><summary>phase rules</summary>{{range .Analysis.Rules}}<p class="meta"><strong>{{.ID}}</strong>: {{.Formula}}; limitation: {{.Limitation}}</p>{{end}}</details>
+{{else}}
+<h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
+<p class="empty">time-aware analysis unavailable: timeline not captured. Aggregate SQL/HTTP/resource tables remain authoritative. Enable ISUTOOLS_TIMELINE=1 before the run to collect bounded buckets.</p>
+{{end}}
 
 <h2>Advisor <span class="meta">(ISUCON 定石で未設定のもの)</span></h2>
 {{if .Snapshot.Advisor}}

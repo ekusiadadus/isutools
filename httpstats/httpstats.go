@@ -34,6 +34,24 @@ type Rule struct {
 	Replacement string
 }
 
+// EventObserver receives bounded, already-sanitized request events for
+// run-aligned consumers such as the optional timeline. Observer failures are
+// isolated from the application request path.
+type EventObserver interface {
+	HTTPStart(time.Time) any
+	HTTPFinish(time.Time, any, string, time.Duration, bool)
+	HTTPCancel(time.Time, any)
+}
+
+type eventObserverSlot struct {
+	observer EventObserver
+}
+
+type httpEvent struct {
+	observer EventObserver
+	token    any
+}
+
 // Option configures a Collector.
 type Option func(*config)
 
@@ -127,11 +145,13 @@ type table struct {
 //
 // Lock order: mu may be held while acquiring connMu, never the reverse.
 type Collector struct {
-	mu      sync.Mutex
-	resetMu sync.Mutex
-	current *generation
-	maxKeys int
-	rules   []Rule
+	mu         sync.Mutex
+	resetMu    sync.Mutex
+	current    *generation
+	maxKeys    int
+	rules      []Rule
+	eventRules []SafeProfileRouteRule
+	observer   atomic.Pointer[eventObserverSlot]
 
 	// gens is the boundary bookkeeping, guarded by mu.
 	gens generationState
@@ -144,6 +164,31 @@ type Collector struct {
 	connRead    int64
 	connWrote   int64
 	connBuckets [64]int64
+}
+
+// SetEventRouteRules installs full-match-to-constant rules for event labels.
+// They are separate from legacy aggregation rules, whose replacements may
+// retain captures and therefore cannot prove non-secret output.
+func (c *Collector) SetEventRouteRules(rules []SafeProfileRouteRule) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.eventRules = append([]SafeProfileRouteRule(nil), rules...)
+	c.mu.Unlock()
+}
+
+// SetEventObserver replaces the optional event observer. Passing nil disables
+// event delivery. The observer is process-local and is never serialized.
+func (c *Collector) SetEventObserver(observer EventObserver) {
+	if c == nil {
+		return
+	}
+	if observer == nil {
+		c.observer.Store(nil)
+		return
+	}
+	c.observer.Store(&eventObserverSlot{observer: observer})
 }
 
 // Default is used by the package-level Middleware helper.
@@ -210,6 +255,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g := c.begin()
 		start := time.Now()
+		event := c.beginHTTPEvent(start)
 		tracker := &connectionTracker{collector: c, generation: g, started: start}
 		capture := &responseWriter{ResponseWriter: w}
 		capture.onCommit = func(status int) {
@@ -235,9 +281,11 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 			if strings.HasPrefix(capture.Header().Get("Content-Type"), "text/event-stream") {
 				tracker.start(false)
 			}
+			finishedAt := time.Now()
 			if tracker.finishHandler(capture.bytes) {
 				// Long-lived connections are released from the request generation
 				// as soon as they are confirmed, so Reset never waits for them.
+				finishHTTPCancel(event, finishedAt)
 			} else {
 				id := identity{
 					method:   r.Method,
@@ -245,7 +293,9 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 					protocol: r.Proto,
 					status:   capture.status,
 				}
-				c.finish(g, id, time.Since(start), capture.bytes)
+				duration := finishedAt.Sub(start)
+				c.finish(g, id, duration, capture.bytes)
+				finishHTTPEvent(event, finishedAt, c.timelineKey(r), duration, capture.status >= http.StatusInternalServerError)
 			}
 			if panicked != nil {
 				panic(panicked)
@@ -254,6 +304,48 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(wrapped, r)
 	})
+}
+
+func (c *Collector) beginHTTPEvent(at time.Time) (event httpEvent) {
+	slot := c.observer.Load()
+	if slot == nil || slot.observer == nil {
+		return httpEvent{}
+	}
+	event.observer = slot.observer
+	defer func() {
+		if recover() != nil {
+			event = httpEvent{}
+		}
+	}()
+	event.token = event.observer.HTTPStart(at)
+	return event
+}
+
+func finishHTTPEvent(event httpEvent, at time.Time, key string, duration time.Duration, failed bool) {
+	if event.observer == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	event.observer.HTTPFinish(at, event.token, key, duration, failed)
+}
+
+func finishHTTPCancel(event httpEvent, at time.Time) {
+	if event.observer == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	event.observer.HTTPCancel(at, event.token)
+}
+
+// timelineKey permits only a router-owned pattern or an explicitly configured
+// full-match-to-constant rule. The heuristic path fallback used by the legacy
+// table is useful for aggregation but cannot prove that a slug is non-secret.
+func (c *Collector) timelineKey(r *http.Request) string {
+	c.mu.Lock()
+	rules := append([]SafeProfileRouteRule(nil), c.eventRules...)
+	c.mu.Unlock()
+	label := SafeProfileLabelWithRules(r, rules)
+	return label.Method + " " + label.Route
 }
 
 // Snapshot returns the currently active generation without clearing it.
@@ -557,7 +649,8 @@ func bucketFor(ns int64) int {
 }
 
 func p95(s *stat) int64 {
-	target := (s.count*95 + 99) / 100
+	// ceil(count*0.95), without overflowing at MaxInt64.
+	target := s.count - s.count/20
 	var cumulative int64
 	for i, count := range s.buckets {
 		cumulative += count

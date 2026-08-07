@@ -93,6 +93,19 @@ type Collector struct {
 	now func() time.Time
 }
 
+// Point is one bounded, instantaneous pool reading for the optional timeline.
+// Cumulative wait fields are converted to per-bucket deltas by the timeline
+// collector; the remaining fields describe saturation at this instant.
+type Point struct {
+	TargetID     string
+	MaxOpen      int
+	Open         int
+	InUse        int
+	Idle         int
+	WaitCount    int64
+	WaitDuration time.Duration
+}
+
 // New returns an empty collector.
 func New() *Collector {
 	return &Collector{
@@ -215,6 +228,39 @@ func (c *Collector) Watched() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// Points returns the current watched-pool readings in TargetID order. A pool
+// whose Stats callback panics is omitted; application diagnostics must never
+// be able to panic the application.
+func (c *Collector) Points() []Point {
+	if c == nil {
+		return nil
+	}
+	type source struct {
+		id    string
+		stats func() sql.DBStats
+	}
+	c.mu.Lock()
+	sources := make([]source, 0, len(c.watch))
+	for id, watched := range c.watch {
+		sources = append(sources, source{id: id, stats: watched.stats})
+	}
+	c.mu.Unlock()
+	sort.Slice(sources, func(i, j int) bool { return sources[i].id < sources[j].id })
+	points := make([]Point, 0, len(sources))
+	for _, source := range sources {
+		stats, ok := safeStats(source.stats)
+		if !ok {
+			continue
+		}
+		points = append(points, Point{
+			TargetID: source.id, MaxOpen: stats.MaxOpenConnections,
+			Open: stats.OpenConnections, InUse: stats.InUse, Idle: stats.Idle,
+			WaitCount: stats.WaitCount, WaitDuration: stats.WaitDuration,
+		})
+	}
+	return points
 }
 
 // Notes returns the degradation notes recorded so far. Each note starts with

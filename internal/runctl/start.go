@@ -239,6 +239,13 @@ func (c *Controller) beginRun(ctx context.Context, o StartRunOptions, plan start
 		c.endOwner(slot)
 		return StartResult{}, fmt.Errorf("runctl: run %s was preempted while starting: %w", runID, ErrRunAborted)
 	}
+	if res.State == StateAborted {
+		c.observeTermination(RunTerminationEvent{
+			RunID: runID, Epoch: ep, State: StateAborted,
+			Validity: ValidityInvalid, Reason: ReasonRequiredFailed,
+			BoundaryAt: res.StartedAt,
+		})
+	}
 	c.endOwner(slot)
 	return res.clone(), nil
 }

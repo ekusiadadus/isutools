@@ -37,6 +37,7 @@ import (
 
 	"github.com/ekusiadadus/isutools/accesslog"
 	"github.com/ekusiadadus/isutools/advisor"
+	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/counters"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
@@ -45,6 +46,8 @@ import (
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/internal/runctl"
+	"github.com/ekusiadadus/isutools/internal/safefs"
+	"github.com/ekusiadadus/isutools/internal/timeline"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
@@ -169,6 +172,17 @@ var (
 // both Handler() and ResetNow go through it.
 type measurement struct {
 	ctrl *runctl.Controller
+	// cpu is the sole run-aligned CPU owner. cpuBridge and the runctl observer
+	// both refer to it in run mode; in fixed mode cpuBridge instead holds the
+	// shared timer owner and no lifecycle observer is installed.
+	cpu         cpuCoordinator
+	cpuBridge   *cpuWebBridge
+	cpuRoot     *safefs.Root
+	cpuMode     string
+	cpuDuration time.Duration
+	recovery    *runRecoveryLedger
+	timeline    *timelineRuntime
+	executable  *buildinfo.ExecutableIdentity
 	// proc is nil where procfs does not exist.
 	proc *procstats.Collector
 	// procManaged means proc is registered as a coordinated baseline collector,
@@ -268,6 +282,29 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 	if opts.Health == nil {
 		opts.Health = collectorHealth
 	}
+	var (
+		cpu       cpuCoordinator
+		cpuBridge *cpuWebBridge
+		cpuRoot   *safefs.Root
+		cpuMode   string
+	)
+	if getenv("ISUTOOLS") != "off" {
+		cpu, cpuBridge, cpuRoot, cpuMode = newRunCPUCoordinator(getenv)
+	}
+	recovery := newRunRecoveryLedger()
+	timelineRuntime := newTimelineRuntime(getenv)
+	observers := joinedRunObservers{}
+	if opts.LifecycleObserver != nil {
+		observers = append(observers, opts.LifecycleObserver)
+	}
+	observers = append(observers, recovery)
+	if timelineRuntime != nil {
+		observers = append(observers, timelineRuntime)
+	}
+	if cpu != nil {
+		observers = append(observers, cpuRunObserver{owner: cpu})
+	}
+	opts.LifecycleObserver = observers
 	// The enrich hook has to be decided before the Controller exists, because
 	// a Controller's hook is fixed at construction. Preserve an Enrich supplied
 	// by the caller and compose query-plan capture after it; enabling EXPLAIN
@@ -286,22 +323,73 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		// instead of panicking in a library path.
 		log.Printf("isutools: run controller falling back to package defaults: %v", err)
 		ctrl = runctl.Default()
+		// The fallback Controller does not carry the observer installed above.
+		// Keeping a managed CPU owner would create exactly the split ownership
+		// this integration forbids, so disable and release it fail-closed.
+		if cpu != nil {
+			cpu.Close()
+		}
+		if cpuRoot != nil {
+			_ = cpuRoot.Close()
+		}
+		cpu, cpuBridge, cpuRoot, cpuMode = nil, nil, nil, ""
+		if timelineRuntime != nil {
+			timelineRuntime.close()
+			timelineRuntime = nil
+		}
 	}
 	// The process collector is built even when measurement is off, because
 	// Handler() has always served a report regardless of ISUTOOLS=off.
 	m := &measurement{
-		ctrl:       ctrl,
-		proc:       newProcCollector(),
-		explain:    explain,
-		generation: sqlstats.Default.CurrentGeneration,
+		ctrl:        ctrl,
+		cpu:         cpu,
+		cpuBridge:   cpuBridge,
+		cpuRoot:     cpuRoot,
+		cpuMode:     cpuMode,
+		cpuDuration: pprofDuration(getenv),
+		recovery:    recovery,
+		timeline:    timelineRuntime,
+		proc:        newProcCollector(),
+		explain:     explain,
+		generation:  sqlstats.Default.CurrentGeneration,
 	}
 	if getenv("ISUTOOLS") == "off" {
 		return m
 	}
-	registerCollectors(ctrl, getenv)
+	baselines := registerCollectorsStatus(ctrl, getenv)
 	m.procManaged = registerProcCollector(ctrl, m.proc)
 	m.generationManaged = registerGenerationCollectorsStatus(ctrl, gens)
+	if m.timeline != nil {
+		var pools *dbpool.Collector
+		if featureEnabled(getenv, envDBPool) {
+			pools = dbpool.Default
+		}
+		m.timeline.setSources(m.proc, baselines.host, pools)
+		if collector, ok := gens.http.(*httpstats.Collector); ok {
+			rules, err := httpstats.ParseSafeProfileRouteRules(getenv(envTimelineSafeRoutes))
+			if err != nil {
+				collectorHealth.Set(healthTimeline, health.StatusDegraded, err.Error()+"; unmatched routes only")
+				rules = nil
+			}
+			collector.SetEventRouteRules(rules)
+			collector.SetEventObserver(m.timeline.collector)
+		}
+		if collector, ok := gens.sql.(interface{ SetEventObserver(sqlstats.EventObserver) }); ok {
+			collector.SetEventObserver(m.timeline.collector)
+		}
+	}
 	m.profiles = resolveProfileSettings(getenv).apply(collectorHealth)
+	if cpu != nil || len(m.profiles) != 0 || getenv(envProfileAnalysis) == "1" {
+		identity, err := buildinfo.CaptureExecutable()
+		m.executable = &identity
+		if err != nil {
+			collectorHealth.Set("profile-provenance", health.StatusDegraded, err.Error())
+		} else if identity.Source == buildinfo.SourceProcSelfExe {
+			collectorHealth.Set("profile-provenance", health.StatusOK, "")
+		} else {
+			collectorHealth.Set("profile-provenance", health.StatusDegraded, "running image hash is path-unbound on this platform")
+		}
+	}
 	// The capturer is built from the environment rather than from Handler(), so
 	// an application that opens its runs through ResetNow still publishes the
 	// opening half of every pair when the admin server is disabled.
@@ -369,7 +457,17 @@ func newProcCollector() *procstats.Collector {
 // and appears in no boundary record, which is what makes "measure without
 // this collector" a real comparison instead of an approximation.
 func registerCollectors(ctrl *runctl.Controller, getenv func(string) string) []string {
+	return registerCollectorsStatus(ctrl, getenv).names
+}
+
+type baselineRegistration struct {
+	names []string
+	host  *hoststats.Collector
+}
+
+func registerCollectorsStatus(ctrl *runctl.Controller, getenv func(string) string) baselineRegistration {
 	var registered []string
+	var host *hoststats.Collector
 	add := func(reg runctl.Registration, coll runctl.BaselineCollector) {
 		if err := ctrl.RegisterBaseline(reg, coll); err != nil {
 			collectorHealth.Set(reg.Name, health.StatusFailed, err.Error())
@@ -389,6 +487,7 @@ func registerCollectors(ctrl *runctl.Controller, getenv func(string) string) []s
 			collectorHealth.Set(hoststats.CollectorName, health.StatusDisabled, err.Error())
 		} else {
 			add(runctl.Registration{Name: hoststats.CollectorName}, collector)
+			host = collector
 		}
 	} else {
 		collectorHealth.Set(hoststats.CollectorName, health.StatusDisabled, hoststats.EnvEnable+" is off")
@@ -422,7 +521,7 @@ func registerCollectors(ctrl *runctl.Controller, getenv func(string) string) []s
 	} else {
 		collectorHealth.Set(dbpool.Name, health.StatusDisabled, envDBPool+" is off")
 	}
-	return registered
+	return baselineRegistration{names: registered, host: host}
 }
 
 // registerGenerationCollectors wires the swappable-generation collectors into
@@ -904,8 +1003,31 @@ func (m *measurement) resetNow(ctx context.Context, o runctl.StartRunOptions) (S
 	if err != nil {
 		return result, err
 	}
+	if result.State != runctl.StateStarted ||
+		(result.Validity != runctl.ValidityValid && result.Validity != runctl.ValidityPartial) {
+		return result, nil
+	}
 	m.captureOpenProfiles(result)
+	if m.cpuBridge != nil && m.cpuMode == "run" {
+		m.cpuBridge.StartRun(ctx, web.CPUStartRequest{
+			RunID: result.RunID, Epoch: uint64(result.Epoch), State: string(result.State), Validity: string(result.Validity),
+			BoundaryStart: cpuStartBoundary(result), GenerationWindow: webBoundaryWindow(result.GenerationWindow), BoundaryWindow: webBoundaryWindow(result.BoundaryWindow),
+		})
+	} else if m.cpuBridge != nil && m.cpuMode == "fixed" {
+		m.cpuBridge.StartFixed(ctx, web.FixedCPUStartRequest{
+			RunID: result.RunID, Epoch: uint64(result.Epoch), State: string(result.State), Validity: string(result.Validity),
+			Generation: m.generation(), Duration: m.cpuDuration, RequestedAt: time.Now(),
+			GenerationWindow: webBoundaryWindow(result.GenerationWindow), BoundaryWindow: webBoundaryWindow(result.BoundaryWindow),
+		})
+	}
 	return result, nil
+}
+
+func cpuStartBoundary(result runctl.StartResult) time.Time {
+	if !result.GenerationWindow.Max.IsZero() {
+		return result.GenerationWindow.Max
+	}
+	return result.StartedAt
 }
 
 // captureOpenProfiles writes the opening half of the pair for a run this
@@ -935,6 +1057,10 @@ func (m *measurement) startRun(ctx context.Context, o runctl.StartRunOptions) (S
 	m.mu.Lock()
 	m.lastRunID = result.RunID
 	m.mu.Unlock()
+	m.recovery.RecordStart(result)
+	if m.timeline != nil {
+		m.timeline.start(result)
+	}
 	return result, nil
 }
 
@@ -1055,6 +1181,9 @@ func (m *measurement) completeResetRun(ctx context.Context) (web.RunFinish, erro
 	accepted, err := m.ctrl.FinishRun(ctx, runID)
 	if err != nil {
 		if errors.Is(err, runctl.ErrUnknownRun) || errors.Is(err, runctl.ErrRunAborted) {
+			if recovered, ok := m.recovery.RecoverStartedTTL(runID); ok {
+				return recovered, nil
+			}
 			return web.RunFinish{}, nil
 		}
 		return web.RunFinish{}, fmt.Errorf("isutools: finishing run %s: %w", runID, err)
@@ -1511,6 +1640,24 @@ func HTTP(next http.Handler) http.Handler {
 		}
 		httpstats.Default.SetRules(rules)
 	})
+	labels := os.Getenv(envCPUProfileLabels)
+	if labels == "1" {
+		core := defaultMeasurement()
+		if core.cpu == nil || core.cpuMode != "run" {
+			collectorHealth.Set("profile-labels", health.StatusDegraded, "pprof labels require managed run CPU profiling")
+		} else {
+			rules, err := httpstats.ParseSafeProfileRouteRules(os.Getenv(envSafeProfileRoutes))
+			if err != nil {
+				collectorHealth.Set("profile-labels", health.StatusDegraded, err.Error())
+				rules = nil
+			} else {
+				collectorHealth.Set("profile-labels", health.StatusOK, "")
+			}
+			next = httpstats.ProfileLabelMiddleware(next, cpuHTTPLabeler{owner: core.cpu}, rules)
+		}
+	} else if labels != "" && labels != "0" {
+		collectorHealth.Set("profile-labels", health.StatusDegraded, fmt.Sprintf("unknown %s=%q; labels disabled", envCPUProfileLabels, labels))
+	}
 	return httpstats.Middleware(next)
 }
 
@@ -1557,6 +1704,8 @@ func Handler() http.Handler {
 		Health:                    collectorHealth,
 		HTTP:                      httpstats.Default,
 		DataDir:                   os.Getenv(envDataDir),
+		ProfileAnalysis:           os.Getenv(envProfileAnalysis) == "1",
+		Executable:                core.executable,
 		PprofDuration:             pprofDuration(os.Getenv),
 		DB: func(ctx context.Context) *dbinspect.Schema {
 			name, dsn, ok := sqlstats.FirstConn()
@@ -1579,7 +1728,12 @@ func Handler() http.Handler {
 		AbortRun:        core.abortResetRun,
 		Sections:        core.latestSections,
 		RunSnapshot:     core.latestRunSnapshot,
+		Timeline:        core.timelineSection,
 		RuntimeProfiles: core.profiles,
+	}
+	if core.cpuBridge != nil {
+		provider.CPUProfiles = core.cpuBridge
+		provider.CPUProfileMode = core.cpuMode
 	}
 	trafficClientFacing := os.Getenv("ISUTOOLS_HTTP3_EDGE") == ""
 	provider.ProtocolTrafficClientFacing = &trafficClientFacing
@@ -1625,6 +1779,13 @@ func Handler() http.Handler {
 	return web.NewHandler(provider)
 }
 
+func (m *measurement) timelineSection(runID string, epoch uint64) *timeline.Section {
+	if m == nil || m.timeline == nil {
+		return nil
+	}
+	return m.timeline.section(runID, epoch)
+}
+
 // startResetRun opens the run that POST /reset measures.
 //
 // It preempts a run already in flight because that is what the endpoint has
@@ -1654,6 +1815,7 @@ func webRunStart(result runctl.StartResult) web.RunStart {
 	return web.RunStart{
 		RunID:            result.RunID,
 		Epoch:            uint64(result.Epoch),
+		State:            string(result.State),
 		StartedAt:        result.StartedAt,
 		Validity:         string(result.Validity),
 		GenerationWindow: webBoundaryWindow(result.GenerationWindow),

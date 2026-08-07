@@ -6,45 +6,60 @@
 
 **English** | [日本語](./README.md)
 
-All-in-one profiling module for ISUCON-style tuning. With a **one-line change**
-to your app it measures SQL / HTTP / nginx access logs / processes & CPU /
-DB schema / pprof, and lets you review every run through a **pre-sorted
-dashboard** and **self-contained snapshots**. Includes a reproducible ABBA
-overhead gate. v1.2 adds **SQL row efficiency (examined/sent), query plans,
-DB pool statistics, host resources, and network counters** — all inside the
-same run boundary.
+**Measure, compare, and review an ISUCON run in one dashboard.**
 
-Per-benchmark run history is listed with score and git revision; clicking a
-row opens every measurement captured during that run:
+isutools is an all-in-one profiling module that integrates into a Go application with minimal changes. It captures SQL, HTTP, reverse-proxy logs, pprof, processes, host resources, network counters, and DB-pool statistics inside the same benchmark boundary, then saves the result with its score and git revision.
 
 ![isutools dashboard: per-benchmark run history with scores and git revisions](docs/images/dashboard-runs.png)
 
-- Integration details: **[DB, nginx/Apache, pprof, prerequisites](./docs/INTEGRATION.md)** (in Japanese)
-- Design doc: [DESIGN.md](./DESIGN.md) / Implementation status: [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md) (in Japanese)
-- License: MIT / Runtime: Go 1.24+
-- Track record (dogfooding): tuned private-isu for one day using only this
-  module's measurements — **score 0 → 541,650** (0 fails).
-  [Full write-up on the blog (Japanese)](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
-
-## Quick Start
+## Try it first
 
 ```go
 import "github.com/ekusiadadus/isutools"
 
-db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn) // just rewrite your existing sqlx.Open
-
-// To measure HTTP as well, wrap your existing handler once
+db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
 http.ListenAndServe(":8080", isutools.HTTP(handler))
 ```
 
-Register the underlying driver with `database/sql` (e.g. via a blank import)
-before this call. MySQL / MariaDB / PostgreSQL (via database/sql) all use the
-same one line. On successful registration the admin server starts once on
-`127.0.0.1:19191`. If registration fails, `SQLDriverName` **fails open** to
-the raw driver name, and any missing data is always recorded in
-`meta.partial` / `meta.health` (it never breaks your app's startup).
-For per-driver imports, DSNs, and pgxpool constraints, see
-[Integration Guide §2](./docs/INTEGRATION.md#2-db-ドライバへの接続).
+The dashboard starts on `127.0.0.1:19191`. Keep it on loopback, connect through SSH forwarding, and wrap each benchmark in one reset/save boundary:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:19191/reset
+# benchmark command
+curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
+```
+
+## What it answers first
+
+- Which SQL statements and HTTP paths consume the run
+- Whether indexes are avoiding unnecessary row reads
+- Whether CPU, memory, disk, or network resources are saturated
+- Whether requests wait on the database or the connection pool
+- What changed between two runs in score, errors, total time, count, and average
+- Whether missing or contaminated measurements make a run unsafe to compare
+
+## Recorded dogfooding result
+
+Using only isutools measurements, one day of private-isu tuning improved the score from **0 to 541,650 with zero failures**. This is a record from one controlled environment, not a general performance guarantee.
+
+- [Full tuning record (Japanese)](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
+- [How we optimized the ISUCON14 Go web application](./docs/case-studies/isucon14-webapp-optimization.en.md)
+- [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
+- [Integration guide](./docs/INTEGRATION.md)
+- [Design](./DESIGN.md) / [Implementation status](./docs/IMPLEMENTATION_STATUS.md)
+
+## Coverage
+
+| Area | Support |
+|---|---|
+| Database | MySQL / MariaDB / PostgreSQL through `database/sql` |
+| HTTP | Go `net/http` middleware |
+| Reverse-proxy logs | Explicit nginx / Caddy / Apache / Envoy formats |
+| Runtime | pprof, CPU, mutex, block, and heap profiles |
+| Host | Linux procfs / sysfs / cgroup v2 |
+| Output | Live dashboard, JSON, self-contained HTML, and run-to-run diff |
+
+Read the [integration guide](./docs/INTEGRATION.md) before use. The dashboard security model assumes loopback binding and SSH forwarding, not public exposure.
 
 ## Five-minute preflight
 
@@ -60,6 +75,10 @@ ssh -L 19191:127.0.0.1:19191 isucon@example-host
 Open <http://127.0.0.1:19191/> locally. There is no need to expose the admin
 server on `0.0.0.0`. On the application host, also verify
 `curl -fsS http://127.0.0.1:19191/ >/dev/null`.
+This simple forward works only when the SSH daemon and isutools share one
+network namespace. For a Windows SSH host with WSL2, a VM, or a nested
+container, use the scoped guest relay and keepalive procedure in
+[Integration Guide §8](./docs/INTEGRATION.md#8-管理ポートと権限).
 
 ### 2. Use one reset → benchmark → save boundary
 
@@ -207,7 +226,7 @@ type aliases, which is why those *can* be named.) `ResetNow` and
 | `POST /collect` | Wait for and collect buffered nginx logs with a deadline |
 | `POST /finish` | Pin the end boundary of the current run and return `202` + boundary JSON without waiting for drain |
 | `POST /abort` | Abort the current run with an epoch fence (`204`, idempotent, no snapshot is created) |
-| `POST /save?score=N` | Pin the end boundary, wait for the immutable snapshot, and persist it as html+json staging with caps (the HTML appears in the list only after the JSON is published) |
+| `POST /save?score=N&pass=true|false` | Pin the end boundary, wait for the immutable snapshot, and persist capped html+json staging. `pass` is the optional benchmark correctness result (HTML is listed only after JSON publication) |
 | `GET /files/<name>` | Fetch saved html / json / pprof files |
 
 `/reset`, `/finish`, `/abort` and `/save` return the ID of the run they opened
@@ -223,6 +242,10 @@ you can match a run to the benchmark that produced it afterwards.
   5xx/499, CPU interval trust and saturation, DB-pool waits, SQL row
   efficiency, and host I/O. It connects each suspicion to detailed evidence
   without claiming that one metric proves causality
+- **Run Timeline** (`ISUTOOLS_TIMELINE=1`): aligned HTTP/SQL/resource buckets,
+  phase shifts, low-volume critical-path candidates, and bottleneck migration.
+  Every candidate is a `correlation-suspect` with its window, metric, formula,
+  and limitation; insufficient evidence falls back to the aggregate sections
 - **Collector Health**: per-collector status and missing-data (`partial`) warnings
 - **DB Schema**: tables, row counts, and **index list** as of generation start
   (evidence of "what indexes existed before the run")
@@ -283,9 +306,18 @@ you can match a run to the benchmark that produced it afterwards.
 | `ISUTOOLS_DATA_DIR` | — | Where snapshots / profiles are persisted (the backing store of the run list) |
 | `ISUTOOLS_ACCESS_LOG` | — | Path to the nginx/Caddy/Apache/Envoy log. **LTSV / JSON lines auto-detected** (see the integration guide for supported formats) |
 | `ISUTOOLS_NGINX_LOG` | — | Legacy name; used as a fallback only when `ACCESS_LOG` is unset |
-| `ISUTOOLS_PPROF_SECONDS` | 0 | Automatically capture an N-second CPU profile after reset (covers the entire bench window) |
+| `ISUTOOLS_PPROF_SECONDS` | 0 | Capture duration in fixed mode; hard maximum in run mode (1–600 seconds) |
+| `ISUTOOLS_CPU_PROFILE_MODE` | off | `fixed` keeps timer capture; `run` aligns CPU capture to run boundaries. Manual `/pprof/profile` returns 409 while run mode owns it |
+| `ISUTOOLS_PROFILE_ANALYSIS` | off | `1` enables read-only capabilities, CAS publication, and derived analysis display |
+| `ISUTOOLS_PPROF_LABELS` | off | `1` adds opaque capture/tuple private labels to CPU samples; raw URLs are never stored |
+| `ISUTOOLS_PPROF_SAFE_ROUTE_RULES` | — | Full-match regexp to constant route-label rules used only when no router pattern exists; one invalid rule disables the set |
 | `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Inject rev info when a Docker build lacks embedded VCS information |
 | `ISUTOOLS_PATH_RULES` | — | HTTP path normalization rules (`regex=replacement;...`, each pair split at the last `=`) |
+| `ISUTOOLS_TIMELINE` | off | `1` / `on` / `true` / `yes` enables run-aligned time-aware analysis. Default off installs no extra request-path observer |
+| `ISUTOOLS_TIMELINE_INTERVAL` | `1s` | Bucket width, from `100ms` through `1m` |
+| `ISUTOOLS_TIMELINE_BUCKETS` | `180` | Per-run bucket cap, 2–600. Overflow folds into the final bucket and marks the section truncated |
+| `ISUTOOLS_TIMELINE_MAX_OPERATIONS` | `32` | Run-wide HTTP and SQL operation-key cap, 1–128; overflow is merged into `(other)` |
+| `ISUTOOLS_TIMELINE_SAFE_ROUTE_RULES` | — | Full-match regexp to constant labels when no router pattern exists. Captures cannot be emitted; unmatched paths become `(unmatched)` |
 | `ISUTOOLS_NGINX_CONF` | — | nginx conf inspected by the advisor (file or directory) |
 | `ISUTOOLS_PROXY_CONF` / `_KIND` | — / auto | nginx/Caddy/Envoy config read by the HTTP/3 advisor. Prefer the generic name; kind is `nginx` / `caddy` / `envoy` |
 | `ISUTOOLS_HTTP3_UDP443` | — | State the result measured from an external client as `reachable` / `blocked`; firewall/NAT is never guessed from inside the process |
@@ -330,6 +362,24 @@ health key as `ignored invalid values: ...`. Artifacts are written to
 `ISUTOOLS_DATA_DIR`, and the Profiles section prints the matching
 `go tool pprof -diff_base` command.
 
+`ISUTOOLS_CPU_PROFILE_MODE=fixed` retains timer-only stopping: finish and abort
+do not stop it. Handler and `ResetNow` use the same process-wide owner, and a
+successful capture is retained as one private immutable `.pprof` plus its
+SHA-256 `.meta.json` record. Manual `/pprof/profile` remains available in
+fixed/off modes; only managed run mode returns 409.
+
+Run-aligned CPU capture and external analysis are implemented in the working
+tree as opt-in features. Linux cgroup-v2 hard-limit/OOM behavior and a real
+`runtime/pprof` CPU profile are verified, but the feature is not release-approved:
+the Darwin crash-fault and private-isu ABBA gates remain outstanding. Set
+`ISUTOOLS_CPU_PROFILE_MODE=run` and `ISUTOOLS_PROFILE_ANALYSIS=1`, then run
+`isutools-pprof preflight / fetch / analyze / publish` on the control host only
+after the ABBA block. `fetch` requires the exact `snapshot_base` and
+`snapshot_sha256` returned by `/save`; `publish` requires an operator-selected
+`--expected-current` and never retries a 409 automatically. If no hard memory
+primitive can be established, analysis exits 4 before reading profile bytes;
+it never downgrades to a soft limit.
+
 ### EXPLAIN (default off)
 
 | Variable | Default | Meaning |
@@ -349,9 +399,10 @@ health key as `ignored invalid values: ...`. Artifacts are written to
 
 ## Additional libraries and prerequisites
 
-pprof is part of the Go standard library, so the instrumented app needs no
-extra package. Automatic CPU profiling needs a writable `ISUTOOLS_DATA_DIR`,
-and `go tool pprof` only at analysis time. procstats also adds no package but
+pprof capture uses the Go standard library, so the instrumented app needs no
+extra package. Only the external `isutools-pprof` binary uses the pinned
+`github.com/google/pprof/profile` module. Automatic CPU profiling needs a
+writable `ISUTOOLS_DATA_DIR`; `go tool pprof` remains available for manual views. procstats also adds no package but
 requires Linux `/proc` and PID-namespace permissions. k6, curl, jq, and
 Graphviz are external commands for specific workflows, not runtime libraries
 of isutools. For the per-feature required/optional matrix, see

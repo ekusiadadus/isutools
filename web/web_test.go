@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -22,6 +24,7 @@ import (
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/health"
+	"github.com/ekusiadadus/isutools/internal/timeline"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
@@ -268,7 +271,7 @@ func TestCoordinatorManagedResetDoesNotRotateCollectorsTwice(t *testing.T) {
 		RunGenerationManaged: true,
 		StartRun: func(context.Context) (RunStart, error) {
 			generation++ // models the coordinator's BeginBoundary.
-			return RunStart{RunID: "run-managed-reset", StartedAt: time.Now()}, nil
+			return RunStart{RunID: "run-managed-reset", State: "started", Validity: "valid", StartedAt: time.Now()}, nil
 		},
 	})
 
@@ -360,7 +363,14 @@ func TestSavePersistsAndDashboardLists(t *testing.T) {
 		t.Fatalf("save status = %d: %s", rec.Code, rec.Body.String())
 	}
 	var saved struct {
-		File string `json:"file"`
+		File                  string `json:"file"`
+		SnapshotBase          string `json:"snapshot_base"`
+		SnapshotFile          string `json:"snapshot_file"`
+		SnapshotSchemaVersion int    `json:"snapshot_schema_version"`
+		RunID                 string `json:"run_id"`
+		SnapshotSHA256        string `json:"snapshot_sha256"`
+		Visibility            string `json:"visibility"`
+		Durability            string `json:"durability"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -381,6 +391,20 @@ func TestSavePersistsAndDashboardLists(t *testing.T) {
 	}
 	if !strings.Contains(string(jsonBytes), `"score": "929"`) {
 		t.Errorf("stored json meta must carry the score: %s", jsonBytes[:200])
+	}
+	wantHash := sha256.Sum256(jsonBytes)
+	if saved.SnapshotFile != strings.TrimSuffix(saved.File, ".html")+".json" ||
+		saved.SnapshotSHA256 != hex.EncodeToString(wantHash[:]) {
+		t.Errorf("save provenance = %#v, want JSON file and exact bytes hash", saved)
+	}
+	if saved.SnapshotBase != strings.TrimSuffix(saved.File, ".html") || saved.SnapshotSchemaVersion != schemaVersion {
+		t.Errorf("save ledger identity = %#v", saved)
+	}
+	if got := rec.Header().Get("X-Isutools-Snapshot-SHA256"); got != saved.SnapshotSHA256 {
+		t.Errorf("snapshot hash header = %q, want %q", got, saved.SnapshotSHA256)
+	}
+	if saved.Visibility != "visible" || (saved.Durability != "durable" && saved.Durability != "unknown") {
+		t.Errorf("save publication state = visibility %q durability %q", saved.Visibility, saved.Durability)
 	}
 
 	runID := strings.SplitN(saved.File, "_", 2)[0]
@@ -842,7 +866,7 @@ func (f *fakeRunStarter) start(context.Context) (RunStart, error) {
 	if f.err != nil {
 		return RunStart{}, f.err
 	}
-	return RunStart{RunID: f.id, StartedAt: time.Unix(1_700_000_000, 0), Validity: "valid"}, nil
+	return RunStart{RunID: f.id, State: "started", StartedAt: time.Unix(1_700_000_000, 0), Validity: "valid"}, nil
 }
 
 func TestResetReportsTheRunItOpened(t *testing.T) {
@@ -876,7 +900,7 @@ func TestResetRunsInspectionBeforeOpeningTheMeasuredInterval(t *testing.T) {
 		},
 		StartRun: func(context.Context) (RunStart, error) {
 			started = true
-			return RunStart{RunID: "run-clean", StartedAt: time.Now(), Validity: "valid"}, nil
+			return RunStart{RunID: "run-clean", State: "started", StartedAt: time.Now(), Validity: "valid"}, nil
 		},
 	})
 
@@ -1076,6 +1100,160 @@ func TestFinishEndsTheRunAndSaveCompletesIt(t *testing.T) {
 	}
 }
 
+func TestSaveRecoversStartedTTLAndOrphansOpenProfiles(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	startedAt := time.Date(2026, 8, 6, 11, 53, 50, 0, time.UTC)
+	expiredAt := startedAt.Add(31 * time.Minute)
+	runID := "run-b23e5eab6ac3cdf0"
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir, RuntimeProfiles: []string{"heap"},
+		StartRun: func(context.Context) (RunStart, error) {
+			return RunStart{RunID: runID, Epoch: 7, State: "started", Validity: "valid", StartedAt: startedAt}, nil
+		},
+		FinishRun: func(context.Context) (RunFinish, error) {
+			return RunFinish{}, errors.New("runctl: unknown run")
+		},
+		CompleteRun: func(context.Context) (RunFinish, error) {
+			return RunFinish{
+				RunID: runID, Epoch: 7, State: "aborted", Validity: "invalid",
+				StartedAt: startedAt, AcceptedAt: expiredAt,
+				Recovered: true, RecoveryReason: "started-ttl",
+			}, nil
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save?score=237979", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recovery save status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var saved SaveResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("save response: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, saved.SnapshotFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Meta.Score != "237979" || !snapshot.Meta.Partial || snapshot.Meta.Run == nil {
+		t.Fatalf("recovery provenance = %#v", snapshot.Meta)
+	}
+	if got := snapshot.Meta.Run; got.RunID != runID || got.Epoch != 7 || got.State != "aborted" ||
+		got.Validity != "invalid" || !got.Recovered || got.RecoveryReason != "started-ttl" ||
+		!got.StartedAt.Equal(startedAt) || !got.FinishedAt.Equal(expiredAt) {
+		t.Fatalf("recovered run = %#v", got)
+	}
+	if snapshot.Meta.Profiles == nil || len(snapshot.Meta.Profiles.Captures) == 0 || len(snapshot.Meta.Profiles.Pairs) != 0 {
+		t.Fatalf("recovered profile manifest = %#v", snapshot.Meta.Profiles)
+	}
+	for _, capture := range snapshot.Meta.Profiles.Captures {
+		if capture.Point == ProfilePointOpen && !capture.Orphan {
+			t.Fatalf("open profile remained ambiguous: %#v", capture)
+		}
+	}
+}
+
+func TestSaveDoesNotRecoverAnUnprovenFinishError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		FinishRun: func(context.Context) (RunFinish, error) {
+			return RunFinish{}, errors.New("collector freeze failed")
+		},
+		CompleteRun: func(context.Context) (RunFinish, error) {
+			return RunFinish{RunID: "run-not-recovered", Epoch: 1, Validity: "partial"}, nil
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/save", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("unproven recovery status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unproven recovery published files: %v", entries)
+	}
+}
+
+func TestSavePersistsBenchmarkOutcomeIntoTimeline(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	runID := "run-timeline-outcome"
+	started := time.Unix(1_700_000_000, 0)
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		StartRun: func(context.Context) (RunStart, error) {
+			return RunStart{RunID: runID, Epoch: 7, State: "started", Validity: "valid", StartedAt: started}, nil
+		},
+		CompleteRun: func(context.Context) (RunFinish, error) {
+			return RunFinish{RunID: runID, Epoch: 7, State: "finished", Validity: "valid", AcceptedAt: started.Add(time.Second)}, nil
+		},
+		Timeline: func(id string, epoch uint64) *timeline.Section {
+			if id != runID || epoch != 7 {
+				t.Fatalf("timeline lookup = %q/%d", id, epoch)
+			}
+			return &timeline.Section{Schema: timeline.SchemaV1, RunID: id, Epoch: epoch,
+				Analysis: timeline.Analysis{Available: false, Reason: timeline.ReasonInsufficientBuckets}}
+		},
+	})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	recorder = httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/save?score=236006&pass=false", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("save status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response SaveResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, response.SnapshotFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot Snapshot
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Meta.BenchmarkPass == nil || *snapshot.Meta.BenchmarkPass || snapshot.Meta.Score != "236006" ||
+		snapshot.Timeline == nil || snapshot.Timeline.Outcome.Pass == nil || *snapshot.Timeline.Outcome.Pass ||
+		snapshot.Timeline.Outcome.Score != "236006" || snapshot.Timeline.Outcome.Validity != "valid" {
+		t.Fatalf("persisted outcome = meta %#v timeline %#v", snapshot.Meta, snapshot.Timeline)
+	}
+}
+
+func TestSaveRejectsInvalidBenchmarkPassBeforeEndingRun(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	ended := false
+	h := NewHandler(Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		CompleteRun: func(context.Context) (RunFinish, error) { ended = true; return RunFinish{}, nil },
+	})
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/save?pass=maybe", nil))
+	if recorder.Code != http.StatusBadRequest || ended {
+		t.Fatalf("status=%d ended=%v body=%s", recorder.Code, ended, recorder.Body.String())
+	}
+}
+
 func TestSaveDirectlyClosesProfilesAndPersistsManifest(t *testing.T) {
 	dir := t.TempDir()
 	starter := &fakeRunStarter{id: "run-profile-save"}
@@ -1179,7 +1357,7 @@ func TestAbortEndsRunAndOrphansOpeningProfiles(t *testing.T) {
 		DataDir:         dir,
 		RuntimeProfiles: []string{"heap"},
 		StartRun: func(context.Context) (RunStart, error) {
-			return RunStart{RunID: runID, Epoch: 7, StartedAt: time.Now(), Validity: "valid"}, nil
+			return RunStart{RunID: runID, Epoch: 7, State: "started", StartedAt: time.Now(), Validity: "valid"}, nil
 		},
 		AbortRun: func(context.Context) (RunAbort, error) {
 			aborts++
