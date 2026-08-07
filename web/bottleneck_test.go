@@ -97,3 +97,71 @@ func TestReportRendersBottleneckOverviewBeforeCollectorHealth(t *testing.T) {
 		t.Fatalf("report did not render the overview first: %s", html[:min(len(html), 1200)])
 	}
 }
+
+func TestDiagnosisSummarySeparatesFixCandidateFromCodeEvidence(t *testing.T) {
+	started := time.Unix(100, 0)
+	snapshot := Snapshot{
+		Meta: Meta{
+			Run: &RunInfo{StartedAt: started, FinishedAt: started.Add(time.Minute)},
+			Profiles: &ProfileManifest{
+				RunID: "run-1",
+				Expected: []ProfileExpectation{{
+					Kind: "cpu", Mode: "interval",
+					Inputs: []ProfileExpectedInput{{Kind: "cpu", Point: "interval", File: "run_cpu.pprof"}},
+				}},
+			},
+		},
+		HTTP: httpstats.Snapshot{{
+			Key: "GET /api/app/notification HTTP/1.1 200", Count: 1200,
+			Total: 20 * time.Minute, Avg: time.Second, P95: 1100 * time.Millisecond,
+		}},
+		SQL: []agg.Entry{{
+			Key:   "SELECT * FROM rides WHERE user_id = ? ORDER BY created_at DESC",
+			Count: 900, Total: 9 * time.Second,
+		}},
+		DBPool: []dbpool.Entry{{
+			TargetID: "app", MaxOpen: 100, Open: 100,
+			WaitCount: 59001, WaitDuration: 874 * time.Second,
+		}},
+	}
+
+	diagnosis := diagnoseBottleneck(snapshot)
+	if diagnosis.PrimaryLevel != "hot" ||
+		!strings.Contains(diagnosis.Primary, "DB接続プール") ||
+		!strings.Contains(diagnosis.PrimaryEvidence, "59,001") {
+		t.Fatalf("primary diagnosis = %+v, want pool saturation first", diagnosis)
+	}
+	if !strings.Contains(diagnosis.Amplifier, "long-poll候補") ||
+		!strings.Contains(diagnosis.HTTPSearchKey, "/api/app/notification") {
+		t.Fatalf("amplifier diagnosis = %+v, want notification demand with search key", diagnosis)
+	}
+	if diagnosis.CodeLevel != "warn" ||
+		!strings.Contains(diagnosis.CodeEvidence, "CPU profileがありません") ||
+		!strings.Contains(diagnosis.CodeEvidence, "行番号を断定できません") {
+		t.Fatalf("code evidence = %+v, want explicit missing-profile boundary", diagnosis)
+	}
+	if !strings.Contains(diagnosis.SQLSearchKey, "SELECT * FROM rides") {
+		t.Fatalf("SQL search key = %q", diagnosis.SQLSearchKey)
+	}
+}
+
+func TestReportPutsDecisionAndCodeEvidenceBeforeDenseTables(t *testing.T) {
+	snapshot := Snapshot{
+		HTTP: httpstats.Snapshot{{Key: "GET /hot HTTP/1.1 200", Count: 2, Total: time.Second}},
+		Meta: Meta{Profiles: &ProfileManifest{RunID: "run-without-cpu"}},
+	}
+	body := renderReport(t, snapshot)
+	decision := strings.Index(body, "結論: 次に修正する場所")
+	overview := strings.Index(body, "Bottleneck Overview")
+	if decision < 0 || overview < 0 || decision >= overview {
+		t.Fatalf("decision must precede evidence tables: decision=%d overview=%d", decision, overview)
+	}
+	for _, want := range []string{
+		`id="diagnosis"`, `data-target="http"`, `data-target="sql"`, `data-target="profiles"`,
+		"CPU profileがありません", "ソースコードの行番号を断定できません",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("decision section is missing %q", want)
+		}
+	}
+}

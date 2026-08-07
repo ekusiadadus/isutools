@@ -371,9 +371,57 @@ export ISUTOOLS_DATA_DIR=/var/lib/isutools   # アプリ実行ユーザーが書
 export ISUTOOLS_PPROF_SECONDS=30
 ```
 
-解析にはローカルの `go tool pprof` が必要です。グラフ表示には Graphviz があると便利ですが、
-計測・top 表示の必須条件ではありません。profile は対象実行ファイルと近い Go toolchain で
-解析し、シンボルを失わない build artifact を保持してください。
+`ISUTOOLS_CPU_PROFILE_MODE=fixed`を併記すると、admin `POST /reset`とアプリ内`ResetNow`は
+同じprocess-wide timer ownerを使う。fixedはfinish/abort observerへ接続せず、指定秒数だけで止まる。
+成果物は0600のimmutable profileとSHA-256 sidecarを一組として既存20 run/512 MiB retentionへ入れる。
+manual `/pprof/profile`互換は維持する。
+
+run境界へ揃えたCPU採取と保存済みrunへのderived解析を使う場合は、対象hostで次を明示する。
+どちらも既定offであり、`run` mode中だけmanual `/pprof/profile`はowner競合を避けるため409になる。
+
+```bash
+export ISUTOOLS_DATA_DIR=/var/lib/isutools
+export ISUTOOLS_CPU_PROFILE_MODE=run
+export ISUTOOLS_PPROF_SECONDS=120       # run CPU captureのhard max (1〜600秒)
+export ISUTOOLS_PROFILE_ANALYSIS=1
+# optional: router pattern由来のopaque CPU label
+export ISUTOOLS_PPROF_LABELS=1
+```
+
+解析・転送は採点run間に行わず、ABBA block終了後にcontrol hostでまとめる。`/save` responseの
+`snapshot_base`と`snapshot_sha256`をrun直後のledgerへ保存し、後から同一性を作り直さない。
+
+```bash
+# block開始前。retention、上限、空き容量、current generationをfail-closed確認
+isutools-pprof preflight --admin http://127.0.0.1:19191 --block-runs 4
+
+# block終了後。BASE/HASHは該当runの/save responseから転記する
+isutools-pprof fetch --admin http://127.0.0.1:19191 \
+  --snapshot-base "$BASE" --snapshot-sha256 "$HASH" --bundle-dir ./pprof-bundle
+
+isutools-pprof analyze --bundle-dir ./pprof-bundle --binary ./app \
+  --source-root ./ --output ./analysis.json
+
+# 初回はnone。更新/rollbackは直前に確認したcurrent artifact IDを明示する
+isutools-pprof publish --admin http://127.0.0.1:19191 \
+  --analysis ./analysis.json --expected-current none
+```
+
+HTTPの代わりにmount済みDataDirから`fetch --data-dir <dir>`も使えるが、derived fileをDataDirへ
+直接書く経路はない。publishは必ずadmin endpointのCASを通る。redirect、URL credential、別origin、
+symlink/non-regular inputは拒否する。409 responseのcurrent IDを自動採用してretryしない。
+
+Linux analyzerは書込み権限を委譲したcgroup v2 directoryを
+`ISUTOOLS_PPROF_CGROUP_ROOT`へ絶対pathで指定する。workerはそのcgroupへ出生時から所属し、
+512 MiB `memory.max`、swap 0、1 GiB `RLIMIT_AS`、SIGSTOP/membership readbackが全て成立してから
+profile FDを読む。Darwinはhard `RLIMIT_AS`を設定・readbackできる場合だけ解析する。
+hard primitiveが無い場合はsoft limit/RSS pollingへdowngradeせず、expected-only failed JSONを残して
+exit 4となる。
+
+手動解析にはローカルの `go tool pprof`も利用できる。グラフ表示にはGraphvizがあると便利だが、
+`isutools-pprof`のtop表示には不要である。verified provenanceはrevision文字列ではなく
+capture-time running-image SHA-256と`--binary`の完全一致だけであり、シンボルを失わないbuild
+artifactを保持する。
 
 ### procstats
 
@@ -406,8 +454,59 @@ ABBA release gate は [abba.sh](../examples/abba.sh) を使います。最低3�
 既定 `127.0.0.1:19191` は loopback のため無認証です。遠隔からは SSH tunnel を使います。
 
 ```bash
-ssh -L 19191:127.0.0.1:19191 user@server
+ssh -NT \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -L 19191:127.0.0.1:19191 user@server
 ```
+
+この単純な`-L`は、remote側の接続を開くSSH daemonとisutoolsが同じnetwork namespaceにいる
+場合だけ成立します。Windowsでsshdが動き、アプリがWSL2内にいる構成では、転送先の
+`127.0.0.1`はWindowsを指し、WSL2内のisutools loopbackではありません。VMやnested containerも
+同様です。
+
+WSL2ではまずguest内からisutoolsを確認し、guest IPだけで一時relayをlistenさせます。`29191`は
+例示用の一時portです。`<DISTRO>`と`<WSL_GUEST_IP>`は実環境の値へ置き換えてください。
+
+```powershell
+# Windows SSH host上: guest identityとguest内isutoolsを確認
+wsl.exe -d <DISTRO> -- hostname -I
+wsl.exe -d <DISTRO> -- curl -fsS http://127.0.0.1:19191/json
+
+# SSH sessionのremote commandとして起動する一時relay。
+# SSH切断時にexec先も終了させ、常設serviceにはしない。
+wsl.exe -d <DISTRO> -- systemd-socket-activate `
+  --listen=<WSL_GUEST_IP>:29191 `
+  systemd-socket-proxyd 127.0.0.1:19191
+```
+
+local側ではrelayを起動するremote commandとforwardを同じSSH lifecycleにします。
+
+```bash
+ssh -T \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -L 19191:<WSL_GUEST_IP>:29191 user@windows-host \
+  'wsl.exe -d <DISTRO> -- systemd-socket-activate --listen=<WSL_GUEST_IP>:29191 systemd-socket-proxyd 127.0.0.1:19191'
+```
+
+guest relayはWSL guest IPへだけbindし、Windows firewallでもSSH host以外からの到達を許可しないで
+ください。isutools自身の`19191`は引き続きguest loopback限定です。問題を回避するために
+`0.0.0.0:19191`へ無認証admin serverを公開してはいけません。
+
+切り分けは次の4層を別々に確認します。
+
+1. **isutools listener**: WSL2/guest内で`ss -ltnp 'sport = :19191'`と
+   `curl -fsS http://127.0.0.1:19191/json`を実行する。
+2. **guest relay reachability**: guest内で`ss -ltnp 'sport = :29191'`、Windows側で
+   `Test-NetConnection <WSL_GUEST_IP> -Port 29191`を確認する。
+3. **SSH forwarding channel**: `ssh -vv`で`open failed: connect failed`がないことを確認する。
+   `ExitOnForwardFailure`が保証するのはlocal listen作成までで、後からrelayが落ちた場合までは保証しない。
+4. **local listener/end-to-end**: localの`lsof -nP -iTCP:19191 -sTCP:LISTEN`はprocessの存在しか
+   証明しない。必ず`curl -v http://127.0.0.1:19191/json`まで通す。listenerだけ残るstale tunnelは
+   終了して、keepalive付きcommandで作り直す。
 
 application-level token 認証はありません。非 loopback bind は既定で fail closed で、
 SSH / firewall / host loopback publish により外部到達性を制限した構成だけ
@@ -419,10 +518,11 @@ requestを403にします。これはSSH境界を補強しますが、外部公�
 
 ## 9. 新しい collector の有効化
 
-v1.2 で追加された collector は、いずれも run の**両端でだけ**データを取ります
+v1.2 で追加された通常 collector は、いずれも run の**両端でだけ**データを取ります
 (`POST /reset` が置く開始境界と、`POST /finish` / `POST /save` が置く終了境界)。
-ベンチ実行中の常時サンプリングはありません。EXPLAIN 取得(§11)だけは例外で、
-終了境界より後の enrich phase に 1 回だけ走ります。
+既定設定ではベンチ実行中の常時サンプリングはありません。例外はopt-inの2機能です。
+EXPLAIN取得(§11)は終了境界より後のenrich phaseに1回だけ、Run Timelineは
+`ISUTOOLS_TIMELINE=1`のときだけrun中に設定intervalで採取します。
 
 ### フラグと既定値
 
@@ -867,7 +967,7 @@ advisor の `plan-full-scan` / `plan-filesort` / `plan-temporary` の入力に�
 | `POST /reset` | 世代を回して**新しい run を開始**する。実行中の run があれば preempt して破棄する | `204`、`X-Isutools-Run-Id` header。run を開けなければ `409`(fail-closed) |
 | `POST /collect` | buffered アクセスログの**非終端 flush**。境界は動かさない | `204` |
 | `POST /finish` | 現 run の**終了境界を固定**する。drain も snapshot 構築も待たない | `202` + 境界 JSON、`X-Isutools-Run-Id` |
-| `POST /save?score=N` | 終了境界を固定し、immutable snapshot を待って ack し、html + json を保存する | `200` + `{"file": "..."}`。`ISUTOOLS_DATA_DIR` 未設定なら `400` |
+| `POST /save?score=N&pass=true|false` | 終了境界を固定し、immutable snapshot を待って ack し、html + json を保存する。`pass` は任意のベンチマーカー正誤判定 | `200` + `{"file": "..."}`。`pass` が `true` / `false` / `1` / `0` 以外ならrunを閉じる前に`400`。`ISUTOOLS_DATA_DIR` 未設定なら `400` |
 | `POST /abort` | 現 run を破棄する。snapshot は作らない。冪等 | `204` |
 
 `POST /collect` は**終端ではありません**。終了境界が既に固定された後に呼ぶと `409` と
@@ -879,6 +979,15 @@ the run's boundary is already fixed; POST /reset before collecting again
 
 境界の後に flush すると、次の世代に属するバイト列を測り終えた区間へ足し込むことになるため、
 拒否は意図的な fail-closed です。**flush は必ず `/finish` / `/save` より前に**行ってください。
+
+runを閉じないまま既定の`StartedTTL=30m`を越えると、coordinatorは資源を解放するため
+そのrunを`started-ttl`でabortします。その後の`/save`は、同じprocess内のbounded recovery
+ledgerが**同一RunID/Epochかつstarted-ttl terminal event**を証明できる場合だけlive collector
+snapshotを保存します。このsnapshotは`state=aborted`、`validity=invalid`、`partial=true`、
+`recovered=true`になり、opening profileはorphanとして記録されます。通常のimmutable run
+snapshotやrun-aligned close profileが存在するようには見せません。process再起動後や別理由の
+finish errorにはこの証拠が無いため従来どおり`409`です。これは取りこぼした診断情報の救済で、
+比較可能なベンチ結果への昇格ではありません。
 
 `/reset` `/collect` `/finish` `/abort` `/save` は同時に1つしか走りません。
 競合したときの応答は `409` と次の本文です。
@@ -898,8 +1007,35 @@ echo "isutools run: $run_id"              # 計測結果に付ける run のラ�
 
 score=$(./bench.sh)                       # ベンチ本体
 curl -fsS -X POST "$ADMIN/collect"        # 終了境界の前に flush する
-curl -fsS -X POST "$ADMIN/save?score=$score"
+curl -fsS -X POST "$ADMIN/save?score=$score&pass=true"
 ```
+
+### 時系列 phase / critical-path 候補
+
+```bash
+export ISUTOOLS_TIMELINE=1
+export ISUTOOLS_TIMELINE_INTERVAL=1s
+export ISUTOOLS_TIMELINE_BUCKETS=180
+export ISUTOOLS_TIMELINE_MAX_OPERATIONS=32
+```
+
+有効時は、run開始からの固定bucketへHTTP完了、正規化SQL完了、HTTP in-flight最大値、
+DB pool、process CPU/iowait/RSS、host disk deltaを揃えます。保持上限はrun全体で固定され、
+JSON化後も2 MiBを超える場合はbucketを公開せず`timeline-size-limit`を残します。
+
+HTTP operation名はrouter patternが得られた場合、または明示した`ISUTOOLS_TIMELINE_SAFE_ROUTE_RULES`
+の出力だけです。数字/UUIDを伏せるheuristicだけでは秘密非保存を証明できないため、
+どちらも無いrouteは常に`(unmatched)`になります。query stringは保存しません。
+safe ruleは`^...$=/constant/{label}`形式で、regexpはfull-match、出力は定数だけです。
+capture groupを出力へ展開できないため、入力slugやtokenを誤って保存しません。
+
+Run Timelineが示すphaseとcandidateは因果推論ではありません。各行にwindow、signal、
+metric、判定formula、観測限界を保存し、候補ラベルは`correlation-suspect`に固定します。
+bucketが2個未満、またはtimeline未採取なら理由を明示し、既存のaggregate
+SQL/HTTP/resource表をfallbackとして残します。DiffはDB pool wait、CPU busy/iowait、同一件数の
+SQL/HTTP平均latencyのいずれかが改善したのにscore、
+`pass`、計測validity、成功HTTP数、5xxのいずれかが悪化した場合だけ、双方の式と限界を
+並べた「resource-improved / outcome-regressed」警告を出します。
 
 計測結果を捨ててよい試走なら `/abort`、レポートは要らないが停止時刻を厳密に決めたい場合は
 `/finish` を使います。`/reset` は**前の run を破棄する**ので、結果が必要な run は必ず

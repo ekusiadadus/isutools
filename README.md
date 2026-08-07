@@ -72,6 +72,9 @@ ssh -L 19191:127.0.0.1:19191 isucon@example-host
 
 ブラウザでは <http://127.0.0.1:19191/> を開く。`0.0.0.0` へ公開する必要はない。
 アプリ側で `curl -fsS http://127.0.0.1:19191/ >/dev/null` が成功することも確認する。
+この単純な転送はSSH daemonとisutoolsが同じnetwork namespaceにいる場合だけ成立する。
+Windows SSH host→WSL2、VM、nested containerの場合は
+[統合ガイド §8](./docs/INTEGRATION.md#8-管理ポートと権限)のguest relayとkeepalive手順を使う。
 
 ### 2. 計測境界は reset → benchmark → save
 
@@ -210,7 +213,7 @@ DB を作り直すこと自体は止められない。だから `SerializeInitia
 | `POST /collect` | buffered nginx log を期限付きで flush 待ち・回収 |
 | `POST /finish` | 現 run の終了境界を固定し、drain を待たず `202` + 境界 JSON を返す |
 | `POST /abort` | 現 run を epoch fence 付きで中止(`204`、冪等、snapshot は作らない) |
-| `POST /save?score=N` | 終了境界を固定して immutable snapshot を待ち、上限付きで html+json staging 保存(HTML は JSON 公開後に一覧へ出る) |
+| `POST /save?score=N&pass=true|false` | 終了境界を固定して immutable snapshot を待ち、上限付きで html+json staging 保存。`pass` は任意のベンチマーカー判定(HTML は JSON 公開後に一覧へ出る) |
 | `GET /files/<name>` | 保存済み html / json / pprof の取得 |
 
 `/reset` `/finish` `/abort` `/save` は開始・終了した run の ID を
@@ -223,6 +226,9 @@ DB を作り直すこと自体は止められない。だから `SerializeInitia
   **ホスト情報(CPU モデル / コア数 / メモリ GB / OS)**
 - **Bottleneck Overview**: HTTP / SQL の累計 demand、5xx / 499、CPU 区間の
   信頼性と飽和度、DB pool wait、SQL 行効率、Host I/O を「最初に見る順」で要約。
+- **Run Timeline** (`ISUTOOLS_TIMELINE=1`): 1秒 bucket の HTTP/SQL/resource
+  推移、phase shift、低流量 critical-path 候補、bottleneck migration。全候補は
+  `correlation-suspect` で、window・metric・formula・limitation を併記する。
   原因を自動断定せず、各詳細セクションへ降りるための triage として表示
 - **Collector Health**: 各コレクターの状態・欠損(`partial`)警告
 - **DB Schema**: 世代開始時点のテーブル・行数・**インデックス一覧**(「実行前に何が
@@ -274,9 +280,18 @@ DB を作り直すこと自体は止められない。だから `SerializeInitia
 | `ISUTOOLS_DATA_DIR` | — | スナップショット / プロファイルの永続化先(実行一覧の実体) |
 | `ISUTOOLS_ACCESS_LOG` | — | nginx/Caddy/Apache/Envoy ログのパス。**LTSV / JSON 行を自動判別**(対応形式は統合ガイド参照) |
 | `ISUTOOLS_NGINX_LOG` | — | 旧変数名。`ACCESS_LOG` 未設定時だけ fallback |
-| `ISUTOOLS_PPROF_SECONDS` | 0 | reset 後に CPU プロファイルを N 秒自動採取(ベンチ区間を丸ごと採る) |
+| `ISUTOOLS_PPROF_SECONDS` | 0 | fixed modeではreset後の採取秒数、run modeではhard max秒数(1〜600) |
+| `ISUTOOLS_CPU_PROFILE_MODE` | off | `fixed`で従来のtimer採取、`run`でrun境界連動CPU採取。`run`中のmanual `/pprof/profile`は409 |
+| `ISUTOOLS_PROFILE_ANALYSIS` | off | `1`でread-only capabilities、CAS publish、derived analysis表示を有効化 |
+| `ISUTOOLS_PPROF_LABELS` | off | `1`でCPU profileへcapture/tupleのopaque private labelを付与。raw URLは保存しない |
+| `ISUTOOLS_PPROF_SAFE_ROUTE_RULES` | — | router patternが無いroute用のfull-match regexp→定数label。invalid時はrules全体を無効化 |
 | `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Docker ビルドで vcs 情報が埋まらない場合の rev 注入 |
 | `ISUTOOLS_PATH_RULES` | — | HTTP パス正規化ルール(`regex=replacement;...` 各ペアは最後の `=` で分割) |
+| `ISUTOOLS_TIMELINE` | off | `1` / `on` / `true` / `yes` でrun-aligned時系列解析を有効化。既定offなので通常のrequest pathには追加observerなし |
+| `ISUTOOLS_TIMELINE_INTERVAL` | `1s` | bucket幅。`100ms`〜`1m` |
+| `ISUTOOLS_TIMELINE_BUCKETS` | `180` | runごとのbucket上限。2〜600。超過区間は最後のbucketへ集約し`truncated`を明示 |
+| `ISUTOOLS_TIMELINE_MAX_OPERATIONS` | `32` | HTTP/SQLそれぞれのrun全体operation key上限。1〜128、超過は`(other)` |
+| `ISUTOOLS_TIMELINE_SAFE_ROUTE_RULES` | — | router patternが無いroute用のfull-match regexp→定数label。capture展開不可。未一致は`(unmatched)` |
 | `ISUTOOLS_NGINX_CONF` | — | advisor が検査する nginx conf(ファイル or ディレクトリ) |
 | `ISUTOOLS_PROXY_CONF` / `_KIND` | — / auto | HTTP/3 advisor が読む nginx/Caddy/Envoy 設定。nginx entrypoint file は include graph を追跡し、directory は `*.conf` を symlink 重複排除して読む。kind は `nginx` / `caddy` / `envoy` |
 | `ISUTOOLS_HTTP3_UDP443` | — | 外部clientからの結果を `reachable` / `blocked` で明示。プロセス内からfirewall/NATを推測しない |
@@ -318,6 +333,25 @@ runtime 設定なので、**未設定の変数には一切触らない**(アプ�
 `ignored invalid values: ...` として残る。成果物は `ISUTOOLS_DATA_DIR` に置かれ、
 ダッシュボードの Profiles セクションに `go tool pprof -diff_base` のコマンドが出る。
 
+`ISUTOOLS_CPU_PROFILE_MODE=fixed`は従来どおりreset後のtimerだけで停止し、finish/abortでは
+止めない。Handlerと`ResetNow`は同じprocess-wide ownerを使い、成功したprofileは0600の
+immutable `.pprof`とSHA-256付き`.meta.json`を一組で保存・retentionする。manual
+`/pprof/profile`はfixed/offでは引き続き利用でき、409になるのはmanaged run modeだけである。
+
+run境界CPU採取と外部解析はv1.4.0のopt-in機能である。Linux cgroup v2上の
+hard-limit/OOMと実`runtime/pprof` CPU profileは検証済みだが、Darwin crash faultと
+完全なprivate-isu ABBA gateは未検証範囲として残る。`ISUTOOLS_CPU_PROFILE_MODE=run`と
+`ISUTOOLS_PROFILE_ANALYSIS=1`を設定し、ABBA block終了後にcontrol host上の
+`isutools-pprof preflight / fetch / analyze / publish`を順に使う。`fetch`は`/save`が返した
+exact `snapshot_base`と`snapshot_sha256`を必須とし、`publish`はoperatorが確認した
+`--expected-current`を必須とする。409を自動retryしない。hard memory primitiveを確立できない
+環境ではprofile bytesを読む前にexit 4となり、soft limitへdowngradeしない。詳細は
+[統合ガイド §7](./docs/INTEGRATION.md#7-pprofprocstats負荷生成ツール)を参照。
+
+既知の制約として、同一processでinitialize/resetを短時間に二重実行すると、前runの非同期CPU
+stopと次runのstartが競合し、次runのCPU artifactが欠落する場合がある([#19](https://github.com/ekusiadadus/isutools/issues/19))。
+計測対象runのinitializeは一度だけ実行し、retryには同じnonceの`ResetNowWithNonce`を使う。
+
 ### EXPLAIN(既定 off)
 
 | 変数 | 既定 | 意味 |
@@ -337,8 +371,9 @@ runtime 設定なので、**未設定の変数には一切触らない**(アプ�
 
 ## 追加ライブラリと事前準備
 
-pprof は Go 標準ライブラリなので、計測側の追加 package は不要。自動 CPU profile には
-writable な `ISUTOOLS_DATA_DIR`、解析時だけ `go tool pprof` が必要になる。procstats も
+pprof 採取は Go 標準ライブラリなので、計測対象アプリ側の追加 package は不要。外部
+`isutools-pprof`だけが固定versionの`github.com/google/pprof/profile`を使う。自動 CPU profileには
+writable な `ISUTOOLS_DATA_DIR`が必要で、手動表示には引き続き`go tool pprof`も使える。procstats も
 追加 package はないが Linux `/proc` と PID namespace の権限が必要。k6、curl、jq、
 Graphviz は用途別の外部コマンドであり、isutools の runtime library ではない。
 機能別の必須／任意一覧は [統合ガイド §1](./docs/INTEGRATION.md#1-必須任意の全体像)。

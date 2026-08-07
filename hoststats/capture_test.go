@@ -112,6 +112,24 @@ func TestHostStatsCapture_ReadsEverySource(t *testing.T) {
 	}
 }
 
+func TestTimelinePointReadsOnlyWholeDeviceDiskCounters(t *testing.T) {
+	t.Parallel()
+	c := newTestCollector(t, testEnv{}, newClock(fixtureTime))
+	point, err := c.Point(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if point.ReadBytes != (2000+40)*512 || point.WriteBytes != (4000+80)*512 ||
+		point.IOTicks != 1212*time.Millisecond || point.WeightedIO != 1414*time.Millisecond {
+		t.Fatalf("Point() = %#v", point)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.Point(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Point(cancelled) = %v", err)
+	}
+}
+
 func TestHostStatsCommittedMatrix(t *testing.T) {
 	t.Parallel()
 	expired, cancel := context.WithCancel(context.Background())

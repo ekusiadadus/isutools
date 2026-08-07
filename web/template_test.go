@@ -7,6 +7,7 @@ import (
 
 	"github.com/ekusiadadus/isutools/dbpool"
 	"github.com/ekusiadadus/isutools/hoststats"
+	"github.com/ekusiadadus/isutools/internal/timeline"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
@@ -556,9 +557,56 @@ func TestReportOmitsEmptySQLRowsSection(t *testing.T) {
 	}
 }
 
+func TestReportRendersTraceableTimelineAndInsufficientEvidenceFallback(t *testing.T) {
+	start := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
+	rule := timeline.Rule{ID: timeline.PhaseErrorOnset, Formula: "previous errors == 0 and current errors > 0", Limitation: "observed HTTP only"}
+	section := &timeline.Section{
+		Schema: timeline.SchemaV1, RunID: "run-timeline", Epoch: 7, IntervalNs: int64(time.Second), MaxBuckets: 10,
+		Buckets: []timeline.Bucket{{Index: 1, Start: start, End: start.Add(time.Second)}},
+		Analysis: timeline.Analysis{Available: true, Rules: []timeline.Rule{rule},
+			Phases: []timeline.Phase{{Kind: timeline.PhaseErrorOnset, RuleID: rule.ID, WindowStart: start, WindowEnd: start.Add(time.Second), Evidence: []timeline.EvidenceRef{{
+				BucketIndex: 1, WindowStart: start, WindowEnd: start.Add(time.Second), Signal: "http", Metric: "error_count", Value: 3,
+				Formula: rule.Formula, Limitation: rule.Limitation,
+			}}}},
+			Suspects: []timeline.Suspect{{Signal: "low-volume critical-path candidate", Key: "POST /gate", Kind: "http", Label: "correlation-suspect", Score: 100, Evidence: []timeline.EvidenceRef{{
+				BucketIndex: 0, WindowStart: start.Add(-time.Second), WindowEnd: start, Signal: "http:POST /gate", Metric: "p95_ns", Value: float64(200 * time.Millisecond),
+				Formula: "count <= 20% of busiest operation", Limitation: "correlation, not causality",
+			}}}},
+		},
+	}
+	body := renderReport(t, Snapshot{Timeline: section})
+	for _, want := range []string{"Run Timeline", "error-onset", "error_count", "previous errors == 0 and current errors &gt; 0", rule.Limitation, "correlation-suspect", "POST /gate", "p95_ns", "correlation, not causality"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("timeline report missing %q", want)
+		}
+	}
+	if !strings.Contains(body, "<details><summary>時系列の詳細") {
+		t.Fatalf("dense timeline evidence must be collapsed behind a summary")
+	}
+
+	section.Analysis = timeline.Analysis{Available: false, Reason: timeline.ReasonInsufficientBuckets}
+	body = renderReport(t, Snapshot{Timeline: section})
+	if !strings.Contains(body, "time-aware analysis unavailable: "+timeline.ReasonInsufficientBuckets) ||
+		!strings.Contains(body, "Aggregate SQL/HTTP/resource tables remain authoritative") {
+		t.Fatalf("timeline fallback missing: %s", body)
+	}
+}
+
+func TestReportWithoutTimelineKeepsAggregateFallbackAndStatesUnavailable(t *testing.T) {
+	body := renderReport(t, Snapshot{})
+	for _, want := range []string{
+		"Run Timeline", "time-aware analysis unavailable: timeline not captured",
+		"Aggregate SQL/HTTP/resource tables remain authoritative", "ISUTOOLS_TIMELINE=1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("timeline-disabled fallback missing %q", want)
+		}
+	}
+}
+
 func TestReportWithRunSectionsStaysSelfContained(t *testing.T) {
 	body := renderReport(t, fullSnapshot())
-	for _, forbidden := range []string{"http://", "https://", "src=", "href="} {
+	for _, forbidden := range []string{`href="http://`, `href="https://`, `href="//`, `src=`} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("the report must stay self-contained, found %q", forbidden)
 		}

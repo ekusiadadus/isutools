@@ -62,6 +62,23 @@ func TestCollectorMeasuresResetToSnapshotInterval(t *testing.T) {
 	}
 }
 
+func TestTimelinePointAggregatesCumulativeHostAndProcessCounters(t *testing.T) {
+	t.Parallel()
+	files := fixtureFS(1000, 2, map[int]procFixture{
+		10: {comm: "worker", utime: 70, stime: 30, starttime: 100, rssPages: 3},
+		20: {comm: "memory", utime: 10, stime: 10, starttime: 200, rssPages: 9},
+	})
+	c := New(WithFS(files), WithPageSize(4096))
+	point, err := c.TimelinePoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if point.TotalJiffies != 1000 || point.BusyJiffies != 1000 || point.IOWaitJiffies != 0 ||
+		point.ProcessJiffies != 120 || point.CPUs != 2 || point.RSSBytes != 12*4096 {
+		t.Fatalf("TimelinePoint() = %#v", point)
+	}
+}
+
 func TestCollectorBoundsAndSortsTopLists(t *testing.T) {
 	files := fixtureFS(100, 1, map[int]procFixture{
 		1: {comm: "one", utime: 1, starttime: 10, rssPages: 1},

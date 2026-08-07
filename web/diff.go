@@ -2,19 +2,19 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"math"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/ekusiadadus/isutools/dbpool"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
+	"github.com/ekusiadadus/isutools/internal/safefs"
 )
 
 // diffRow separates traffic volume from per-operation latency. Total time is
@@ -38,6 +38,20 @@ type diffPage struct {
 	AScore, BScore    string
 	ProvenanceWarning string
 	SQL, HTTP         []diffRow
+	Contradictions    []diffContradiction
+}
+
+type diffEvidence struct {
+	Signal, Metric string
+	A, B           float64
+	Formula        string
+	Limitation     string
+}
+
+type diffContradiction struct {
+	Label        string
+	Outcome      diffEvidence
+	Improvements []diffEvidence
 }
 
 // diff renders GET /diff?a=<run-id>&b=<run-id>: which queries/paths got
@@ -69,11 +83,186 @@ func (h *handler) diff(w http.ResponseWriter, r *http.Request) {
 		ProvenanceWarning: provenanceWarning(snapA.Meta, snapB.Meta),
 		SQL:               diffEntries(snapA.SQL, snapB.SQL),
 		HTTP:              diffEntries(entriesOf(snapA.HTTP), entriesOf(snapB.HTTP)),
+		Contradictions:    detectContradictions(*snapA, *snapB),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := diffTmpl.Execute(w, page); err != nil {
 		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
 	}
+}
+
+// detectContradictions reports the exact, intentionally conservative case in
+// which at least one measured resource signal improves while a benchmark
+// outcome regresses. It labels correlation only; changed load shape can
+// explain both sides without either causing the other.
+func detectContradictions(a, b Snapshot) []diffContradiction {
+	improvements := resourceImprovements(a, b)
+	if len(improvements) == 0 {
+		return nil
+	}
+	outcomes := outcomeRegressions(a, b)
+	rows := make([]diffContradiction, 0, len(outcomes))
+	for _, outcome := range outcomes {
+		rows = append(rows, diffContradiction{
+			Label:   "resource-improved / outcome-regressed (correlation warning)",
+			Outcome: outcome, Improvements: append([]diffEvidence(nil), improvements...),
+		})
+	}
+	return rows
+}
+
+func resourceImprovements(a, b Snapshot) []diffEvidence {
+	var evidence []diffEvidence
+	aWait, aPools := totalPoolWait(a.DBPool)
+	bWait, bPools := totalPoolWait(b.DBPool)
+	if aPools && bPools && aWait > 0 && bWait < aWait {
+		evidence = append(evidence, diffEvidence{
+			Signal: "database/sql pool wait", Metric: "dbpool.wait_duration_ns",
+			A: float64(aWait), B: float64(bWait), Formula: "B total wait duration < A total wait duration",
+			Limitation: "summed goroutine wait time is concurrency-weighted and pool membership or traffic may differ",
+		})
+	}
+	if a.Proc != nil && b.Proc != nil && a.Proc.CPUTotal != nil && b.Proc.CPUTotal != nil &&
+		a.Proc.CPUTotal.IOWaitPercent > 0 && b.Proc.CPUTotal.IOWaitPercent < a.Proc.CPUTotal.IOWaitPercent {
+		evidence = append(evidence, diffEvidence{
+			Signal: "host iowait", Metric: "proc.cpu_total.iowait_percent",
+			A: a.Proc.CPUTotal.IOWaitPercent, B: b.Proc.CPUTotal.IOWaitPercent,
+			Formula:    "B interval iowait percent < A interval iowait percent",
+			Limitation: "host-wide iowait is an interval ratio and does not identify the request or device responsible",
+		})
+	}
+	if a.Proc != nil && b.Proc != nil && a.Proc.CPUTotal != nil && b.Proc.CPUTotal != nil &&
+		a.Proc.CPUTotal.BusyPercent > 0 && b.Proc.CPUTotal.BusyPercent < a.Proc.CPUTotal.BusyPercent {
+		evidence = append(evidence, diffEvidence{
+			Signal: "host CPU busy", Metric: "proc.cpu_total.busy_percent",
+			A: a.Proc.CPUTotal.BusyPercent, B: b.Proc.CPUTotal.BusyPercent,
+			Formula:    "B interval busy percent < A interval busy percent",
+			Limitation: "lower CPU can mean less useful work rather than higher efficiency; traffic shape and run duration may differ",
+		})
+	}
+	evidence = append(evidence, comparableLatencyImprovements("SQL", "sql.avg_latency_ms", diffEntries(a.SQL, b.SQL))...)
+	evidence = append(evidence, comparableLatencyImprovements("HTTP endpoint", "http.avg_latency_ms", diffEntries(entriesOf(a.HTTP), entriesOf(b.HTTP)))...)
+	return evidence
+}
+
+func comparableLatencyImprovements(signal, metric string, rows []diffRow) []diffEvidence {
+	const maxRows = 5
+	evidence := make([]diffEvidence, 0, maxRows)
+	for _, row := range rows {
+		if !row.Comparable || row.AAvgMs <= 0 || row.BAvgMs >= row.AAvgMs {
+			continue
+		}
+		evidence = append(evidence, diffEvidence{
+			Signal: signal + ": " + row.Key, Metric: metric,
+			A: row.AAvgMs, B: row.BAvgMs,
+			Formula:    "A count == B count > 0 and B average latency < A average latency",
+			Limitation: "equal counts do not prove equal concurrency, request parameters, cache state, payload size, or downstream work",
+		})
+		if len(evidence) == maxRows {
+			break
+		}
+	}
+	return evidence
+}
+
+func totalPoolWait(entries []dbpool.Entry) (int64, bool) {
+	if len(entries) == 0 {
+		return 0, false
+	}
+	var total int64
+	for _, entry := range entries {
+		if entry.Partial || entry.WaitDuration < 0 || int64(entry.WaitDuration) > math.MaxInt64-total {
+			return 0, false
+		}
+		total += int64(entry.WaitDuration)
+	}
+	return total, true
+}
+
+func outcomeRegressions(a, b Snapshot) []diffEvidence {
+	var evidence []diffEvidence
+	if aScore, errA := strconv.ParseFloat(a.Meta.Score, 64); errA == nil {
+		if bScore, errB := strconv.ParseFloat(b.Meta.Score, 64); errB == nil && bScore < aScore {
+			evidence = append(evidence, diffEvidence{
+				Signal: "benchmark score", Metric: "meta.score", A: aScore, B: bScore,
+				Formula:    "numeric B score < numeric A score",
+				Limitation: "score semantics and run-to-run variance are benchmark-defined; one pair is not a causal estimate",
+			})
+		}
+	}
+	if a.Meta.BenchmarkPass != nil && b.Meta.BenchmarkPass != nil && *a.Meta.BenchmarkPass && !*b.Meta.BenchmarkPass {
+		evidence = append(evidence, diffEvidence{
+			Signal: "benchmark pass", Metric: "meta.benchmark_pass", A: 1, B: 0,
+			Formula:    "A pass=true and B pass=false",
+			Limitation: "pass is caller-supplied through /save and its correctness rule belongs to the benchmark",
+		})
+	}
+	if a.Meta.Run != nil && b.Meta.Run != nil {
+		aRank, aOK := validityRank(a.Meta.Run.Validity)
+		bRank, bOK := validityRank(b.Meta.Run.Validity)
+		if aOK && bOK && bRank < aRank {
+			evidence = append(evidence, diffEvidence{
+				Signal: "measurement validity", Metric: "meta.run.validity", A: float64(aRank), B: float64(bRank),
+				Formula:    "B validity rank < A validity rank (valid=2, partial=1, invalid=0)",
+				Limitation: "measurement validity describes collection integrity, not benchmark correctness",
+			})
+		}
+	}
+	aSuccess, aErrors := httpOutcomeCounts(a.HTTP)
+	bSuccess, bErrors := httpOutcomeCounts(b.HTTP)
+	if aSuccess > 0 && bSuccess < aSuccess {
+		evidence = append(evidence, diffEvidence{
+			Signal: "successful HTTP completions", Metric: "http.status_2xx_3xx_count",
+			A: float64(aSuccess), B: float64(bSuccess), Formula: "B 2xx/3xx completion count < A count",
+			Limitation: "request mix, benchmark pacing, redirects, and run duration may differ",
+		})
+	}
+	if bErrors > aErrors {
+		evidence = append(evidence, diffEvidence{
+			Signal: "HTTP server errors", Metric: "http.status_5xx_count",
+			A: float64(aErrors), B: float64(bErrors), Formula: "B 5xx count > A 5xx count",
+			Limitation: "request mix, benchmark pacing, and run duration may differ",
+		})
+	}
+	return evidence
+}
+
+func validityRank(value string) (int, bool) {
+	switch value {
+	case "valid":
+		return 2, true
+	case "partial":
+		return 1, true
+	case "invalid":
+		return 0, true
+	default:
+		return 0, false
+	}
+}
+
+func httpOutcomeCounts(entries httpstats.Snapshot) (successes, errors int64) {
+	for _, entry := range entries {
+		if entry.Count <= 0 {
+			continue
+		}
+		switch {
+		case entry.Status >= 200 && entry.Status < 400:
+			successes = saturatingCountAdd(successes, entry.Count)
+		case entry.Status >= 500:
+			errors = saturatingCountAdd(errors, entry.Count)
+		}
+	}
+	return successes, errors
+}
+
+func saturatingCountAdd(current, value int64) int64 {
+	if value <= 0 {
+		return current
+	}
+	if current > math.MaxInt64-value {
+		return math.MaxInt64
+	}
+	return current + value
 }
 
 func provenanceWarning(a, b Meta) string {
@@ -88,13 +277,9 @@ func (h *handler) loadRun(id string) (*Snapshot, error) {
 	if h.p.DataDir == "" {
 		return nil, fmt.Errorf("no data dir")
 	}
-	entries, err := os.ReadDir(h.p.DataDir)
-	if err != nil {
-		return nil, err
-	}
 	matches := make([]string, 0, 1)
-	for _, e := range entries {
-		name := e.Name()
+	for _, entry := range h.dataEntries() {
+		name := entry.name
 		if strings.HasPrefix(name, id+"_") && strings.HasSuffix(name, ".json") {
 			matches = append(matches, name)
 		}
@@ -105,24 +290,17 @@ func (h *handler) loadRun(id string) (*Snapshot, error) {
 	if len(matches) > 1 {
 		return nil, fmt.Errorf("run %s is ambiguous (%d snapshots)", id, len(matches))
 	}
-	file, err := os.Open(filepath.Join(h.p.DataDir, matches[0]))
+	file, err := h.openDataRoot()
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
+	data, err := file.ReadFile(matches[0], maxSnapshotBytes)
 	if err != nil {
+		if errors.Is(err, safefs.ErrTooLarge) {
+			return nil, errSnapshotTooLarge
+		}
 		return nil, err
-	}
-	if info.Size() > maxSnapshotBytes {
-		return nil, errSnapshotTooLarge
-	}
-	data, err := io.ReadAll(io.LimitReader(file, maxSnapshotBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxSnapshotBytes {
-		return nil, errSnapshotTooLarge
 	}
 	snap := &Snapshot{}
 	if err := json.Unmarshal(data, snap); err != nil {
@@ -174,7 +352,11 @@ func diffEntries(a, b []agg.Entry) []diffRow {
 		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		return math.Abs(rows[i].DeltaMs) > math.Abs(rows[j].DeltaMs)
+		iDelta, jDelta := math.Abs(rows[i].DeltaMs), math.Abs(rows[j].DeltaMs)
+		if iDelta != jDelta {
+			return iDelta > jDelta
+		}
+		return rows[i].Key < rows[j].Key
 	})
 	if len(rows) > 30 {
 		rows = rows[:30]
@@ -202,6 +384,7 @@ td.l { text-align: left; white-space: normal; word-break: break-all; }
 tbody tr:nth-child(odd) { background: #fafafa; }
 .up { color: #b91c1c; } .down { color: #15803d; }
 .warn { color: #b45309; font-weight: bold; }
+.contradiction { border: 2px solid #b45309; padding: .6rem; margin: .8rem 0; }
 .empty { color: #999; }
 a { color: #0b57d0; }
 </style>
@@ -210,6 +393,11 @@ a { color: #0b57d0; }
 <h1>diff: {{.A}} (score {{.AScore}}) &rarr; {{.B}} (score {{.BScore}})</h1>
 <p class="meta">delta = B - A。合計時間の変化量順、上位30件。件数が異なる行では合計deltaを改善・悪化とは判定できません。avgと負荷条件を確認してください。<a href="./">&larr; runs</a></p>
 {{if .ProvenanceWarning}}<p class="warn">{{.ProvenanceWarning}}</p>{{end}}
+{{range .Contradictions}}<div class="contradiction">
+<p class="warn">{{.Label}}</p>
+<p class="meta">outcome: {{.Outcome.Signal}} ({{.Outcome.Metric}}) A={{ms1 .Outcome.A}} B={{ms1 .Outcome.B}}; {{.Outcome.Formula}}; limitation: {{.Outcome.Limitation}}</p>
+{{range .Improvements}}<p class="meta">improved resource: {{.Signal}} ({{.Metric}}) A={{ms1 .A}} B={{ms1 .B}}; {{.Formula}}; limitation: {{.Limitation}}</p>{{end}}
+</div>{{end}}
 
 <h2>SQL</h2>
 {{if .SQL}}

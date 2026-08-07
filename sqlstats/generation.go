@@ -82,6 +82,13 @@ func NewGenerationCollector(store *Store) *GenerationCollector {
 	return &GenerationCollector{store: store, results: map[boundaryKey]boundaryRecord{}}
 }
 
+// SetEventObserver forwards event observation to the underlying store.
+func (c *GenerationCollector) SetEventObserver(observer EventObserver) {
+	if c != nil && c.store != nil {
+		c.store.SetEventObserver(observer)
+	}
+}
+
 // Name identifies the snapshot section this collector fills.
 func (c *GenerationCollector) Name() string { return SectionName }
 

@@ -12,6 +12,83 @@ import (
 	"time"
 )
 
+type recordingEventObserver struct {
+	starts, finishes, cancels int
+	key                       string
+	failed                    bool
+}
+
+func (o *recordingEventObserver) HTTPStart(time.Time) any { o.starts++; return "token" }
+func (o *recordingEventObserver) HTTPFinish(_ time.Time, token any, key string, _ time.Duration, failed bool) {
+	if token != "token" {
+		panic("wrong token")
+	}
+	o.finishes++
+	o.key, o.failed = key, failed
+}
+func (o *recordingEventObserver) HTTPCancel(_ time.Time, token any) {
+	if token != "token" {
+		panic("wrong token")
+	}
+	o.cancels++
+}
+
+type panickingEventObserver struct{}
+
+func (panickingEventObserver) HTTPStart(time.Time) any { panic("observer") }
+func (panickingEventObserver) HTTPFinish(time.Time, any, string, time.Duration, bool) {
+	panic("observer")
+}
+func (panickingEventObserver) HTTPCancel(time.Time, any) { panic("observer") }
+
+func TestEventObserverReceivesOnlySafeRouteIdentity(t *testing.T) {
+	c := New()
+	observer := &recordingEventObserver{}
+	c.SetEventObserver(observer)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /reset-password/{account}", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "failed", http.StatusServiceUnavailable)
+	})
+	c.Middleware(mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(
+		http.MethodPost, "/reset-password/alice@example.com?token=secret", nil))
+	if observer.starts != 1 || observer.finishes != 1 || observer.cancels != 0 || !observer.failed {
+		t.Fatalf("observer counts = %#v", observer)
+	}
+	if observer.key != "POST /reset-password/{account}" || strings.Contains(observer.key, "alice") || strings.Contains(observer.key, "secret") {
+		t.Fatalf("observer key = %q", observer.key)
+	}
+
+	observer = &recordingEventObserver{}
+	c.SetEventObserver(observer)
+	c.Middleware(http.NotFoundHandler()).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/invite/secret-slug", nil))
+	if observer.key != "GET (unmatched)" {
+		t.Fatalf("heuristic fallback reached event observer: %q", observer.key)
+	}
+
+	rules, err := ParseSafeProfileRouteRules(`^/invite/[^/]+$=/invite/{token}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer = &recordingEventObserver{}
+	c.SetEventRouteRules(rules)
+	c.SetEventObserver(observer)
+	c.Middleware(http.NotFoundHandler()).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/invite/secret-slug", nil))
+	if observer.key != "GET /invite/{token}" || strings.Contains(observer.key, "secret") {
+		t.Fatalf("safe constant event rule = %q", observer.key)
+	}
+}
+
+func TestEventObserverPanicCannotBreakRequest(t *testing.T) {
+	c := New()
+	c.SetEventObserver(panickingEventObserver{})
+	recorder := httptest.NewRecorder()
+	c.Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusCreated) })).ServeHTTP(
+		recorder, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	if recorder.Code != http.StatusCreated || len(c.Snapshot()) != 1 {
+		t.Fatalf("response=%d snapshot=%#v", recorder.Code, c.Snapshot())
+	}
+}
+
 func TestMiddlewareRecordsRoutePatternWithoutQuery(t *testing.T) {
 	c := New()
 	mux := http.NewServeMux()

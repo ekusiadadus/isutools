@@ -66,8 +66,13 @@ func (c *Controller) AbortRun(ctx context.Context, runID, reason string) (AbortR
 		c.sealLocked(s)
 		cancel, done, ep := s.cancel, s.done, s.epoch
 		partial := committedNames(s.start.Collectors)
+		event := RunTerminationEvent{
+			RunID: runID, Epoch: ep, State: StateAborting,
+			Validity: ValidityInvalid, Reason: reason, BoundaryAt: s.since,
+		}
 		c.notifyLocked(s)
 		c.mu.Unlock()
+		c.observeTermination(event)
 
 		// Step 2: cancel outside the mutex.
 		if cancel != nil {

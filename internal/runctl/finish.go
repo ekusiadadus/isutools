@@ -120,6 +120,7 @@ func (c *Controller) freeze(s *runSlot, ep Epoch, bg context.Context) (FinishAcc
 		BoundaryWindow:   computeWindow(boundaries, nil),
 		AcceptedAt:       c.now(),
 	}
+	overallValidity := worse(s.start.Validity, accepted.Validity)
 
 	err := c.commit(ep, func(slot *runSlot) {
 		slot.finish = accepted
@@ -158,6 +159,11 @@ func (c *Controller) freeze(s *runSlot, ep Epoch, bg context.Context) (FinishAcc
 		c.releaseBaseline(baseOut.handles)
 		return FinishAccepted{}, fmt.Errorf("runctl: run %s was aborted while freezing: %w", s.runID, ErrRunAborted)
 	}
+	c.observeTermination(RunTerminationEvent{
+		RunID: s.runID, Epoch: ep, State: StateFinishing,
+		Validity: overallValidity, Reason: ReasonFinishAccepted,
+		BoundaryAt: terminationBoundary(accepted.GenerationWindow, accepted.AcceptedAt),
+	})
 	return accepted.clone(), nil
 }
 

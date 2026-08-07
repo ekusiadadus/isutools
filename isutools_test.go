@@ -249,6 +249,109 @@ func newTestMeasurement(t *testing.T, values map[string]string) *measurement {
 	return m
 }
 
+func TestCompleteResetRunRecoversStartedTTLAfterControllerTombstoneEviction(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 6, 11, 53, 50, 0, time.UTC)
+	current := now
+	m := newMeasurementWith(envMap(nil), runctl.Options{
+		DisableWatchdog: true,
+		Now:             func() time.Time { return current },
+		Budgets: runctl.Budgets{
+			StartedTTL:   time.Second,
+			TombstoneTTL: time.Second,
+		},
+	}, isolatedGenerationCollectors())
+	t.Cleanup(m.ctrl.Close)
+	started, err := m.startResetRun(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	current = current.Add(2 * time.Second)
+	m.ctrl.Sweep()
+	status, ok := m.ctrl.Status(started.RunID)
+	if !ok || status.Reason != runctl.ReasonStartedTTL {
+		t.Fatalf("ttl status = %#v ok=%v", status, ok)
+	}
+	expiredAt := status.Since
+	current = current.Add(2 * time.Second)
+	m.ctrl.Sweep()
+	if _, ok := m.ctrl.Status(started.RunID); ok {
+		t.Fatal("controller tombstone was not evicted")
+	}
+
+	recovered, err := m.completeResetRun(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.RunID != started.RunID || recovered.Epoch != uint64(started.Epoch) ||
+		recovered.State != string(runctl.StateAborted) || recovered.Validity != string(runctl.ValidityInvalid) ||
+		!recovered.Recovered || recovered.RecoveryReason != runctl.ReasonStartedTTL ||
+		!recovered.StartedAt.Equal(now) || !recovered.AcceptedAt.Equal(expiredAt) {
+		t.Fatalf("recovered = %#v", recovered)
+	}
+}
+
+func TestResetExpireAndSavePersistsRecoveryProvenanceEndToEnd(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 8, 6, 11, 53, 50, 0, time.UTC)
+	current := now
+	m := newMeasurementWith(envMap(map[string]string{"ISUTOOLS": "off"}), runctl.Options{
+		DisableWatchdog: true,
+		Now:             func() time.Time { return current },
+		Budgets: runctl.Budgets{
+			StartedTTL:   time.Second,
+			TombstoneTTL: time.Second,
+		},
+	}, isolatedGenerationCollectors())
+	t.Cleanup(m.ctrl.Close)
+	dir := t.TempDir()
+	handler := web.NewHandler(web.Provider{
+		SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir,
+		StartRun: m.startResetRun, FinishRun: m.finishResetRun, CompleteRun: m.completeResetRun,
+	})
+
+	reset := httptest.NewRecorder()
+	handler.ServeHTTP(reset, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if reset.Code != http.StatusNoContent {
+		t.Fatalf("reset status=%d body=%s", reset.Code, reset.Body.String())
+	}
+	runID := reset.Header().Get("X-Isutools-Run-Id")
+	if runID == "" {
+		t.Fatal("reset returned no run id")
+	}
+	current = current.Add(2 * time.Second)
+	m.ctrl.Sweep()
+	current = current.Add(2 * time.Second)
+	m.ctrl.Sweep()
+	if _, ok := m.ctrl.Status(runID); ok {
+		t.Fatal("expired run tombstone was not evicted")
+	}
+
+	saved := httptest.NewRecorder()
+	handler.ServeHTTP(saved, httptest.NewRequest(http.MethodPost, "/save?score=237979&pass=true", nil))
+	if saved.Code != http.StatusOK {
+		t.Fatalf("save status=%d body=%s", saved.Code, saved.Body.String())
+	}
+	var response web.SaveResponse
+	if err := json.Unmarshal(saved.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dir, response.SnapshotFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot web.Snapshot
+	if err := json.Unmarshal(body, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Meta.Score != "237979" || snapshot.Meta.BenchmarkPass == nil || !*snapshot.Meta.BenchmarkPass ||
+		!snapshot.Meta.Partial || snapshot.Meta.Run == nil || snapshot.Meta.Run.RunID != runID ||
+		!snapshot.Meta.Run.Recovered || snapshot.Meta.Run.RecoveryReason != runctl.ReasonStartedTTL ||
+		snapshot.Meta.Run.State != string(runctl.StateAborted) || snapshot.Meta.Run.Validity != string(runctl.ValidityInvalid) {
+		t.Fatalf("recovered snapshot = %#v", snapshot.Meta)
+	}
+}
+
 // isolatedGenerationCollectors builds a generation collector set private to
 // one test.
 //
@@ -261,6 +364,55 @@ func isolatedGenerationCollectors() generationCollectors {
 		http:     httpstats.New(),
 		sql:      sqlstats.NewGenerationCollector(sqlstats.NewStore(agg.DefaultMaxKeys)),
 		counters: counters.NewGenerationCollector(counters.NewRegistry()),
+	}
+}
+
+func TestTimelineWiringBindsHTTPAndSQLToOneRunEpoch(t *testing.T) {
+	t.Parallel()
+	httpCollector := httpstats.New()
+	store := sqlstats.NewStore(agg.DefaultMaxKeys)
+	gens := generationCollectors{
+		http: httpCollector, sql: sqlstats.NewGenerationCollector(store),
+		counters: counters.NewGenerationCollector(counters.NewRegistry()),
+	}
+	m := newMeasurementWith(envMap(map[string]string{
+		envTimeline: "1", envTimelineInterval: "100ms",
+		hoststats.EnvEnable: "off", envNetStats: "off", sqlrows.EnvFlag: "off", envDBPool: "off",
+	}), runctl.Options{DisableWatchdog: true}, gens)
+	t.Cleanup(func() {
+		m.timeline.close()
+		m.ctrl.Close()
+	})
+	started, err := m.startRun(context.Background(), runctl.StartRunOptions{Reason: "test", Trigger: "test"})
+	if err != nil || started.State != runctl.StateStarted {
+		t.Fatalf("start = %#v, %v", started, err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items/{id}", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	httpCollector.Middleware(mux).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/items/secret", nil))
+	store.Observe("SELECT ?", 2*time.Millisecond)
+	accepted, err := m.ctrl.FinishRun(context.Background(), started.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := m.timeline.section(started.RunID, uint64(accepted.Epoch))
+	if section == nil || section.RunID != started.RunID || section.Epoch != uint64(started.Epoch) || len(section.Buckets) == 0 {
+		t.Fatalf("timeline = %#v", section)
+	}
+	var httpSeen, sqlSeen bool
+	for _, bucket := range section.Buckets {
+		for _, operation := range bucket.HTTP {
+			httpSeen = httpSeen || operation.Key == "GET /items/{id}"
+			if strings.Contains(operation.Key, "secret") {
+				t.Fatalf("timeline leaked raw route: %#v", operation)
+			}
+		}
+		for _, operation := range bucket.SQL {
+			sqlSeen = sqlSeen || operation.Key == "SELECT ?"
+		}
+	}
+	if !httpSeen || !sqlSeen {
+		t.Fatalf("timeline events missing: %#v", section.Buckets)
 	}
 }
 

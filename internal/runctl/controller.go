@@ -32,6 +32,9 @@ type Options struct {
 	// by the enrich budget. It is how post-freeze extras such as EXPLAIN
 	// output are attached without widening the freeze boundary.
 	Enrich func(ctx context.Context, s *Snapshot) error
+	// LifecycleObserver receives the accepted stop boundary for every run.
+	// It must not block; see LifecycleObserver for the liveness contract.
+	LifecycleObserver LifecycleObserver
 	// DisableWatchdog stops the Controller from starting its lease/TTL sweeper
 	// goroutine. Tests that drive Sweep by hand set this.
 	DisableWatchdog bool
@@ -106,10 +109,11 @@ type nonceEntry struct {
 
 // Controller owns the run lifecycle for one process.
 type Controller struct {
-	budgets Budgets
-	now     func() time.Time
-	healthR HealthRecorder
-	enrich  func(context.Context, *Snapshot) error
+	budgets  Budgets
+	now      func() time.Time
+	healthR  HealthRecorder
+	enrich   func(context.Context, *Snapshot) error
+	observer LifecycleObserver
 
 	mu    sync.Mutex
 	epoch Epoch
@@ -144,17 +148,44 @@ func New(o Options) (*Controller, error) {
 		now = time.Now
 	}
 	c := &Controller{
-		budgets: b,
-		now:     now,
-		healthR: o.Health,
-		enrich:  o.Enrich,
-		stop:    make(chan struct{}),
+		budgets:  b,
+		now:      now,
+		healthR:  o.Health,
+		enrich:   o.Enrich,
+		observer: o.LifecycleObserver,
+		stop:     make(chan struct{}),
 	}
 	if !o.DisableWatchdog {
 		c.wg.Add(1)
 		go c.watchdog()
 	}
 	return c, nil
+}
+
+// observeTermination invokes the optional process-wide observer outside the
+// Controller mutex. A profiler adapter is operational instrumentation, not a
+// reason to crash or strand the measured application, so panics are contained.
+func (c *Controller) observeTermination(event RunTerminationEvent) {
+	if c.observer == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				c.recordHealth(HealthContractViolation, fmt.Sprintf("lifecycle observer panicked for run %s: %v", event.RunID, recovered))
+			}
+		}()
+		c.observer.OnRunTermination(event)
+	}()
+	timer := time.NewTimer(LifecycleObserverBudget)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		c.recordHealth(HealthContractViolation, fmt.Sprintf("lifecycle observer exceeded %v for run %s", LifecycleObserverBudget, event.RunID))
+	}
 }
 
 var (

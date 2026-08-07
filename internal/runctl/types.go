@@ -2,6 +2,11 @@ package runctl
 
 import "time"
 
+// LifecycleObserverBudget is the maximum time a lifecycle API waits for its
+// observer to accept a termination event. The observer may continue in its own
+// goroutine after this budget, but can never hold the run state machine.
+const LifecycleObserverBudget = 10 * time.Millisecond
+
 // RunState is a run's position in the lifecycle state machine. Transport
 // layers copy these strings onto the wire verbatim, so the values are part of
 // the contract.
@@ -178,7 +183,39 @@ const (
 	ReasonStartedTTL = "started-ttl"
 	// ReasonHubAbort is a multi-host hub aborting a peer's run.
 	ReasonHubAbort = "hub-abort"
+	// ReasonFinishAccepted marks the closing boundary accepted by FinishRun.
+	ReasonFinishAccepted = "finish-accepted"
 )
+
+// RunTerminationEvent is emitted exactly once when a run stops accepting
+// measured work: after an invalid opening boundary is committed, after a
+// closing boundary is accepted, or immediately after an abort fence is
+// installed. It deliberately carries the run's epoch, not the Controller's
+// possibly advanced epoch, so process-wide resource owners can reject stale
+// or duplicate requests.
+type RunTerminationEvent struct {
+	RunID      string
+	Epoch      Epoch
+	State      RunState
+	Validity   Validity
+	Reason     string
+	BoundaryAt time.Time
+}
+
+// LifecycleObserver receives run termination boundaries. Implementations must
+// return immediately; work that can block (notably runtime/pprof shutdown) has
+// to be handed to an independently bounded coordinator. The Controller calls
+// this interface without holding its mutex and contains observer panics.
+type LifecycleObserver interface {
+	OnRunTermination(RunTerminationEvent)
+}
+
+func terminationBoundary(window BoundaryWindow, fallback time.Time) time.Time {
+	if !window.Max.IsZero() {
+		return window.Max
+	}
+	return fallback
+}
 
 // Health keys this package reports. The set is fixed at four so that a health
 // snapshot stays readable; new conditions reuse these keys with a different
