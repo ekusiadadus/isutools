@@ -1,17 +1,16 @@
 # Implementation and verification status
 
-Updated: 2026-08-07 (Asia/Tokyo) — current release: **v1.3.0**
+Updated: 2026-08-07 (Asia/Tokyo) — current release: **v1.4.0**
 
 `v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1),
-`v1.2.0` tag = `833515e`, and `v1.3.0` tag = `26aa2bb` (merge of PR #14).
+`v1.2.0` tag = `833515e`, `v1.3.0` tag = `26aa2bb` (merge of PR #14),
+and v1.4.0 contains PR #18.
 The existing v1.2 sections below remain historical evidence; their numbers are
 not silently reused for the current working tree.
 
-## Unreleased working-tree implementation (2026-08-06)
+## v1.4.0 release implementation
 
-The `feat/v1.2.0-foundation` working tree after v1.3.0 contains these additional
-changes. They are implemented and locally verified, but are not described as
-released until a PR is merged and a later tag exists:
+PR #18 after v1.3.0 delivers these additional changes:
 
 - issue #12 documentation: SSH loopback forwarding now states the network-
   namespace prerequisite, gives an SSH-lifetime-scoped WSL2 guest relay,
@@ -29,6 +28,9 @@ released until a PR is merged and a later tag exists:
   profiles, immutable capture evidence, hard-isolated external analysis,
   binary provenance, root-scoped artifact I/O, explicit publication CAS, and
   derived HTML
+- decision-oriented report UI: a first repair candidate, HTTP/SQL search keys,
+  explicit source-line evidence boundaries, current-renderer preview for saved
+  snapshots, and line-granularity hotspots after verified profile analysis
 
 Current-tree verification:
 
@@ -43,13 +45,19 @@ Current-tree verification:
 | scripts | shellcheck, `bash -n`, ABBA contract | PASS |
 | minimum Go | Go 1.24.x, Linux/arm64 Docker | all-package test + vet PASS |
 | hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
+| GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, test, MySQL integration | PASS on PR #18 before release |
 
-The pprof external-analysis Darwin crash-fault test, private-isu ABBA release
-gate, remote GitHub Actions result for the new cgroup job, and deployment
-behavior are still unverified. Plan 10 multi-host aggregation remains
-intentionally unimplemented.
+The pprof external-analysis Darwin crash-fault test and a complete private-isu
+ABBA release gate remain unverified. Repeated initialize/reset can also omit a
+managed CPU artifact while the previous asynchronous stop still owns the
+process-wide profiler; this is tracked in issue #19. Plan 10 multi-host
+aggregation remains intentionally unimplemented.
 
 ## Implemented and released
+
+- **v1.4.0**: safe run-aligned CPU capture and hard-isolated external pprof
+  analysis, bounded run timelines, exact expired-run recovery, WSL2 tunnel
+  guidance, and decision-oriented bottleneck/source-line report navigation
 
 - **M1 (v0.1.0)**: bounded SQL aggregation (sharded, log2-bucket p95), literal
   masking, snapshot HTML/JSON, build/host metadata, loopback admin server

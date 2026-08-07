@@ -368,10 +368,10 @@ successful capture is retained as one private immutable `.pprof` plus its
 SHA-256 `.meta.json` record. Manual `/pprof/profile` remains available in
 fixed/off modes; only managed run mode returns 409.
 
-Run-aligned CPU capture and external analysis are implemented in the working
-tree as opt-in features. Linux cgroup-v2 hard-limit/OOM behavior and a real
-`runtime/pprof` CPU profile are verified, but the feature is not release-approved:
-the Darwin crash-fault and private-isu ABBA gates remain outstanding. Set
+Run-aligned CPU capture and external analysis are opt-in v1.4.0 features.
+Linux cgroup-v2 hard-limit/OOM behavior and a real `runtime/pprof` CPU profile
+are verified; the Darwin crash-fault and a complete private-isu ABBA gate
+remain outside the verified scope. Set
 `ISUTOOLS_CPU_PROFILE_MODE=run` and `ISUTOOLS_PROFILE_ANALYSIS=1`, then run
 `isutools-pprof preflight / fetch / analyze / publish` on the control host only
 after the ABBA block. `fetch` requires the exact `snapshot_base` and
@@ -379,6 +379,12 @@ after the ABBA block. `fetch` requires the exact `snapshot_base` and
 `--expected-current` and never retries a 409 automatically. If no hard memory
 primitive can be established, analysis exits 4 before reading profile bytes;
 it never downgrades to a soft limit.
+
+Known limitation: two initialize/reset boundaries in quick succession can race
+the previous run's asynchronous CPU stop against the next start and omit the
+next run's CPU artifact ([#19](https://github.com/ekusiadadus/isutools/issues/19)).
+Initialize a measured run once, and use the same `ResetNowWithNonce` nonce for
+retries.
 
 ### EXPLAIN (default off)
 

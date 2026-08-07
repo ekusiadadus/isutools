@@ -332,10 +332,18 @@ func TestStopStallBecomesWedgedAndLateCompletionRecoversOwner(t *testing.T) {
 	req := validStartRequest()
 	c.StartRun(context.Background(), req)
 	ticket := c.RequestStop(StopRequest{RunID: req.RunID, Epoch: req.Epoch, Reason: "finish", BoundaryAt: time.Now()})
-	time.Sleep(25 * time.Millisecond)
-	status, ok := c.Status(req.RunID, req.Epoch)
-	if !ok || status.State != StateWedged || status.Code != CodeStopWedged {
-		t.Fatalf("wedged status = %#v ok=%v", status, ok)
+	deadline := time.Now().Add(time.Second)
+	var status Status
+	var ok bool
+	for {
+		status, ok = c.Status(req.RunID, req.Epoch)
+		if ok && status.State == StateWedged && status.Code == CodeStopWedged {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("wedged status = %#v ok=%v", status, ok)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	next := validStartRequest()
 	next.RunID, next.Epoch = "run-2", 2

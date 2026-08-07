@@ -36,6 +36,12 @@ const profileAnalysisTemplateText = `<section id="isutools-profile-analysis">
 <h2>Profile Analysis</h2>
 <p>status: {{.Status}} · analysis: <code>{{.AnalysisID}}</code></p>
 <p>snapshot: <code>{{.SnapshotSHA256}}</code> · binary: {{.Binary.Match}} · worker: {{.Analyzer.Isolation.Mode}} / {{.Analyzer.Isolation.Bootstrap}}</p>
+{{$lines := profileLineHotspots .}}
+<h3>次に見るソース行</h3>
+{{if eq .Binary.Match "verified"}}<p><strong>binary一致を検証済み:</strong> 以下のfile:lineはcapture時の実行binaryと一致する解析入力から得ています。</p>{{else}}<p><strong>未検証:</strong> binary一致が{{.Binary.Match}}のため、以下に行が表示されても修正候補であり、capture時binaryのhot lineとは断定できません。</p>{{end}}
+{{if $lines}}<table><thead><tr><th>kind</th><th>sample</th><th>metric</th><th>file:line</th><th>function</th><th>value</th><th>%</th></tr></thead><tbody>{{range $lines}}<tr><td>{{.Kind}}</td><td>{{.SampleType}}</td><td>{{.Metric}}</td><td>{{.Location}}</td><td>{{.Node.Function}}</td><td>{{.Node.Value}}</td><td>{{.Percent}}</td></tr>{{end}}</tbody></table>
+<p>flatはその行自身で消費した値、cumulativeはその行から先の呼び出しを含む値です。まず大きいcumulativeから呼び出し経路を絞り、flatで実作業の行を確認します。</p>
+{{else}}<p>line granularityのsymbolized結果がありません。HTTP/SQLの検索キーは候補の入口にはなりますが、ソースコードのhot lineを示すものではありません。</p>{{end}}
 {{if .Diagnostics}}<h3>Analysis diagnostics</h3><ul>{{range .Diagnostics}}<li><strong>{{.Level}} / {{.Code}}</strong>: {{.Message}}</li>{{end}}</ul>{{end}}
 {{range .Attempts}}<article class="isutools-profile-attempt">
 <h3>{{.Kind}} ({{.Mode}} / {{.Status}})</h3>
@@ -59,6 +65,51 @@ type profileTemplateRow struct {
 	Percent string
 }
 
+type profileLineHotspot struct {
+	Kind       string
+	SampleType string
+	Metric     string
+	Location   string
+	Node       profilemodel.ProfileNode
+	Percent    string
+}
+
+func profileLineHotspots(analysis profilemodel.ProfileAnalysisV1) []profileLineHotspot {
+	const maxRows = 12
+	rows := make([]profileLineHotspot, 0, maxRows)
+	for _, attempt := range analysis.Attempts {
+		for _, summary := range attempt.Summaries {
+			for _, report := range summary.Reports {
+				if report.Granularity != profilemodel.GranularityLines {
+					continue
+				}
+				for _, group := range []struct {
+					metric string
+					nodes  []profilemodel.ProfileNode
+				}{
+					{metric: "cumulative", nodes: report.TopCumulative},
+					{metric: "flat", nodes: report.TopFlat},
+				} {
+					for _, node := range group.nodes {
+						if node.File == "" || node.Line <= 0 {
+							continue
+						}
+						rows = append(rows, profileLineHotspot{
+							Kind: attempt.Kind, SampleType: summary.SampleType, Metric: group.metric,
+							Location: fmt.Sprintf("%s:%d", node.File, node.Line), Node: node,
+							Percent: profilePercent(node.Value, summary.PercentDenominator),
+						})
+						if len(rows) == maxRows {
+							return rows
+						}
+					}
+				}
+			}
+		}
+	}
+	return rows
+}
+
 func profileRows(nodes []profilemodel.ProfileNode, denominator int64) []profileTemplateRow {
 	rows := make([]profileTemplateRow, len(nodes))
 	for index, node := range nodes {
@@ -74,7 +125,10 @@ func profilePercent(value, denominator int64) string {
 	return fmt.Sprintf("%.2f%%", float64(value)*100/float64(denominator))
 }
 
-var profileAnalysisTemplate = template.Must(template.New("profile-analysis").Funcs(template.FuncMap{"profileRows": profileRows}).Parse(profileAnalysisTemplateText))
+var profileAnalysisTemplate = template.Must(template.New("profile-analysis").Funcs(template.FuncMap{
+	"profileRows":         profileRows,
+	"profileLineHotspots": profileLineHotspots,
+}).Parse(profileAnalysisTemplateText))
 
 type ProfileAnalysisPublishRequest struct {
 	ExpectedCurrentArtifactID string                         `json:"expected_current_artifact_id"`
@@ -587,6 +641,33 @@ func (h *handler) serveCurrentDerived(w http.ResponseWriter, request *http.Reque
 	}
 	h.serveDataFile(w, request, current.HTMLFile)
 	return true
+}
+
+// currentAnalysisFragment renders the hash-verified active analysis through
+// the current analysis template. It is used only by the opt-in current report
+// preview; immutable original and derived artifacts remain untouched.
+func (h *handler) currentAnalysisFragment(root *safefs.Root, base string, snapshot []byte) ([]byte, bool) {
+	if !h.p.ProfileAnalysis {
+		return nil, false
+	}
+	current, exists, err := readCurrent(root, base+".profile.current.json")
+	if err != nil || !exists || hashBytes(snapshot) != current.SnapshotSHA256 || verifyCurrent(root, current) != nil {
+		return nil, false
+	}
+	analysisJSON, err := root.ReadFile(current.JSONFile, profilemodel.MaxAnalysisBodyBytes)
+	if err != nil || hashBytes(analysisJSON) != current.JSONSHA256 {
+		return nil, false
+	}
+	analysis, err := profilemodel.Decode(bytes.NewReader(analysisJSON))
+	if err != nil || analysis.AnalysisID != current.AnalysisID || analysis.SnapshotBase != base ||
+		analysis.SnapshotSHA256 != current.SnapshotSHA256 {
+		return nil, false
+	}
+	var fragment bytes.Buffer
+	if err := profileAnalysisTemplate.Execute(&fragment, analysis); err != nil || fragment.Len() > maxAnalysisHTMLIncrement {
+		return nil, false
+	}
+	return fragment.Bytes(), true
 }
 
 func verifyCurrent(root *safefs.Root, current ProfileAnalysisCurrent) error {

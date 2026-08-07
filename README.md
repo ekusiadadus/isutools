@@ -338,15 +338,19 @@ runtime 設定なので、**未設定の変数には一切触らない**(アプ�
 immutable `.pprof`とSHA-256付き`.meta.json`を一組で保存・retentionする。manual
 `/pprof/profile`はfixed/offでは引き続き利用でき、409になるのはmanaged run modeだけである。
 
-run境界CPU採取と外部解析はworking treeへ実装済みのopt-in機能である。Linux cgroup v2上の
+run境界CPU採取と外部解析はv1.4.0のopt-in機能である。Linux cgroup v2上の
 hard-limit/OOMと実`runtime/pprof` CPU profileは検証済みだが、Darwin crash faultと
-private-isu ABBAのrelease証拠は未取得で、まだ出荷承認済みとは扱わない。`ISUTOOLS_CPU_PROFILE_MODE=run`と
+完全なprivate-isu ABBA gateは未検証範囲として残る。`ISUTOOLS_CPU_PROFILE_MODE=run`と
 `ISUTOOLS_PROFILE_ANALYSIS=1`を設定し、ABBA block終了後にcontrol host上の
 `isutools-pprof preflight / fetch / analyze / publish`を順に使う。`fetch`は`/save`が返した
 exact `snapshot_base`と`snapshot_sha256`を必須とし、`publish`はoperatorが確認した
 `--expected-current`を必須とする。409を自動retryしない。hard memory primitiveを確立できない
 環境ではprofile bytesを読む前にexit 4となり、soft limitへdowngradeしない。詳細は
 [統合ガイド §7](./docs/INTEGRATION.md#7-pprofprocstats負荷生成ツール)を参照。
+
+既知の制約として、同一processでinitialize/resetを短時間に二重実行すると、前runの非同期CPU
+stopと次runのstartが競合し、次runのCPU artifactが欠落する場合がある([#19](https://github.com/ekusiadadus/isutools/issues/19))。
+計測対象runのinitializeは一度だけ実行し、retryには同じnonceの`ResetNowWithNonce`を使う。
 
 ### EXPLAIN(既定 off)
 

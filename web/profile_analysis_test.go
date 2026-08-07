@@ -204,6 +204,15 @@ func TestProfileAnalysisDerivedHTMLRendersCompleteEvidenceAndEscapesData(t *test
 	attempt.Diagnostics = []profilemodel.Diagnostic{{Level: profilemodel.DiagnosticWarn, Code: profilemodel.DiagnosticSourcePathRedacted, Message: "outside root <redacted>"}}
 	summary := &attempt.Summaries[0]
 	summary.Reports[0].TopCumulative = []profilemodel.ProfileNode{{Function: `<script>alert("x")</script>`, Value: 5}}
+	summary.Reports = append(summary.Reports, profilemodel.ProfileReport{
+		Granularity: profilemodel.GranularityLines,
+		TopFlat: []profilemodel.ProfileNode{{
+			Function: "main.appGetNotification", File: "app_handlers.go", Line: 711, Value: 4,
+		}},
+		TopCumulative: []profilemodel.ProfileNode{{
+			Function: "main.appGetNotification", File: "app_handlers.go", Line: 670, Value: 7,
+		}},
+	})
 	summary.Labels = []profilemodel.LabelBreakdown{{Key: "http.route", Values: []profilemodel.LabelValue{{Value: "/users/{id}", Total: 5}}}}
 	analysis.Status = profilemodel.AnalysisStatusPartial
 	analysis.AnalysisID = ""
@@ -225,13 +234,27 @@ func TestProfileAnalysisDerivedHTMLRendersCompleteEvidenceAndEscapesData(t *test
 		t.Fatal(err)
 	}
 	html := string(body)
-	for _, want := range []string{"Analysis diagnostics", "Diagnostics", "coverage:", "Top cumulative", "Labels", "50.00%", "/users/{id}", "&lt;script&gt;", analysisSidecarName, analysisCoverageName} {
+	for _, want := range []string{
+		"次に見るソース行", "binary一致を検証済み", "app_handlers.go:711", "main.appGetNotification", "flat", "cumulative",
+		"Analysis diagnostics", "Diagnostics", "coverage:", "Top cumulative", "Labels", "50.00%", "/users/{id}", "&lt;script&gt;", analysisSidecarName, analysisCoverageName,
+	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("derived HTML missing %q: %s", want, html)
 		}
 	}
 	if strings.Contains(html, `<script>alert`) {
 		t.Fatalf("derived HTML contains executable injected markup: %s", html)
+	}
+	preview := httptest.NewRecorder()
+	h.routes().ServeHTTP(preview, httptest.NewRequest(http.MethodGet, "/20260806-120000.000000000-000001?view=current", nil))
+	if preview.Code != http.StatusOK || preview.Header().Get("X-Isutools-View") != "current-renderer" ||
+		preview.Header().Get("X-Isutools-Profile-Analysis") != "current" {
+		t.Fatalf("current analysis preview = %d headers=%v: %s", preview.Code, preview.Header(), preview.Body.String())
+	}
+	for _, want := range []string{"結論: 次に修正する場所", "次に見るソース行", "app_handlers.go:711"} {
+		if !strings.Contains(preview.Body.String(), want) {
+			t.Errorf("current analysis preview missing %q: %s", want, preview.Body.String())
+		}
 	}
 }
 

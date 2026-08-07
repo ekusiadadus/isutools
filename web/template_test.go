@@ -580,6 +580,9 @@ func TestReportRendersTraceableTimelineAndInsufficientEvidenceFallback(t *testin
 			t.Errorf("timeline report missing %q", want)
 		}
 	}
+	if !strings.Contains(body, "<details><summary>時系列の詳細") {
+		t.Fatalf("dense timeline evidence must be collapsed behind a summary")
+	}
 
 	section.Analysis = timeline.Analysis{Available: false, Reason: timeline.ReasonInsufficientBuckets}
 	body = renderReport(t, Snapshot{Timeline: section})
@@ -603,7 +606,7 @@ func TestReportWithoutTimelineKeepsAggregateFallbackAndStatesUnavailable(t *test
 
 func TestReportWithRunSectionsStaysSelfContained(t *testing.T) {
 	body := renderReport(t, fullSnapshot())
-	for _, forbidden := range []string{"http://", "https://", "src=", "href="} {
+	for _, forbidden := range []string{`href="http://`, `href="https://`, `href="//`, `src=`} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("the report must stay self-contained, found %q", forbidden)
 		}

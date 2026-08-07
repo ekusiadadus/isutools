@@ -3,6 +3,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -1072,13 +1073,64 @@ func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 	case 0:
 		http.NotFound(w, r)
 	case 1:
-		if h.p.ProfileAnalysis && h.serveCurrentDerived(w, r, strings.TrimSuffix(matches[0], ".html")) {
+		base := strings.TrimSuffix(matches[0], ".html")
+		if r.URL.Query().Get("view") == "current" {
+			h.renderStoredSnapshot(w, r, base)
+			return
+		}
+		if h.p.ProfileAnalysis && h.serveCurrentDerived(w, r, base) {
 			return
 		}
 		h.serveDataFile(w, r, matches[0])
 	default:
 		http.Error(w, "run id is ambiguous; use a collision-free saved run", http.StatusConflict)
 	}
+}
+
+// renderStoredSnapshot previews an immutable saved JSON snapshot through the
+// current report template. The stored HTML remains the historical rendering;
+// this opt-in view lets users benefit from clearer diagnostics after an
+// isutools upgrade without rewriting, re-signing, or silently changing that
+// evidence artifact.
+func (h *handler) renderStoredSnapshot(w http.ResponseWriter, r *http.Request, base string) {
+	root, err := h.openDataRoot()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer func() { _ = root.Close() }()
+	body, err := root.ReadFile(base+".json", maxSnapshotBytes)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var payload jsonPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "isutools: saved snapshot is invalid", http.StatusUnprocessableEntity)
+		return
+	}
+	var rendered bytes.Buffer
+	if err := reportTmpl.Execute(&rendered, page{Snapshot: payload.Snapshot, Sortable: true}); err != nil {
+		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
+		return
+	}
+	if fragment, ok := h.currentAnalysisFragment(root, base, body); ok {
+		closing := bytes.LastIndex(bytes.ToLower(rendered.Bytes()), []byte("</body>"))
+		if closing >= 0 && rendered.Len()+len(fragment) <= maxDerivedHTMLBytes {
+			current := rendered.Bytes()
+			combined := make([]byte, 0, len(current)+len(fragment))
+			combined = append(combined, current[:closing]...)
+			combined = append(combined, fragment...)
+			combined = append(combined, current[closing:]...)
+			rendered.Reset()
+			_, _ = rendered.Write(combined)
+			w.Header().Set("X-Isutools-Profile-Analysis", "current")
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Isutools-View", "current-renderer")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(rendered.Bytes())
 }
 
 func (h *handler) index(w http.ResponseWriter) {

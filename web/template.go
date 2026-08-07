@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/ekusiadadus/isutools/hoststats"
+	"github.com/ekusiadadus/isutools/httpstats"
+	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/queryplan"
 	"github.com/ekusiadadus/isutools/sqlrows"
 )
@@ -60,7 +62,7 @@ a { color: #0b57d0; }
 <td>{{.Gen}}</td>
 <td class="l">{{.Rev}}</td>
 <td>{{if .Score}}{{.Score}}{{else}}-{{end}}</td>
-<td class="l"><a href="files/{{.File}}">html</a> <a href="files/{{.JSON}}">json</a>{{if .PrevID}} <a href="diff?a={{.PrevID}}&b={{.ID}}">diff</a>{{end}}</td>
+<td class="l"><a href="files/{{.File}}">html</a> <a href="{{.ID}}?view=current">current UI</a> <a href="files/{{.JSON}}">json</a>{{if .PrevID}} <a href="diff?a={{.PrevID}}&b={{.ID}}">diff</a>{{end}}</td>
 </tr>{{end}}
 </tbody>
 </table>
@@ -105,6 +107,167 @@ type bottleneckSignal struct {
 	NextAction string
 }
 
+// bottleneckDiagnosis is the short, decision-oriented answer that precedes
+// the evidence tables. It deliberately separates a measured system
+// constraint from source-code localization: an expensive endpoint or query
+// is a search key, while a file:line is only evidence after symbolized profile
+// analysis with matching executable provenance.
+type bottleneckDiagnosis struct {
+	PrimaryLevel      string
+	Primary           string
+	PrimaryEvidence   string
+	PrimaryAction     string
+	PrimaryAnchor     string
+	AmplifierLevel    string
+	Amplifier         string
+	AmplifierEvidence string
+	HTTPSearchKey     string
+	SQLSearchKey      string
+	CodeLevel         string
+	CodeTitle         string
+	CodeEvidence      string
+	CodeAction        string
+}
+
+func diagnoseBottleneck(snapshot Snapshot) bottleneckDiagnosis {
+	diagnosis := bottleneckDiagnosis{
+		PrimaryLevel:    "warn",
+		Primary:         "第一修正候補はまだ絞れません",
+		PrimaryEvidence: "resource / HTTP / SQL の同一区間データが不足しています。",
+		PrimaryAction:   "POST /reset → benchmark → POST /save で一つの計測区間を作ります。",
+		PrimaryAnchor:   "bottleneck-overview",
+		AmplifierLevel:  "warn",
+		Amplifier:       "負荷を増幅している操作は未判定です",
+	}
+
+	var waits int64
+	var waitDuration time.Duration
+	var open, maxOpen int
+	for _, entry := range snapshot.DBPool {
+		waits += entry.WaitCount
+		waitDuration += entry.WaitDuration
+		open += entry.Open
+		maxOpen += entry.MaxOpen
+	}
+	if waits > 0 {
+		avg := waitDuration / time.Duration(waits)
+		diagnosis.PrimaryLevel = "hot"
+		diagnosis.Primary = "第一修正候補: DB接続プール待ちを減らす"
+		diagnosis.PrimaryEvidence = fmt.Sprintf("wait %s回・累計%s・平均%s、open %d / max %d。requestが接続取得前に待っています。", humanCount(waits), humanDuration(waitDuration), humanDuration(avg), open, maxOpen)
+		diagnosis.PrimaryAction = "DB Poolのtarget別waitと、SQL/handler内で接続を保持する区間を確認します。上限を増やすだけでなく、transaction範囲とquery回数を先に縮めます。"
+		diagnosis.PrimaryAnchor = "db-pool"
+	} else if snapshot.Proc != nil && snapshot.Proc.CPUTotal != nil && procIntervalMatchesRun(snapshot) && snapshot.Proc.CPUTotal.BusyPercent >= 90 {
+		diagnosis.PrimaryLevel = "hot"
+		diagnosis.Primary = "第一修正候補: CPU hot pathを短くする"
+		diagnosis.PrimaryEvidence = fmt.Sprintf("run区間のCPU busy %.1f%%。", snapshot.Proc.CPUTotal.BusyPercent)
+		diagnosis.PrimaryAction = "CPU profileのfunctions → linesの順で、累積値が大きい呼び出し元へ降ります。"
+		diagnosis.PrimaryAnchor = "profiles"
+	} else if len(snapshot.SQL) > 0 {
+		top := topSQLDemand(snapshot.SQL)
+		diagnosis.PrimaryLevel = "warn"
+		diagnosis.Primary = "第一修正候補: 累計DB時間が最大のqueryを減らす"
+		diagnosis.PrimaryEvidence = fmt.Sprintf("count %s・累計%s・%s", humanCount(top.Count), humanDuration(top.Total), truncateRunes(top.Key, 100))
+		diagnosis.PrimaryAction = "HTTP一回あたりの発行回数、rows examined、Query Planを照合します。"
+		diagnosis.PrimaryAnchor = "sql"
+	}
+
+	if len(snapshot.HTTP) > 0 {
+		top := topHTTPDemand(snapshot.HTTP)
+		diagnosis.HTTPSearchKey = httpRouteSearchKey(top.Key)
+		diagnosis.AmplifierLevel = "warn"
+		diagnosis.Amplifier = "負荷増幅候補: 累計HTTP時間が最大のendpoint"
+		if looksLikeLongPoll(diagnosis.HTTPSearchKey) {
+			diagnosis.Amplifier = "負荷増幅候補: long-poll候補のendpoint"
+		}
+		diagnosis.AmplifierEvidence = fmt.Sprintf("%s・count %s・avg %s・p95 %s。待ち時間を含むtotalはhot codeの証明ではありません。", top.Key, humanCount(top.Count), humanDuration(top.Avg), humanDuration(top.P95))
+	}
+	if len(snapshot.SQL) > 0 {
+		diagnosis.SQLSearchKey = truncateRunes(topSQLDemand(snapshot.SQL).Key, 160)
+	}
+
+	diagnosis.CodeLevel, diagnosis.CodeTitle, diagnosis.CodeEvidence, diagnosis.CodeAction = codeEvidence(snapshot.Meta.Profiles)
+	return diagnosis
+}
+
+func topHTTPDemand(entries httpstats.Snapshot) httpstats.Entry {
+	top := entries[0]
+	for _, entry := range entries[1:] {
+		if entry.Total > top.Total {
+			top = entry
+		}
+	}
+	return top
+}
+
+func topSQLDemand(entries []agg.Entry) agg.Entry {
+	top := entries[0]
+	for _, entry := range entries[1:] {
+		if entry.Total > top.Total {
+			top = entry
+		}
+	}
+	return top
+}
+
+func httpRouteSearchKey(key string) string {
+	fields := strings.Fields(key)
+	if len(fields) >= 2 {
+		return fields[1]
+	}
+	return truncateRunes(key, 120)
+}
+
+func looksLikeLongPoll(route string) bool {
+	route = strings.ToLower(route)
+	return strings.Contains(route, "notification") || strings.Contains(route, "poll") ||
+		strings.Contains(route, "stream") || strings.Contains(route, "events")
+}
+
+func codeEvidence(manifest *ProfileManifest) (level, title, evidence, action string) {
+	const requirement = "ソースコードの行番号を断定するには、symbol付きprofile解析とcapture時binaryの一致確認が必要です。"
+	if manifest == nil || manifest.CPU == nil {
+		availablePairs := ""
+		if manifest != nil && len(manifest.Pairs) > 0 {
+			availablePairs = " mutex/block/heapの差分解析から待ち・allocationの候補行は探せますが、CPU hot lineの証明にはなりません。"
+		}
+		return "warn", "コード位置: このrunでは未特定",
+			"このrunにはCPU profileがありません。そのため、HTTP/SQLの検索候補は出せても、CPUを実際に消費したソースコードの行番号を断定できません。" + availablePairs,
+			"次のrunでrun CPU profileを採取し、isutools-pprofでlines集計を生成します。" + requirement
+	}
+	cpu := manifest.CPU
+	if cpu.Status != "published" || cpu.File == "" {
+		code := cpu.Code
+		if code == "" {
+			code = "unknown"
+		}
+		return "hot", "コード位置: CPU profile採取失敗",
+			fmt.Sprintf("CPU profileはstatus=%s / code=%sで、行解析に使えるartifactがありません。", cpu.Status, code),
+			"Profilesのcapture状態を直してから再計測します。" + requirement
+	}
+	return "ok", "コード位置: CPU artifactあり・解析待ち",
+		fmt.Sprintf("%s をline granularityで解析すれば、function / file / lineを表示できます。artifactがあるだけでは行番号は未検証です。", cpu.File),
+		"isutools-pprofを実行後、このrunを開き直して行解析結果を確認します。" + requirement
+}
+
+func humanCount(value int64) string {
+	s := strconv.FormatInt(value, 10)
+	if len(s) <= 3 {
+		return s
+	}
+	start := len(s) % 3
+	if start == 0 {
+		start = 3
+	}
+	var out strings.Builder
+	out.Grow(len(s) + len(s)/3)
+	out.WriteString(s[:start])
+	for index := start; index < len(s); index += 3 {
+		out.WriteByte(',')
+		out.WriteString(s[index : index+3])
+	}
+	return out.String()
+}
+
 // bottleneckOverview reduces the full report to the first checks that answer
 // two questions: where request time accumulates, and whether a resource limit
 // can explain it. Every row remains traceable to a detailed section below.
@@ -112,12 +275,7 @@ func bottleneckOverview(snapshot Snapshot) []bottleneckSignal {
 	rows := make([]bottleneckSignal, 0, 8)
 
 	if len(snapshot.HTTP) > 0 {
-		top := snapshot.HTTP[0]
-		for _, entry := range snapshot.HTTP[1:] {
-			if entry.Total > top.Total {
-				top = entry
-			}
-		}
+		top := topHTTPDemand(snapshot.HTTP)
 		rows = append(rows, bottleneckSignal{
 			Order:      "1",
 			Level:      "hot",
@@ -128,12 +286,7 @@ func bottleneckOverview(snapshot Snapshot) []bottleneckSignal {
 	}
 
 	if len(snapshot.SQL) > 0 {
-		top := snapshot.SQL[0]
-		for _, entry := range snapshot.SQL[1:] {
-			if entry.Total > top.Total {
-				top = entry
-			}
-		}
+		top := topSQLDemand(snapshot.SQL)
 		rows = append(rows, bottleneckSignal{
 			Order:      "2",
 			Level:      "hot",
@@ -749,6 +902,7 @@ var reportFuncs = template.FuncMap{
 	"bottlenecks":  bottleneckOverview,
 	"diskUtilNote": func() string { return hoststats.DiskUtilNote },
 	"cgroupNote":   func() string { return hoststats.CGroupScopeNote },
+	"diagnosis":    diagnoseBottleneck,
 }
 
 var reportTmpl = template.Must(template.New("report").Funcs(reportFuncs).Parse(`<!doctype html>
@@ -776,6 +930,16 @@ td.flag { color: #b45309; font-weight: bold; }
 .signal.hot { color: #9a3412; background: #ffedd5; }
 .signal.warn { color: #92400e; background: #fef3c7; }
 .signal.ok { color: #166534; background: #dcfce7; }
+.decision-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: .75rem; margin: .75rem 0; }
+.decision { border: 1px solid #d1d5db; border-left-width: .4rem; border-radius: .35rem; padding: .75rem; background: #fafafa; }
+.decision.hot { border-left-color: #ea580c; background: #fff7ed; }
+.decision.warn { border-left-color: #d97706; background: #fffbeb; }
+.decision.ok { border-left-color: #16a34a; background: #f0fdf4; }
+.decision h3 { font-size: .9rem; margin: 0 0 .4rem; }
+.decision p { font-size: .82rem; line-height: 1.45; margin: .25rem 0; }
+.jump { font-size: .82rem; line-height: 1.8; }
+.jump-link { appearance: none; border: 0; padding: 0; background: none; color: #0b57d0; font: inherit; text-decoration: underline; cursor: pointer; }
+.search-key { display: block; margin-top: .2rem; padding: .25rem .4rem; background: #f3f4f6; border-radius: .2rem; overflow-wrap: anywhere; }
 details { font-size: .8rem; margin: .4rem 0; }
 summary { cursor: pointer; color: #666; }
 ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
@@ -789,7 +953,32 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
 
-<h2>Bottleneck Overview <span class="meta">(原因の断定ではなく、最初に見る順)</span></h2>
+{{$diagnosis := diagnosis .Snapshot}}
+<span id="diagnosis"></span><h2>結論: 次に修正する場所 <span class="meta">(実測と候補を分離)</span></h2>
+<p class="meta">この要約は修正の探索順を示します。候補のendpoint/queryと、profileで検証済みのソース行は同じ意味ではありません。</p>
+<div class="decision-grid">
+<article class="decision {{$diagnosis.PrimaryLevel}}">
+<h3>{{$diagnosis.Primary}}</h3>
+<p><strong>根拠:</strong> {{$diagnosis.PrimaryEvidence}}</p>
+<p><strong>次:</strong> {{$diagnosis.PrimaryAction}} <button type="button" class="jump-link" data-target="{{$diagnosis.PrimaryAnchor}}">詳細を見る</button></p>
+</article>
+<article class="decision {{$diagnosis.AmplifierLevel}}">
+<h3>{{$diagnosis.Amplifier}}</h3>
+<p>{{$diagnosis.AmplifierEvidence}}</p>
+{{if $diagnosis.HTTPSearchKey}}<p><strong>route検索キー:</strong><code class="search-key">{{$diagnosis.HTTPSearchKey}}</code></p>{{end}}
+{{if $diagnosis.SQLSearchKey}}<p><strong>SQL検索キー:</strong><code class="search-key">{{$diagnosis.SQLSearchKey}}</code></p>{{end}}
+<p><button type="button" class="jump-link" data-target="http">HTTP</button> &middot; <button type="button" class="jump-link" data-target="sql">SQL</button></p>
+</article>
+<article class="decision {{$diagnosis.CodeLevel}}">
+<h3>{{$diagnosis.CodeTitle}}</h3>
+<p>{{$diagnosis.CodeEvidence}}</p>
+<p><strong>次:</strong> {{$diagnosis.CodeAction}}</p>
+<p><button type="button" class="jump-link" data-target="profiles">Profiles</button> &middot; <button type="button" class="jump-link" data-target="isutools-profile-analysis">行解析結果</button></p>
+</article>
+</div>
+<p class="jump">根拠へ移動: <button type="button" class="jump-link" data-target="bottleneck-overview">全signal</button> &middot; <button type="button" class="jump-link" data-target="collector-health">計測の欠損</button> &middot; <button type="button" class="jump-link" data-target="run-timeline">時系列</button> &middot; <button type="button" class="jump-link" data-target="db-pool">DB Pool</button> &middot; <button type="button" class="jump-link" data-target="sql">SQL</button> &middot; <button type="button" class="jump-link" data-target="http">HTTP</button> &middot; <button type="button" class="jump-link" data-target="profiles">Profiles</button></p>
+
+<span id="bottleneck-overview"></span><h2>Bottleneck Overview <span class="meta">(原因の断定ではなく、根拠一覧)</span></h2>
 <p class="meta">累計 demand と capacity / failure signal を同じ区間で比較します。各行の根拠は下の詳細セクションに残っています。</p>
 <table>
 <thead><tr><th>見る順</th><th>signal</th><th>evidence</th><th>次に確認すること</th></tr></thead>
@@ -798,21 +987,24 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 </tr>{{end}}</tbody>
 </table>
 
-<h2>Collector Health</h2>
+<span id="collector-health"></span><h2>Collector Health</h2>
 {{if .Snapshot.Meta.Partial}}<p class="warn">partial snapshot: one or more collectors reported incomplete data</p>{{end}}
 {{if .Snapshot.Meta.Health}}
+<details><summary>collectorの状態と欠損を表示 ({{len .Snapshot.Meta.Health}}件)</summary>
 <table>
 <thead><tr><th>collector</th><th>status</th><th>dropped</th><th>message</th></tr></thead>
 <tbody>{{range .Snapshot.Meta.Health}}<tr>
 <td class="l">{{.Collector}}</td><td>{{.Status}}</td><td data-v="{{.Dropped}}">{{.Dropped}}</td><td class="l">{{.Message}}</td>
 </tr>{{end}}</tbody>
 </table>
+</details>
 {{else}}<p class="empty">no core collector warnings</p>{{end}}
 
 {{with .Snapshot.Timeline}}
-<h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
+<span id="run-timeline"></span><h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
 <p class="meta">{{ns .IntervalNs}} buckets &middot; {{len .Buckets}} / {{.MaxBuckets}} retained{{if .Truncated}} &middot; <span class="warn">truncated</span>{{end}}{{if .OverflowedEvents}} &middot; overflowed events {{.OverflowedEvents}}{{end}}</p>
 {{if .Analysis.Available}}
+<details><summary>時系列の詳細・phase・相関候補を表示</summary>
 {{if .Analysis.Phases}}
 <table>
 <thead><tr><th>bucket</th><th>phase</th><th>window</th><th>signal</th><th>metric</th><th>value</th><th>formula / limitation</th></tr></thead>
@@ -830,10 +1022,11 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 </tr>{{end}}</tbody>
 </table>
 {{else}}<p class="empty">no correlation suspects met the published rules</p>{{end}}
-{{else}}<p class="empty">time-aware analysis unavailable: {{.Analysis.Reason}}. Aggregate SQL/HTTP/resource tables remain authoritative.</p>{{end}}
 <details><summary>phase rules</summary>{{range .Analysis.Rules}}<p class="meta"><strong>{{.ID}}</strong>: {{.Formula}}; limitation: {{.Limitation}}</p>{{end}}</details>
+</details>
+{{else}}<p class="empty">time-aware analysis unavailable: {{.Analysis.Reason}}. Aggregate SQL/HTTP/resource tables remain authoritative.</p>{{end}}
 {{else}}
-<h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
+<span id="run-timeline"></span><h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
 <p class="empty">time-aware analysis unavailable: timeline not captured. Aggregate SQL/HTTP/resource tables remain authoritative. Enable ISUTOOLS_TIMELINE=1 before the run to collect bounded buckets.</p>
 {{end}}
 
@@ -869,7 +1062,7 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <p class="meta">&#42; = unique index. captured {{.Snapshot.DB.CapturedAt}}</p>
 {{end}}{{else}}<p class="empty">not captured (no DB connection observed yet)</p>{{end}}
 
-<h2>SQL</h2>
+<span id="sql"></span><h2>SQL</h2>
 {{if .Snapshot.SQL}}
 <table>
 <thead><tr>
@@ -949,7 +1142,7 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <p class="meta">灰色の行は計測区間内に実行されたサンプルではありません(区間外・DB 時計異常・partial な区間)。リテラルが違えば実行計画も変わるため、advisor の判定対象からは外しています。鮮度の列にその理由が入ります。</p>
 {{end}}{{end}}
 
-<h2>HTTP</h2>
+<span id="http"></span><h2>HTTP</h2>
 {{if .Snapshot.HTTP}}
 <table>
 <thead><tr><th>total(ms)</th><th>count</th><th>avg(ms)</th><th>p95*(ms)</th><th>max(ms)</th><th>bytes</th><th>request</th></tr></thead>
@@ -963,7 +1156,7 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 {{with .Snapshot.Connections}}{{if .Total}}<p class="meta">long-lived connections (WS/SSE, latency 集計から分離): total {{.Total}} &middot; active {{.Active}} &middot; avg {{printf "%.1f" .AvgSeconds}}s &middot; max {{printf "%.1f" .MaxSeconds}}s</p>{{end}}{{end}}
 
 {{if .Snapshot.DBPool}}
-<h2>DB Pool <span class="meta">(database/sql のコネクションプール。点の値は終端境界、カウンタは区間デルタ)</span></h2>
+<span id="db-pool"></span><h2>DB Pool <span class="meta">(database/sql のコネクションプール。点の値は終端境界、カウンタは区間デルタ)</span></h2>
 <table>
 <thead><tr>
 <th>max open</th><th>open</th><th>in use</th><th>idle</th><th>waits</th><th>wait 合計*</th><th>平均 wait</th><th>idle closed</th><th>idletime closed</th><th>lifetime closed</th><th>interval</th><th>target</th><th>endpoint</th>
@@ -1155,7 +1348,7 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 {{end}}
 
 {{with .Snapshot.Meta.Profiles}}
-<h2>Profiles <span class="meta">(run の両端で採った mutex / block / heap。差分だけが run を近似します)</span></h2>
+<span id="profiles"></span><h2>Profiles <span class="meta">(run の両端で採った mutex / block / heap。差分だけが run を近似します)</span></h2>
 {{if .Pairs}}
 {{range .Pairs}}
 <p class="meta">{{if .Lagging}}<span class="warn">⚠ 採取遅延</span> &middot; {{end}}{{.Kind}} &middot; {{.ResidualText}}{{if .OpenGate}} &middot; open gate {{.OpenGate}}{{end}}</p>
@@ -1178,6 +1371,12 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 {{end}}
 
 {{if .Sortable}}<script>
+document.querySelectorAll(".jump-link").forEach(function (button) {
+  button.addEventListener("click", function () {
+    var target = document.getElementById(button.dataset.target);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+});
 document.querySelectorAll("th").forEach(function (th) {
   th.addEventListener("click", function () {
     var table = th.closest("table");
