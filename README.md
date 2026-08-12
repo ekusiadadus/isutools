@@ -29,6 +29,14 @@ curl -fsS -X POST http://127.0.0.1:19191/reset
 curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
 ```
 
+公式の初期実装へ計測だけを追加する再現可能な例も用意しています。
+
+- [private-isu 最小導入サンプル](./examples/private-isu/README.md)
+- [ISUCON14 最小導入サンプル](./examples/isucon14/README.md)
+
+どちらもSQLドライバーとHTTPハンドラーの計測、`reset -> benchmark -> save`だけを追加し、
+インデックス、キャッシュ、マッチングなどのチューニングは含みません。
+
 ## 最初に分かること
 
 - どのSQLとHTTPパスが時間を使っているか

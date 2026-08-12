@@ -1,0 +1,24 @@
+services:
+  nginx:
+    volumes:
+      - isutools_nginx_logs:/nginx-logs
+
+  app:
+    build:
+      context: golang/
+      dockerfile: Dockerfile
+    environment:
+      ISUTOOLS_ADDR: ":19191"
+      ISUTOOLS_ALLOW_UNAUTHENTICATED: "1"
+      ISUTOOLS_DATA_DIR: /tmp
+      ISUTOOLS_ACCESS_LOG: /nginx-logs/access.log
+      ISUTOOLS_ROLE: app
+    ports:
+      - "127.0.0.1:19191:19191"
+    volumes:
+      - isutools_nginx_logs:/nginx-logs:ro
+      - isutools_data:/tmp
+
+volumes:
+  isutools_nginx_logs:
+  isutools_data:
