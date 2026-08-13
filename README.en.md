@@ -53,6 +53,15 @@ manual `/pprof/profile` endpoint, so it stops on the expected 409 while managed
 run CPU mode owns the process-wide profiler. Do not work around an SSH/Tunnel
 failure by exposing the unauthenticated admin endpoint on `0.0.0.0:19191`.
 
+On 2026-08-13, the complete workflow was rechecked over SSH against the existing
+private-isu environment on Windows/WSL2: readiness, a real `make bench`, durable
+snapshot download over SCP, manual pprof capture, and loopback port forwarding.
+The score-0/pass-true run proves the integration path, not performance.
+
+- [Verification commands, run ID, hashes, and limitations](./docs/private-isu-ssh-verification-20260813.md)
+
+![2026-08-13 private-isu SSH verification report](docs/images/private-isu-ssh-verification-20260813.png)
+
 ## What it answers first
 
 - Which SQL statements and HTTP paths consume the run
