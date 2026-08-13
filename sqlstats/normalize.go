@@ -1,6 +1,7 @@
 package sqlstats
 
 import (
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,9 +16,45 @@ const (
 )
 
 var (
-	normCache sync.Map // raw query -> normalized query
+	normCache sync.Map // normalizeCacheKey -> normalized query
 	cacheSize atomic.Int64
 )
+
+// CommentTagPolicy controls whether the first safe block comment participates
+// in the aggregate key. All comments are scrubbed in both modes.
+type CommentTagPolicy string
+
+const (
+	CommentTagsOn  CommentTagPolicy = "on"
+	CommentTagsOff CommentTagPolicy = "off"
+	EnvCommentTags                  = "ISUTOOLS_SQL_COMMENT_TAGS"
+)
+
+type normalizeCacheKey struct {
+	query  string
+	policy CommentTagPolicy
+}
+
+var defaultCommentTagPolicy = sync.OnceValue(func() CommentTagPolicy {
+	policy, _ := ResolveCommentTagPolicy(os.Getenv)
+	return policy
+})
+
+// ResolveCommentTagPolicy returns a secret-free reason code. Unknown values
+// preserve the historical tag-on behavior.
+func ResolveCommentTagPolicy(getenv func(string) string) (CommentTagPolicy, string) {
+	if getenv == nil {
+		return CommentTagsOn, "default-on"
+	}
+	switch strings.ToLower(strings.TrimSpace(getenv(EnvCommentTags))) {
+	case "off", "0", "false", "no", "disabled":
+		return CommentTagsOff, "configured-off"
+	case "", "on", "1", "true", "yes", "enabled":
+		return CommentTagsOn, "default-on"
+	default:
+		return CommentTagsOn, "invalid-value"
+	}
+}
 
 var (
 	numberLiteral = regexp.MustCompile(`(?i)(?:\b\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?\b`)
@@ -30,20 +67,22 @@ var (
 // bounds the complete result. Results are cached per raw string so prepared
 // statements pay the cost once.
 func normalize(q string) string {
-	if v, ok := normCache.Load(q); ok {
+	policy := defaultCommentTagPolicy()
+	key := normalizeCacheKey{query: q, policy: policy}
+	if v, ok := normCache.Load(key); ok {
 		return v.(string)
 	}
-	n := computeNormalize(q)
+	n := computeNormalizeWithPolicy(q, policy)
 	if len(q) <= maxCacheableLen && cacheSize.Load() < maxCacheEntries {
-		if _, loaded := normCache.LoadOrStore(q, n); !loaded {
+		if _, loaded := normCache.LoadOrStore(key, n); !loaded {
 			cacheSize.Add(1)
 		}
 	}
 	return n
 }
 
-func computeNormalize(q string) string {
-	s, tag := scrubSQL(q)
+func computeNormalizeWithPolicy(q string, policy CommentTagPolicy) string {
+	s, tag := scrubSQL(q, policy == CommentTagsOn)
 	s = strings.Join(strings.Fields(s), " ")
 	s = hexLiteral.ReplaceAllString(s, "?")
 	s = numberLiteral.ReplaceAllString(s, "?")
@@ -59,7 +98,7 @@ func computeNormalize(q string) string {
 // scrubSQL is deliberately conservative rather than dialect-specific. When
 // syntax is ambiguous it removes content rather than risking credentials or
 // PII in a persisted report.
-func scrubSQL(q string) (string, string) {
+func scrubSQL(q string, extractTag bool) (string, string) {
 	var b strings.Builder
 	b.Grow(min(len(q), maxQueryLen))
 	tag := ""
@@ -72,7 +111,7 @@ func scrubSQL(q string) (string, string) {
 				return b.String(), tag
 			}
 			comment := strings.TrimSpace(q[i+2 : i+2+end])
-			if tag == "" && len(comment) <= maxTagLen && safeTag.MatchString(comment) {
+			if extractTag && tag == "" && len(comment) <= maxTagLen && safeTag.MatchString(comment) {
 				tag = comment
 			}
 			b.WriteByte(' ')

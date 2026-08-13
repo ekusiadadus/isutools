@@ -10,6 +10,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -128,6 +129,9 @@ func Validate(in ProfileAnalysisV1) error {
 		}
 		summaries += attemptSummaries
 		nodes += attemptNodes
+		if err := validateFlame(in.Attempts[i], in.Binary, in.Analyzer.Version, in.GeneratedAt); err != nil {
+			return fmt.Errorf("attempt[%d] flame: %w", i, err)
+		}
 		observedFiles += len(in.Attempts[i].ObservedInputs)
 	}
 	if summaries > MaxSummaries {
@@ -166,6 +170,42 @@ func Validate(in ProfileAnalysisV1) error {
 	}
 	if len(body) > MaxAnalysisBodyBytes {
 		return fmt.Errorf("canonical analysis body exceeds %d bytes", MaxAnalysisBodyBytes)
+	}
+	return nil
+}
+
+func validateFlame(attempt ProfileAttempt, binary BinaryProvenance, analyzerVersion string, generatedAt time.Time) error {
+	flame := attempt.Flame
+	if flame == nil {
+		return nil
+	}
+	if flame.Mode != attempt.Mode || flame.NodeLimit != MaxFlameNodes || flame.DepthLimit != MaxFlameDepth || flame.AnalyzerVersion != analyzerVersion || !flame.GeneratedAt.Equal(generatedAt) {
+		return errors.New("metadata does not match analysis")
+	}
+	if flame.Status == "unsupported" {
+		if flame.Reason == "" || len(flame.Reason) > 128 || len(flame.Nodes) != 0 || len(flame.InputSHA256) != 0 || flame.BinarySHA256 != "" {
+			return errors.New("unsupported flame must contain only a bounded reason")
+		}
+		return nil
+	}
+	if flame.Status != "ready" || attempt.Kind != "cpu" || binary.Match != BinaryMatchVerified || binary.Analyzed == nil || flame.BinarySHA256 != binary.Analyzed.SHA256 {
+		return errors.New("ready flame requires verified CPU binary provenance")
+	}
+	if len(flame.Nodes) == 0 || len(flame.Nodes) > MaxFlameNodes || len(flame.InputSHA256) != len(attempt.ObservedInputs) || flame.TotalWeight <= 0 {
+		return errors.New("ready flame has invalid input or node count")
+	}
+	for i, hash := range flame.InputSHA256 {
+		if !validHash(hash) || hash != attempt.ObservedInputs[i].SHA256 {
+			return errors.New("input hash does not match observed profile")
+		}
+	}
+	for _, node := range flame.Nodes {
+		if err := validateBoundedString("flame function", node.Function, 256); err != nil {
+			return err
+		}
+		if node.Depth < 0 || node.Depth >= MaxFlameDepth || node.X < 0 || node.Width <= 0 || node.X+node.Width > 10000 || (node.Sign != "positive" && node.Sign != "negative") {
+			return errors.New("flame node geometry is out of bounds")
+		}
 	}
 	return nil
 }

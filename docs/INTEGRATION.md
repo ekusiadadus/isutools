@@ -21,6 +21,9 @@ CPU profile はそれぞれ明示的な事前準備が必要です。
 | Network (netstats) | なし | Linux `/proc/net`、`/sys/class/net` | `ISUTOOLS_NETSTATS` |
 | DB Pool (dbpool) | なし | なし | 登録済み TargetID で `isutools.WatchDBPool` を呼ぶ |
 | Query Plans (EXPLAIN) | なし | MySQL 8.0.17+(`QUERY_SAMPLE_TEXT`) | `ISUTOOLS_EXPLAIN=1` と EXPLAIN 専用の最小権限ユーザー(§11) |
+| Echo route template | Echo v4またはv5 adapter | なし | `echov4.Install(e)` / `echov5.Install(e)` (§13) |
+| trusted session label | `sessionlabel` | nginx upstream response header | cookie名と32 byte以上のHMAC key (§13) |
+| multi-host | embedded peerまたは`isutools-agent` | SSH local forwarding | owner-only peer/target JSON、loopback listener (§13) |
 
 Prometheus、Grafana、エージェントデーモンは不要です。`go-sql-proxy` は
 isutools 自身の Go module 依存として取得されます。
@@ -617,9 +620,8 @@ fallback せず cgroup 全体を skip します(fail-closed)。理由は
 (cgroup namespace の中からは自分がホストかどうか判定できないため、推測しません)。
 
 `ISUTOOLS_ROLE` は identity 欄に表示されるだけのラベルで、これで分岐する処理は
-ありません。**複数ホストの集約(計画10)は未実装です。** v1.2 は単一ホスト構成のみで、
-peer プロトコルも hub もありません。ラベルは、ホストごとに別々の管理サーバを開いて
-見比べるときの目印として使ってください。
+ありません。複数ホストでは§13のpeer/hubがこのidentityとnamespace/cgroup scopeを
+participantごとに保存します。値を合算するためのラベルではありません。
 
 ### Network(netstats)
 
@@ -1104,6 +1106,23 @@ initialize handler 側に build tag も分岐も要りません。
 破棄されます。どちらか一方に統一するのが分かりやすいですが、併用しても run が
 二重に残ることはありません。
 
-run 境界はこのプロセスの中だけの概念です。**複数ホストの同時境界(計画10)は未実装**なので、
-アプリと DB が別ホストの構成では、ホストごとに `/reset` を叩き、
-ホストごとのレポートを見比べてください。
+単一プロセスだけなら上記の境界で完結します。アプリとDBが別ホストの構成は、
+§13のpeer/hubプロトコルで開始・終了barrierを揃え、participantごとのsend→ack区間と
+immutable snapshotを保存してください。
+
+## 13. Echo、trusted session、複数台計測
+
+現場指摘で追加された次の配線は、設定例、失敗理由、秘密情報の境界、SSH tunnel、
+agent/hubの起動手順を一つの運用文書に集約しています。
+
+- Echo v4/v5 とframework-neutral route template
+- nginxへ渡すHMAC session pseudonym
+- access-log path groupingとSQL comment tag policy
+- managed CPU handoffとbounded flame view
+- advisor provenanceとDB capability matrix
+- embedded peer、standalone agent、loopback hub
+
+手順は [Field-feedback implementation guide](./FIELD_FEEDBACK.md) を参照してください。
+複数台の値はhostごとに表示し、合算しません。required participantの欠落はinvalid、
+optionalの欠落はpartialです。listenerとhub endpointはliteral loopbackのみ受理するため、
+host間transportはSSH local forwardingを使います。

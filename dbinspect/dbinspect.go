@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"strings"
 	"time"
+
+	"github.com/ekusiadadus/isutools/sqlstats"
 )
 
 const collectTimeout = 5 * time.Second
@@ -18,6 +20,93 @@ type Index struct {
 	Name    string `json:"name"`
 	Columns string `json:"columns"`
 	Unique  bool   `json:"unique"`
+}
+
+// CollectRegistered inspects one logical target through the credential-safe
+// registry. Unlike Collect it never opens the application's raw DSN and never
+// copies a driver error into the report. The schema is bound explicitly
+// because inspector sessions intentionally have no default database.
+func CollectRegistered(ctx context.Context, targetID string) *Schema {
+	result := &Schema{CapturedAt: time.Now().UTC().Format(time.RFC3339)}
+	target, ok := sqlstats.Target(targetID)
+	if !ok {
+		result.Flavor = "unknown"
+		result.Error = "target-not-registered"
+		return result
+	}
+	result.Flavor = flavorOf(target.Driver)
+	if result.Flavor != "mysql" {
+		result.Error = "dialect-unsupported"
+		return result
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, collectTimeout)
+	defer cancel()
+	err := sqlstats.Inspect(inspectCtx, targetID, sqlstats.PurposeStats, func(queryCtx context.Context, q sqlstats.Querier) error {
+		tables, err := collectRegisteredTables(queryCtx, q, target.Schema)
+		if err != nil {
+			return err
+		}
+		result.Tables = tables
+		return nil
+	})
+	if err != nil {
+		result.Error = "inspection-failed"
+	}
+	return result
+}
+
+func collectRegisteredTables(ctx context.Context, q sqlstats.Querier, schema string) ([]Table, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT table_name, COALESCE(engine, ''), COALESCE(table_rows, 0), COALESCE(data_length, 0)
+		FROM information_schema.tables
+		WHERE table_schema = ?
+		ORDER BY table_name`, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	byName := map[string]*Table{}
+	var names []string
+	for rows.Next() {
+		table := Table{}
+		if err := rows.Scan(&table.Name, &table.Engine, &table.Rows, &table.DataBytes); err != nil {
+			return nil, err
+		}
+		byName[table.Name] = &table
+		names = append(names, table.Name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	indexes, err := q.QueryContext(ctx, `
+		SELECT table_name, index_name, non_unique,
+		       GROUP_CONCAT(column_name ORDER BY seq_in_index SEPARATOR ',')
+		FROM information_schema.statistics
+		WHERE table_schema = ?
+		GROUP BY table_name, index_name, non_unique
+		ORDER BY table_name, index_name`, schema)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = indexes.Close() }()
+	for indexes.Next() {
+		var tableName, indexName, columns string
+		var nonUnique int64
+		if err := indexes.Scan(&tableName, &indexName, &nonUnique, &columns); err != nil {
+			return nil, err
+		}
+		if table := byName[tableName]; table != nil {
+			table.Indexes = append(table.Indexes, Index{Name: indexName, Columns: columns, Unique: nonUnique == 0})
+		}
+	}
+	if err := indexes.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]Table, 0, len(names))
+	for _, name := range names {
+		result = append(result, *byName[name])
+	}
+	return result, nil
 }
 
 // Table is one table with its indexes.

@@ -108,6 +108,25 @@ func WithMaxKeys(n int) Option {
 	}
 }
 
+// WithPathRules applies one immutable grouping policy after query stripping
+// and before aggregate, flow, and story observation.
+func WithPathRules(rules *PathRules) Option {
+	return func(c *Collector) { c.pathRules = rules }
+}
+
+// WithPathRulesSpec parses a bounded configuration without ever putting the
+// raw specification into health output.
+func WithPathRulesSpec(spec string, unmatched UnmatchedPolicy) Option {
+	return func(c *Collector) {
+		rules, err := ParsePathRules(spec, unmatched)
+		if err != nil {
+			c.pathRulesError = pathRuleReason(err)
+			return
+		}
+		c.pathRules = rules
+	}
+}
+
 // Collector tails a log from a generation baseline. It retains an open file
 // descriptor so an inode-rotated file can be drained before the new path.
 type Collector struct {
@@ -119,6 +138,8 @@ type Collector struct {
 	maxLineBytes    int
 	maxCollectBytes int64
 	agg             *Aggregator
+	pathRules       *PathRules
+	pathRulesError  string
 
 	file     File
 	offset   int64
@@ -143,6 +164,9 @@ func New(path string, opts ...Option) *Collector {
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.pathRulesError != "" {
+		c.recordPartialLocked("path-rules-" + c.pathRulesError)
 	}
 	c.mu.Lock()
 	if err := c.openLocked(true); err != nil {
@@ -441,6 +465,7 @@ func (c *Collector) consumeLocked(data []byte) {
 				c.recordPartialLocked("malformed access-log records were dropped")
 				continue
 			}
+			rec.URI = c.pathRules.Normalize(rec.URI)
 			c.agg.Observe(rec)
 			if rec.Partial {
 				c.health.Partial++

@@ -552,6 +552,7 @@ func analyzeBundle(root *safefs.Root, bundle profileBundle, binaryPath, sourceRo
 	analysis.Attempts = make([]profilemodel.ProfileAttempt, len(bundle.Attempts))
 	for index, bundled := range bundle.Attempts {
 		attempt := profilemodel.ProfileAttempt{Kind: bundled.Kind, Mode: bundled.Mode, ExpectedInputs: bundled.Expected, Coverage: bundled.Coverage}
+		attempt.Flame = unavailableFlame(bundled.Mode, "profile-missing", analysis.GeneratedAt)
 		if len(bundled.Observed) != len(bundled.Expected) {
 			attempt.Status = profilemodel.AnalysisStatusFailed
 			attempt.Diagnostics = []profilemodel.Diagnostic{diagnostic(profilemodel.DiagnosticError, profilemodel.DiagnosticProfileMissing, "one or more expected profile inputs were not captured")}
@@ -617,6 +618,7 @@ func analyzeBundle(root *safefs.Root, bundle profileBundle, binaryPath, sourceRo
 		}
 		attempt := &analysis.Attempts[index]
 		attempt.Summaries = result.Summaries
+		attempt.Flame = flameForAttempt(result.Flame, bundled, analysis)
 		sourceRedacted := sanitizeSourcePaths(attempt.Summaries, sourceRoot)
 		if sourceRedacted {
 			attempt.Diagnostics = append(attempt.Diagnostics, diagnostic(profilemodel.DiagnosticWarn, profilemodel.DiagnosticSourcePathRedacted, "one or more source paths were outside the selected source root and were redacted"))
@@ -645,6 +647,41 @@ func analyzeBundle(root *safefs.Root, bundle profileBundle, binaryPath, sourceRo
 		err = profilemodel.Validate(signed)
 	}
 	return signed, analysis.Status != profilemodel.AnalysisStatusFailed, err
+}
+
+func unavailableFlame(mode, reason string, generatedAt time.Time) *profilemodel.FlameGraph {
+	return &profilemodel.FlameGraph{
+		Status: "unsupported", Reason: reason, Mode: mode,
+		NodeLimit: profilemodel.MaxFlameNodes, DepthLimit: profilemodel.MaxFlameDepth,
+		AnalyzerVersion: cliVersion, GeneratedAt: generatedAt,
+	}
+}
+
+func flameForAttempt(worker *profilemodel.FlameGraph, bundled bundleAttempt, analysis profilemodel.ProfileAnalysisV1) *profilemodel.FlameGraph {
+	if bundled.Kind != "cpu" {
+		return unavailableFlame(bundled.Mode, "unsupported-profile-type", analysis.GeneratedAt)
+	}
+	if analysis.Binary.Match != profilemodel.BinaryMatchVerified || analysis.Binary.Analyzed == nil {
+		reason := "binary-provenance-unverified"
+		if analysis.Binary.Match == profilemodel.BinaryMatchMismatch {
+			reason = "binary-provenance-mismatch"
+		}
+		return unavailableFlame(bundled.Mode, reason, analysis.GeneratedAt)
+	}
+	if worker == nil || worker.Status != "ready" || len(worker.Nodes) == 0 {
+		return unavailableFlame(bundled.Mode, "flame-data-unavailable", analysis.GeneratedAt)
+	}
+	flame := *worker
+	flame.Nodes = append([]profilemodel.FlameNode(nil), worker.Nodes...)
+	flame.Mode = bundled.Mode
+	flame.InputSHA256 = make([]string, 0, len(bundled.Observed))
+	for _, input := range bundled.Observed {
+		flame.InputSHA256 = append(flame.InputSHA256, input.SHA256)
+	}
+	flame.BinarySHA256 = analysis.Binary.Analyzed.SHA256
+	flame.AnalyzerVersion = cliVersion
+	flame.GeneratedAt = analysis.GeneratedAt
+	return &flame
 }
 
 func sanitizeSourcePaths(summaries []profilemodel.ProfileSummary, sourceRoot string) bool {

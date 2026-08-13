@@ -10,6 +10,8 @@ const (
 	MaxSummaries          = 32
 	MaxTopNodes           = 50
 	MaxReportNodes        = 2000
+	MaxFlameNodes         = 2048
+	MaxFlameDepth         = 64
 	MaxWorkerMemoryBytes  = uint64(512 << 20)
 	MaxWorkerAddressBytes = uint64(1 << 30)
 )
@@ -173,6 +175,33 @@ type ProfileAttempt struct {
 	ObservedInputs []ObservedProfileInput `json:"observed_inputs,omitempty"`
 	Diagnostics    []Diagnostic           `json:"diagnostics,omitempty"`
 	Summaries      []ProfileSummary       `json:"summaries,omitempty"`
+	Flame          *FlameGraph            `json:"flame,omitempty"`
+}
+
+type FlameGraph struct {
+	Status          string      `json:"status"`
+	Reason          string      `json:"reason,omitempty"`
+	Mode            string      `json:"mode"`
+	SampleType      string      `json:"sample_type,omitempty"`
+	Unit            string      `json:"unit,omitempty"`
+	TotalWeight     int64       `json:"total_weight,omitempty"`
+	Nodes           []FlameNode `json:"nodes,omitempty"`
+	Truncated       bool        `json:"truncated"`
+	NodeLimit       int         `json:"node_limit"`
+	DepthLimit      int         `json:"depth_limit"`
+	InputSHA256     []string    `json:"input_sha256,omitempty"`
+	BinarySHA256    string      `json:"binary_sha256,omitempty"`
+	AnalyzerVersion string      `json:"analyzer_version"`
+	GeneratedAt     time.Time   `json:"generated_at"`
+}
+
+type FlameNode struct {
+	Function string `json:"function"`
+	Depth    int    `json:"depth"`
+	X        int    `json:"x_permyriad"`
+	Width    int    `json:"width_permyriad"`
+	Value    int64  `json:"value"`
+	Sign     string `json:"sign"`
 }
 
 type ProfileSummary struct {

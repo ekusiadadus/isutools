@@ -37,6 +37,16 @@ func AnalyzeInterval(decoded *DecodedProfile, topN int) ([]profilemodel.ProfileS
 // AnalyzeDelta subtracts open from close using checked arithmetic and the
 // google/pprof compatibility rules. Both input profiles remain untouched.
 func AnalyzeDelta(open, closeProfile *DecodedProfile, topN int) ([]profilemodel.ProfileSummary, error) {
+	merged, err := DeltaProfile(open, closeProfile, topN)
+	if err != nil {
+		return nil, err
+	}
+	return aggregate(merged, profilemodel.ProfileModeCumulativeDelta, topN)
+}
+
+// DeltaProfile returns close-open after the same compatibility and overflow
+// checks used by AnalyzeDelta. Callers use it for signed flame layouts.
+func DeltaProfile(open, closeProfile *DecodedProfile, topN int) (*pprofprofile.Profile, error) {
 	openProfile, openBudgets, err := checkedProfile(open, topN)
 	if err != nil {
 		return nil, fmt.Errorf("open profile: %w", err)
@@ -74,7 +84,7 @@ func AnalyzeDelta(open, closeProfile *DecodedProfile, topN int) ([]profilemodel.
 	if _, err := absoluteBudgets(merged); err != nil {
 		return nil, err
 	}
-	return aggregate(merged, profilemodel.ProfileModeCumulativeDelta, topN)
+	return merged, nil
 }
 
 func checkedProfile(decoded *DecodedProfile, topN int) (*pprofprofile.Profile, []int64, error) {

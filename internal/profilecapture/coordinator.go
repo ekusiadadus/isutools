@@ -108,12 +108,16 @@ func New(o Options) (*Coordinator, error) {
 	}, nil
 }
 
-func (c *Coordinator) StartRun(_ context.Context, req StartRequest) StartResult {
+func (c *Coordinator) StartRun(ctx context.Context, req StartRequest) StartResult {
 	if code := validateStart(req); code != "" {
 		return StartResult{RunID: req.RunID, Epoch: req.Epoch, State: StateSkipped, Code: code}
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := captureKey{runID: req.RunID, epoch: req.Epoch}
 
+	var handoff <-chan struct{}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -124,18 +128,54 @@ func (c *Coordinator) StartRun(_ context.Context, req StartRequest) StartResult 
 		return StartResult{RunID: req.RunID, Epoch: req.Epoch, State: StateSkipped, Code: CodeTerminalFenced}
 	}
 	if existing := c.sessions[key]; existing != nil {
-		result := c.startResultLocked(existing)
-		if !reflect.DeepEqual(existing.req, req) {
-			result.State, result.Code = StateSkipped, CodeReplayMismatch
+		if existing.state == StateSkipped && existing.code == CodeCPUBusy && c.active == nil {
+			delete(c.sessions, key)
+			c.removeOrderKeyLocked(key)
 		} else {
-			result.State = StateReplayed
+			result := c.startResultLocked(existing)
+			if !reflect.DeepEqual(existing.req, req) {
+				result.State, result.Code = StateSkipped, CodeReplayMismatch
+			} else if existing.state != StateSkipped {
+				result.State = StateReplayed
+			}
+			c.mu.Unlock()
+			return result
 		}
+	}
+	if c.active != nil {
+		if c.active.stopRequested != nil {
+			handoff = c.active.done
+		} else {
+			result := c.recordSkippedLocked(req, CodeCPUBusy)
+			c.mu.Unlock()
+			return result
+		}
+	}
+	c.mu.Unlock()
+	if handoff != nil {
+		timer := time.NewTimer(c.startJoin)
+		defer timer.Stop()
+		select {
+		case <-handoff:
+			return c.StartRun(ctx, req)
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+		c.mu.Lock()
+		if existing := c.sessions[key]; existing != nil {
+			result := c.startResultLocked(existing)
+			c.mu.Unlock()
+			return result
+		}
+		result := c.recordSkippedLocked(req, CodeCPUBusy)
 		c.mu.Unlock()
 		return result
 	}
+
+	c.mu.Lock()
 	if c.active != nil {
 		c.mu.Unlock()
-		return StartResult{RunID: req.RunID, Epoch: req.Epoch, State: StateSkipped, Code: CodeCPUBusy}
+		return c.StartRun(ctx, req)
 	}
 	s := &session{
 		key: key, req: req, captureID: newSessionCaptureID(c.now()), state: StateStarting,
@@ -182,6 +222,30 @@ func (c *Coordinator) StartRun(_ context.Context, req StartRequest) StartResult 
 		c.mu.Unlock()
 	}
 	return c.startResult(s)
+}
+
+func (c *Coordinator) removeOrderKeyLocked(key captureKey) {
+	for i, candidate := range c.order {
+		if candidate == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			return
+		}
+	}
+}
+
+func (c *Coordinator) recordSkippedLocked(req StartRequest, code string) StartResult {
+	key := captureKey{runID: req.RunID, epoch: req.Epoch}
+	now := c.now()
+	s := &session{
+		key: key, req: req, captureID: newSessionCaptureID(now), state: StateSkipped, code: code,
+		startRequestedAt: now, startDone: make(chan struct{}), done: make(chan struct{}),
+	}
+	close(s.startDone)
+	close(s.done)
+	c.sessions[key] = s
+	c.order = append(c.order, key)
+	c.pruneLocked()
+	return c.startResultLocked(s)
 }
 
 func validateStart(req StartRequest) string {

@@ -60,7 +60,7 @@ func TestSQLDriverNameEnabled(t *testing.T) {
 }
 
 func TestSQLDriverNameDisabled(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	if got := SQLDriverName("rootfake"); got != "rootfake" {
 		t.Errorf("SQLDriverName = %q, want raw name when disabled", got)
 	}
@@ -228,7 +228,7 @@ func TestRegisterSQLUnknownDriver(t *testing.T) {
 }
 
 func TestRegisterSQLDisabled(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	if err := RegisterSQL("definitely-not-registered"); err != nil {
 		t.Fatalf("disabled RegisterSQL must be a no-op, got %v", err)
 	}
@@ -245,7 +245,9 @@ func envMap(values map[string]string) func(string) string {
 func newTestMeasurement(t *testing.T, values map[string]string) *measurement {
 	t.Helper()
 	m := newMeasurementWith(envMap(values), runctl.Options{DisableWatchdog: true}, isolatedGenerationCollectors())
-	t.Cleanup(m.ctrl.Close)
+	if m.ctrl != nil {
+		t.Cleanup(m.ctrl.Close)
+	}
 	return m
 }
 
@@ -295,7 +297,7 @@ func TestResetExpireAndSavePersistsRecoveryProvenanceEndToEnd(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 8, 6, 11, 53, 50, 0, time.UTC)
 	current := now
-	m := newMeasurementWith(envMap(map[string]string{"ISUTOOLS": "off"}), runctl.Options{
+	m := newMeasurementWith(envMap(nil), runctl.Options{
 		DisableWatchdog: true,
 		Now:             func() time.Time { return current },
 		Budgets: runctl.Budgets{
@@ -809,8 +811,8 @@ func TestShortPanicText(t *testing.T) {
 
 func TestNewMeasurementWhenOffRegistersNothing(t *testing.T) {
 	m := newTestMeasurement(t, map[string]string{"ISUTOOLS": "off"})
-	if err := m.ctrl.RegisterBaseline(runctl.Registration{Name: dbpool.Name}, dbpool.Default); err != nil {
-		t.Errorf("ISUTOOLS=off must register no collector, got %v", err)
+	if m.ctrl != nil || m.proc != nil || m.timeline != nil || m.boundary != nil || m.cpu != nil {
+		t.Fatalf("ISUTOOLS=off constructed runtime state: %+v", m)
 	}
 }
 
@@ -886,7 +888,7 @@ func TestSerializeInitializePropagatesFailure(t *testing.T) {
 }
 
 func TestSerializeInitializeWhenOffStillRuns(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	called := false
 	if err := SerializeInitialize(context.Background(), func(context.Context) error {
 		called = true
@@ -900,7 +902,7 @@ func TestSerializeInitializeWhenOffStillRuns(t *testing.T) {
 }
 
 func TestResetNowWhenOffIsANoOp(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	result, err := ResetNow(context.Background())
 	if err != nil {
 		t.Fatalf("ResetNow: %v", err)
@@ -974,12 +976,10 @@ func TestWatchDBPoolRejectsArgumentBugs(t *testing.T) {
 	}
 }
 
-func TestWatchDBPoolValidatesEvenWhenDisabled(t *testing.T) {
-	// A wiring bug must surface in the configuration the application ships,
-	// not only in the one it benchmarks.
-	t.Setenv("ISUTOOLS", "off")
-	if err := WatchDBPool("never-registered", &sql.DB{}); !errors.Is(err, sqlstats.ErrUnknownTarget) {
-		t.Errorf("err = %v, want ErrUnknownTarget even when measurement is off", err)
+func TestWatchDBPoolIsUnconditionalNoopWhenDisabled(t *testing.T) {
+	setHardOffForTest(t)
+	if err := WatchDBPool("never-registered", nil); err != nil {
+		t.Errorf("err = %v, want hard-off no-op", err)
 	}
 }
 
@@ -1026,7 +1026,7 @@ func TestRegisterDBInspectorRejectsUnknownTarget(t *testing.T) {
 }
 
 func TestRegisterDBTargetDisabled(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	if err := RegisterDBTarget("", "rootfake", "dsn"); err != nil {
 		t.Fatalf("disabled RegisterDBTarget must be a no-op, got %v", err)
 	}
@@ -1159,7 +1159,7 @@ func TestEmbeddedResetNowCoordinatesProcstatsBoundary(t *testing.T) {
 }
 
 func TestResetNowWithNonceWhenOff(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	result, err := ResetNowWithNonce(context.Background(), "nonce-off")
 	if err != nil || result.RunID != "" {
 		t.Fatalf("ResetNowWithNonce = (%+v, %v), want the zero value and no error", result, err)
@@ -1167,7 +1167,7 @@ func TestResetNowWithNonceWhenOff(t *testing.T) {
 }
 
 func TestUnwatchDBPoolWhenDisabled(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	if err := UnwatchDBPool("never-registered"); err != nil {
 		t.Fatalf("disabled UnwatchDBPool must be a no-op, got %v", err)
 	}
@@ -1356,7 +1356,7 @@ func TestHTTPMiddleware(t *testing.T) {
 }
 
 func TestHTTPMiddlewareDisabled(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 	if got := HTTP(next); fmt.Sprintf("%p", got) != fmt.Sprintf("%p", next) {
 		t.Error("ISUTOOLS=off must return the handler unwrapped so the request path is untouched")
@@ -1369,7 +1369,7 @@ func TestCountersRecordAndDisable(t *testing.T) {
 	if got := counterValue(t, "isutools-test-counter"); got != 3 {
 		t.Errorf("counter = %d, want 3", got)
 	}
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	AddCount("isutools-test-counter", 10)
 	if got := counterValue(t, "isutools-test-counter"); got != 3 {
 		t.Errorf("counter = %d, want counting to stop when measurement is off", got)

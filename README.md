@@ -84,6 +84,7 @@ private-isuをisutoolsの計測だけで1日チューニングし、**score 0か
 - [改善手順と全記録](https://ekusiadadus.com/ja/blog/private-isu-500k-with-isutools)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 - [導入ガイド](./docs/INTEGRATION.md)
+- [現場指摘 #19–#29 の設定・Echo・session・複数台運用](./docs/FIELD_FEEDBACK.md)
 - [設計](./DESIGN.md) / [実装状況](./docs/IMPLEMENTATION_STATUS.md)
 
 ## 対応範囲
@@ -92,6 +93,7 @@ private-isuをisutoolsの計測だけで1日チューニングし、**score 0か
 |---|---|
 | Database | MySQL / MariaDB / PostgreSQL (`database/sql`) |
 | HTTP | Go `net/http` middleware |
+| Router adapters | Echo v4 / v5、framework-neutral route-template API |
 | Reverse proxy logs | nginx / Caddy / Apache / Envoyの明示形式 |
 | Runtime | pprof、CPU、mutex、block、heap |
 | Host | Linux procfs / sysfs / cgroup v2 |
@@ -318,10 +320,14 @@ DB を作り直すこと自体は止められない。だから `SerializeInitia
 | `ISUTOOLS_ALLOW_UNAUTHENTICATED` | — | `1` で非 loopback bind を明示許可。**SSH トンネル + `127.0.0.1` 限定 publish の Docker 構成専用**(security warningを表示。計測の`partial`とは分離) |
 | `ISUTOOLS_DATA_DIR` | — | スナップショット / プロファイルの永続化先(実行一覧の実体) |
 | `ISUTOOLS_ACCESS_LOG` | — | nginx/Caddy/Apache/Envoy ログのパス。**LTSV / JSON 行を自動判別**(対応形式は統合ガイド参照) |
+| `ISUTOOLS_ACCESS_LOG_PATH_RULES` / `_UNMATCHED` | — / `keep` | access logのfull-match regexp→定数path。未一致は`keep`または`collapse` |
+| `ISUTOOLS_SQL_COMMENT_TAGS` | on | 安全な先頭tag 1個だけ保持。`off`なら`/* ... */`を含む全commentをtag化せず集計前に除去 |
 | `ISUTOOLS_NGINX_LOG` | — | 旧変数名。`ACCESS_LOG` 未設定時だけ fallback |
 | `ISUTOOLS_PPROF_SECONDS` | 0 | fixed modeではreset後の採取秒数、run modeではhard max秒数(1〜600) |
 | `ISUTOOLS_CPU_PROFILE_MODE` | off | `fixed`で従来のtimer採取、`run`でrun境界連動CPU採取。`run`中のmanual `/pprof/profile`は409 |
 | `ISUTOOLS_PROFILE_ANALYSIS` | off | `1`でread-only capabilities、CAS publish、derived analysis表示を有効化 |
+| `ISUTOOLS_PEER` / `_TOKEN` | off / — | embedded peerを明示的に有効化。tokenは32 byte以上、listenerはliteral loopbackのみ |
+| `ISUTOOLS_SESSION_COOKIE` / `_HMAC_KEY` | — | trusted session adapterのsource cookieと32 byte以上のHMAC key |
 | `ISUTOOLS_PPROF_LABELS` | off | `1`でCPU profileへcapture/tupleのopaque private labelを付与。raw URLは保存しない |
 | `ISUTOOLS_PPROF_SAFE_ROUTE_RULES` | — | router patternが無いroute用のfull-match regexp→定数label。invalid時はrules全体を無効化 |
 | `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Docker ビルドで vcs 情報が埋まらない場合の rev 注入 |
@@ -387,9 +393,9 @@ exact `snapshot_base`と`snapshot_sha256`を必須とし、`publish`はoperator�
 環境ではprofile bytesを読む前にexit 4となり、soft limitへdowngradeしない。詳細は
 [統合ガイド §7](./docs/INTEGRATION.md#7-pprofprocstats負荷生成ツール)を参照。
 
-既知の制約として、同一processでinitialize/resetを短時間に二重実行すると、前runの非同期CPU
-stopと次runのstartが競合し、次runのCPU artifactが欠落する場合がある([#19](https://github.com/ekusiadadus/isutools/issues/19))。
-計測対象runのinitializeは一度だけ実行し、retryには同じnonceの`ResetNowWithNonce`を使う。
+短時間のinitialize/resetでもCPU profiler ownershipはbounded handoffされる。100ms以内に
+前ownerが解放されなければ新runへ`skipped/cpu-busy`を明示し、無言の欠落や二重Startは起こさない。
+initialize retryには引き続き同じnonceの`ResetNowWithNonce`を使う。
 
 ### EXPLAIN(既定 off)
 
@@ -578,12 +584,12 @@ examined vs sent)/ **hoststats**(メモリ / disk / PSI / cgroup / host identity
 **Go API**(`ResetNow` / `ResetNowWithNonce` / `SerializeInitialize`、run 両端の
 ランタイムプロファイルペア)。
 
-**複数台横断計測(peer protocol)は未実装で、計画のみ**
-([plans/10-multi-host.md](./plans/10-multi-host.md))。現状は **1 ホスト単位**の計測であり、
-`ISUTOOLS_PEER` / `ISUTOOLS_PEER_TOKEN` / `ISUTOOLS_AGENT_TARGETS_FILE` といった
-計画中の変数を読むコードは存在しない。複数台構成では各ホストで別々に isutools を
-動かし、ダッシュボードもホストごとに開くことになる。`SerializeInitialize` の
-直列化もプロセス内に閉じており、ホストをまたいだ initialize は直列化できない。
+v1.2時点では複数台横断計測は計画のみでしたが、現在のtreeにはembedded peer、
+standalone agent、loopback hub、start/finish barrier、lease、snapshot budget、
+ACK/abort sealがあります。host間transportはSSH local forwardingのみで、各hostの値は
+合算せずparticipant別に保存します。設定と回復手順は
+[現場指摘の実装ガイド](./docs/FIELD_FEEDBACK.md#multi-host-over-ssh-only-tunnels)を参照してください。
+`SerializeInitialize` 自体の直列化範囲は引き続きプロセス内です。
 
 その他の既知の制約: hoststats / netstats は Linux 専用、SQL 行効率は MySQL の
 performance_schema が必要、EXPLAIN は MySQL 8.0.17 以降 + 専用の最小権限 credential が必要で

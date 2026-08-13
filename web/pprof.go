@@ -449,6 +449,8 @@ type ProfileManifest struct {
 type ProfileExpectation struct {
 	Kind   string                 `json:"kind"`
 	Mode   string                 `json:"mode"`
+	Status string                 `json:"status,omitempty"`
+	Code   string                 `json:"code,omitempty"`
 	Inputs []ProfileExpectedInput `json:"inputs"`
 }
 
@@ -910,7 +912,7 @@ func (h *handler) profileManifestFor(runID string, epoch uint64) *ProfileManifes
 			manifest.CPU = cpu
 			if cpu.ExpectedFile != "" {
 				manifest.Expected = append(manifest.Expected, ProfileExpectation{
-					Kind: "cpu", Mode: "interval",
+					Kind: "cpu", Mode: "interval", Status: cpuExpectationStatus(cpu), Code: cpu.Code,
 					Inputs: []ProfileExpectedInput{{Kind: "cpu", Point: "interval", File: cpu.ExpectedFile}},
 				})
 			}
@@ -928,6 +930,13 @@ func (h *handler) profileManifestFor(runID string, epoch uint64) *ProfileManifes
 		manifest.Executable = &copy
 	}
 	return manifest
+}
+
+func cpuExpectationStatus(cpu *CPUIntervalCapture) string {
+	if cpu == nil || cpu.File == "" || cpu.Status == "skipped" || cpu.Status == "failed" || cpu.Status == "wedged" || cpu.Status == "start-wedged" {
+		return "missing"
+	}
+	return "present"
 }
 
 // captureBoundary is the common path of both halves.
