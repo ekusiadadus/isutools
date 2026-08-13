@@ -1,0 +1,9 @@
+# Copy this file to .isutools.mk and adapt it to the existing remote environment.
+REMOTE_HOST := user@example-host
+REMOTE_ROOT := /srv/private-isu
+REMOTE_RESULTS := /tmp/isutools-results
+REMOTE_RESULTS_SCP := /tmp/isutools-results
+
+# The default is docker. A Windows OpenSSH host controlling Docker Desktop from
+# WSL may need a command such as:
+# REMOTE_DOCKER := /init "/mnt/c/Program Files/Docker/Docker/resources/bin/docker.exe" -d
