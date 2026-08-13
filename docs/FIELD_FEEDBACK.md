@@ -117,7 +117,8 @@ Two peer forms share protocol/schema version 1:
 - embedded: set `ISUTOOLS_PEER=on`, keep a 32-byte-or-longer token in
   `ISUTOOLS_PEER_TOKEN`, and call `isutools.ServePeer` on `127.0.0.1`
 - standalone: build `./cmd/isutools-agent` for DB/proxy/DNS hosts; it provides
-  host, network, SQL-row, dbinspect, query-plan, advisor and DB-capability data
+  host, network, SQL-row, dbinspect, advisor and DB-capability data, plus
+  query-plan data only when an explicit least-privilege explain target is configured
 
 Example agent:
 

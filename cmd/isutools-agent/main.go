@@ -123,7 +123,10 @@ func run(ctx context.Context, opt options, token string) error {
 	}
 
 	sections := controller.RegisteredCollectors()
-	sections = append(sections, "advisor-static", "db-capabilities", "dbinspect", queryplan.Name)
+	sections = append(sections, "advisor-static", "db-capabilities", "dbinspect")
+	if hasTargetPurpose(targets, string(sqlstats.PurposeExplain)) {
+		sections = append(sections, queryplan.Name)
+	}
 	peer, err := multihost.NewPeer(multihost.PeerOptions{
 		Enabled: true, Token: token, Role: opt.role, Form: "agent", AgentID: agentID,
 		Sections: sections, Capabilities: []string{"run-v1", "strict-dto", "lease-v1", "bounded-snapshot"},
@@ -155,6 +158,17 @@ func run(ctx context.Context, opt options, token string) error {
 		<-done
 		return ctx.Err()
 	}
+}
+
+func hasTargetPurpose(targets []multihost.TargetSummaryDTO, purpose string) bool {
+	for _, target := range targets {
+		for _, candidate := range target.Purposes {
+			if candidate == purpose {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func loadAndRegisterTargets(path string) ([]multihost.TargetSummaryDTO, error) {

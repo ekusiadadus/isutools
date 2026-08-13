@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ekusiadadus/isutools/multihost"
 )
 
 func TestLiteralLoopback(t *testing.T) {
@@ -17,6 +19,16 @@ func TestLiteralLoopback(t *testing.T) {
 		if literalLoopback(addr) {
 			t.Fatalf("literalLoopback(%q) = true", addr)
 		}
+	}
+}
+
+func TestHasTargetPurpose(t *testing.T) {
+	targets := []multihost.TargetSummaryDTO{{ID: "db1", Purposes: []string{"app", "explain"}}}
+	if !hasTargetPurpose(targets, "explain") {
+		t.Fatal("explain purpose was not detected")
+	}
+	if hasTargetPurpose(targets, "stats") {
+		t.Fatal("unregistered stats purpose was detected")
 	}
 }
 
