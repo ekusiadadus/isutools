@@ -37,6 +37,29 @@ curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
 どちらもSQLドライバーとHTTPハンドラーの計測、`reset -> benchmark -> save`だけを追加し、
 インデックス、キャッシュ、マッチングなどのチューニングは含みません。
 
+### 別PCからprivate-isuを操作するMakefile
+
+このrepositoryの`Makefile`は、既存のremote private-isuに対するreadiness確認、実ベンチ、
+artifactのSCP取得、SSH port forwarding、手動CPU profile取得をまとめます。最初に
+`.isutools.mk.example`をlocal設定`.isutools.mk`へコピーし、既存環境のhost/pathだけを
+指定します。`.isutools.mk`はgitignoreされます。
+
+```bash
+cp .isutools.mk.example .isutools.mk
+$EDITOR .isutools.mk
+
+make status          # 既存containerを表示
+make check           # app / MySQL / isutoolsのreadiness
+make bench           # reset -> bench -> collect -> save -> SCP
+make verify-results  # 手元の最新JSONを要約
+make tunnel          # localhost:19191へSSH転送（Ctrl-Cで終了）
+make pprof PPROF_SECONDS=30
+```
+
+結果は既定で`~/isutools-private-isu-results`へ保存されます。`make pprof`はmanual
+`/pprof/profile`を使うため、managed run CPU modeがprofileを所有している間は409で停止します。
+publicな`0.0.0.0:19191`へ迂回せず、SSH/Tunnel自体の障害は先に復旧してください。
+
 ## 最初に分かること
 
 - どのSQLとHTTPパスが時間を使っているか

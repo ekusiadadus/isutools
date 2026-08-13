@@ -29,6 +29,30 @@ curl -fsS -X POST http://127.0.0.1:19191/reset
 curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
 ```
 
+### Makefile for a remote private-isu host
+
+The repository `Makefile` wraps readiness checks, a real benchmark, artifact
+download over SCP, SSH port forwarding, and a manual CPU-profile capture for an
+existing remote private-isu environment. Copy `.isutools.mk.example` to the
+gitignored `.isutools.mk` and set only that environment's host and paths.
+
+```bash
+cp .isutools.mk.example .isutools.mk
+$EDITOR .isutools.mk
+
+make status
+make check
+make bench           # reset -> bench -> collect -> save -> SCP
+make verify-results
+make tunnel          # forward localhost:19191; Ctrl-C stops it
+make pprof PPROF_SECONDS=30
+```
+
+Artifacts default to `~/isutools-private-isu-results`. `make pprof` uses the
+manual `/pprof/profile` endpoint, so it stops on the expected 409 while managed
+run CPU mode owns the process-wide profiler. Do not work around an SSH/Tunnel
+failure by exposing the unauthenticated admin endpoint on `0.0.0.0:19191`.
+
 ## What it answers first
 
 - Which SQL statements and HTTP paths consume the run
