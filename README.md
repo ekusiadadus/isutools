@@ -60,6 +60,14 @@ make pprof PPROF_SECONDS=30
 `/pprof/profile`を使うため、managed run CPU modeがprofileを所有している間は409で停止します。
 publicな`0.0.0.0:19191`へ迂回せず、SSH/Tunnel自体の障害は先に復旧してください。
 
+2026-08-13にはWindows/WSL2上の既存private-isuへSSH接続し、`make check`、実際の
+`make bench`、durable snapshotのSCP取得、`make pprof`、loopback SSH転送まで再確認
+しました。score 0 / pass trueのため性能結果ではなく、操作・収集・保存経路の実機確認です。
+
+- [実行コマンド、run ID、hashを含む確認記録](./docs/private-isu-ssh-verification-20260813.md)
+
+![2026-08-13 private-isu SSH verification report](docs/images/private-isu-ssh-verification-20260813.png)
+
 ## 最初に分かること
 
 - どのSQLとHTTPパスが時間を使っているか
