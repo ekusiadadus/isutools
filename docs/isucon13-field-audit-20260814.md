@@ -75,6 +75,18 @@ mtimeや「最新ファイル」から推測しません。公式`/tmp/result.js
 `ERR_BLOCKED_BY_CLIENT`で遮断したため、この画像を「対話ブラウザで管理画面を開いた証拠」とは
 表現しません。
 
+## 並行セッションとの境界
+
+上記の公式runとderived publishは、Go module proxyから`7975737`を解決し、`replace`なしで
+buildしたbinaryで完了しました。その後、既に存在していた別の`tmux claude`セッションが
+flow/session smoke testのためWindows上の一時sourceを`replace`へ追加し、19:20と19:21 JSTに
+serviceをrestartして`/reset`を繰り返しました。この並行作業は停止・上書きしていません。
+
+同run再送の409実機証拠は、並行作業開始前の`6003f82` binaryで取得したものです。`/save`の
+実装は`7975737`まで同一で、最終sourceではroot/Echo test、race、vetと専用回帰testを通しています。
+並行reset中のprobeは同一runにならないため証拠から除外し、そこで生成したJSON/HTML 4ファイルは
+`/home/isucon/isutools-backup-pr43-20260814-1922/concurrent-probe-artifacts`へ回収可能な形で移しました。
+
 ## 再実行と確認コマンド
 
 詳細手順は[`examples/isucon13-wsl`](../examples/isucon13-wsl/README.md)にあります。
