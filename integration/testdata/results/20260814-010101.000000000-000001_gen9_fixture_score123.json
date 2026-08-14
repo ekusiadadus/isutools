@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "schema_version": 3,
+    "time": "2026-08-14T01:01:01+09:00",
+    "generation": 9,
+    "score": "123",
+    "benchmark_pass": true,
+    "partial": false,
+    "run": {
+      "run_id": "run-fixture-snapshot",
+      "validity": "valid"
+    },
+    "health": [
+      {
+        "collector": "profile",
+        "status": "ok"
+      }
+    ]
+  },
+  "sql": [],
+  "http": [],
+  "accesslog": {
+    "lines": 7,
+    "partial_lines": 0
+  }
+}

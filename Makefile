@@ -90,8 +90,12 @@ pull-results: require-config
 
 verify-results:
 	@set -eu; \
-	latest=$$(find '$(RESULTS_DIR)' -maxdepth 1 -type f -name '*.json' -print | sort | tail -n 1); \
-	test -n "$$latest" || { printf 'no JSON artifacts in %s\n' '$(RESULTS_DIR)' >&2; exit 1; }; \
+	latest=$$(find '$(RESULTS_DIR)' -maxdepth 1 -type f -name '*.json' -print | sort | while IFS= read -r candidate; do \
+		if jq -e '((.meta.schema_version | type) == "number") and ((.meta.time | type) == "string") and ((.meta.generation | type) == "number") and (((.meta.score | type) == "string") or ((.meta.score | type) == "number")) and ((.sql | type) == "array") and ((.http | type) == "array")' "$$candidate" >/dev/null 2>&1; then \
+			printf '%s\n' "$$candidate"; \
+		fi; \
+	done | tail -n 1); \
+	test -n "$$latest" || { printf 'no saved snapshot JSON artifacts in %s\n' '$(RESULTS_DIR)' >&2; exit 1; }; \
 	printf 'artifact: %s\n' "$$latest"; \
 	jq -e '{time:.meta.time,generation:.meta.generation,score:.meta.score,benchmark_pass:.meta.benchmark_pass,partial:.meta.partial,run_id:.meta.run.run_id,validity:.meta.run.validity,sql_rows:(.sql|length),http_rows:(.http|length),accesslog_lines:(.accesslog.lines // 0),accesslog_partial:(.accesslog.partial_lines // 0),profile_status:([.meta.health[]? | select(.collector=="profile")][0].status // "missing")}' "$$latest"
 
