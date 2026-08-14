@@ -1,0 +1,10 @@
+logging:
+  formats:
+    - name: isutools_json
+      # cqhm method, cquup unmapped URL path, cqhv protocol, pssc status,
+      # pscl bytes, ttms total milliseconds.
+      format: '{"schema":"isutools.http-access.v1","method":"%<cqhm>","uri":"%<cquup>","protocol":"%<cqhv>","status":%<pssc>,"duration_ms":%<ttms>,"bytes":%<pscl>}'
+  logs:
+    - filename: isutools-access
+      format: isutools_json
+      mode: ascii

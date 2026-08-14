@@ -52,11 +52,12 @@ ISUCON 本番に「`go get` + 数行」で持ち込めることをゴールと�
 
 | Milestone | 対象 | 手段 |
 |---|---|---|
-| M1 / v0.1 | MySQL / MariaDB / PostgreSQL(database/sql) | 登録済み `driver.Driver` をプロキシ化。pgx native API は対象外 |
+| M1 / v0.1 | MySQL / MariaDB / PostgreSQL / SQLite(database/sql) | 登録済み `driver.Driver` をプロキシ化。pgx native API は対象外 |
 | M1 / v0.1 | buildinfo + Snapshot + HTML/JSON | schema version付きSnapshotから全rendererを生成 |
 | M2 / v0.2 | HTTP/1.1, HTTP/2 + nginx + procstats | Handler middleware、差分ログ、ベンチ区間の `/proc` 差分 |
 | v0.3–v0.7 | run履歴、pprof、CPU total、advisor、counter | 段階リリース済み |
 | v1.0 | diff、WebSocket/SSE接続、User Flow、k6例 | 接続レベル計測。フレーム計測は除外 |
+| v1.6 | 全公開ISUCON stack、proxy decoder registry、Redis、proxy非依存flow | 明示単位JSONと歴代framework adapter |
 
 ### 非スコープ(v1)
 
@@ -73,7 +74,9 @@ isutools/
 ├── isutools.go      // SQLDriverName() / HTTP() / Handler() + loopback admin
 ├── sqlstats/        // SQL: ドライバプロキシ + メモリ内集計
 ├── httpstats/       // HTTP in: ミドルウェア集計 (h1/h2, パス正規化)
-├── accesslog/       // nginx LTSV/JSON + Caddy native JSON + 明示Apache/Envoy JSON
+├── accesslog/       // 明示format registry + canonical/Caddy/Traefik/IIS decoder
+├── flowstats/       // proxy非依存の疑似session遷移 + scenario journey
+├── redisstats/      // key/valueを保存しないRedis command latency
 ├── procstats/       // /proc スキャン: プロセス別 CPU/RSS top-N
 ├── buildinfo/       // git hash + dirty 検出
 ├── internal/agg/    // 共通集計コア (bounded map, log2 バケットヒストグラム)
@@ -210,7 +213,7 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
   Bodyサイズ上限、読み取り後のBody復元、匿名operationの安定hashを必須とする。
   batch/APQ/multipart/WebSocketを未対応のまま推測集計せず、healthにunsupportedを出す
 
-### 5.4 accesslog(nginx / 明示Apache JSON)
+### 5.4 accesslog（明示format registry）
 
 - **pull 型**: アプリのホットパスには一切関与しない。`POST /reset` で現在の
   inode・offsetを世代の開始点として記録し、snapshot/`POST /collect` で
@@ -218,9 +221,14 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
 - ローテーションは inode 変更前の旧ファイル末尾を可能な限りdrainしてから新ファイルへ
   移り、copytruncate(同じinodeでsize < offset)はoffset=0へ戻す。欠損・重複の可能性は
   collector healthへ表示する
-- v1実装は nginx LTSV/JSON（alp aliases含む）を行頭で自動判定する。Apache は
-  `reqtime_us:%D` を持つ明示 JSON のみ対応する。nginx/Apache combined を
-  自動判別で推測して読まない
+- 新規構成は`ISUTOOLS_ACCESS_LOG_FORMAT`で`isutools-ltsv`、明示単位を持つ
+  `isutools-json-v1`、Caddy/Traefik native JSON、IIS W3Cを選ぶ。`auto`は旧
+  JSON/LTSV互換だけで、製品やduration単位を推測しない
+- canonical JSONは`isutools.http-access.v1`と`duration_ns/us/ms/sec`のいずれかを要求し、
+  単位の競合、未知schema、非有限値、overflowを拒否する。nginx/Apache combinedは読まない
+- nginx/OpenResty、Apache/OpenLiteSpeed、H2O、Envoy、Caddy、HAProxy、Traefik、
+  lighttpd、Varnish、ATS、IIS、Squidの設定断片とgolden fixtureを同梱する。
+  nginx streamはHTTPへ偽装せず、別のL4 connection schemaに分離する
 - Docker 構成ではログの volume 共有が必要(compose 例を同梱。5.8 参照)
 
 #### 5.4.1 nginx ltsv フォーマット仕様(同梱スニペット)
@@ -260,7 +268,7 @@ middlewareを自動構成するため、通常構成でclient headerを直接ロ
 | **cache HIT/MISS 率** | proxy_cache 導入の効き目 |
 | ctype 別集計 | 画像/CSS/JS/HTML の帯域内訳 |
 | proto 別 count / 5xx / p95 | reverse proxy終端を含むHTTP/1.1・2・3の実測比率と移行signal |
-| scenario + sess 別 request列 | 明示scenarioごとの上位ユーザーストーリー。URL意味推測なし |
+| scenario + sess 別 request列 | middlewareのHMAC疑似sessionと登録済みroute templateによる上位ユーザーストーリー。URL意味推測なし |
 | status 101 / 499 / 5xx | WebSocket 接続はレイテンシ集計から分離、499・reset は警告表示(接続枯渇の兆候) |
 
 - `$upstream_response_time` のカンマ/コロン区切り値は全試行をparseし、raw値、合計、
@@ -550,7 +558,7 @@ mazrean「ISUCON14感想戦で40万点超えました」(traP blog 2024-12)。
 | resetと同時計測の境界 | generationをatomic swapし旧世代を凍結 | SQL/HTTP単体と同時reset直列化は実装済み、collector横断barrier未完 |
 | WebSocket汎用frame wrapper不成立 | v1はconnection/wire bytes、messageはPhase 2 adapter | v1実装。成功した101/Hijackのみ分類 |
 | procがベンチ後を測る | reset/snapshotの区間差分 | M2 local実装済み |
-| upstream複数値、Apache `%B`誤解 | 5.4のraw/合計/試行数、`%O`区別 | nginx実装済み。Apacheは明示JSON+`%D`のみ |
+| upstream複数値、Apache `%B`誤解 | 5.4のraw/合計/試行数、`%O`区別 | nginx実装済み。Apacheはcanonical JSON+`%D`をnative config test |
 | gqlgen operation単位 | `InterceptOperation`、subscription重複回避 | M3予定 |
 | optional dependency | gqlgen/quic-goをcoreから分離 | package/module境界は実装前に確定 |
 | 共有CIのns hard gate | informational + 固定host ABBA | 複数block/CIスクリプト実装。remote再検証は未実施 |
@@ -599,7 +607,7 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
   hard-limit/OOM、実`runtime/pprof` CPU profile解析も通過したが、Darwin crash faultとABBA release
   gateは未完了
 - JSON→Markdown フォーマッタ(Discord/GitHub 連携強化)
-- Apache ログ(`%D`/`%O`)対応・gqlstats(必要になった時点で)
+- gqlstats（必要になった時点で。Apache `%D` canonical JSONは実装済み）
 - HTTP/3 統合テスト(quic-go 環境依存)
 - クロスコレクター共有 generation gate(IMPLEMENTATION_STATUS 記載の硬化項目。
   ベンチ自動化が「reset 完了後に負荷開始」を守る限り実害なし)
@@ -677,10 +685,11 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 - **Context**: GA4風flowを見たいが、生Cookie/token/user IDの保存やURL意味の自動推測は
   privacy・誤分類・アプリ依存を招く
 - **Decision**: `isutools.HTTP`がsession CookieをHMAC疑似IDへ変換し、環境変数またはrouter helperの
-  非秘密`scenario`とともにupstream responseとしてproxyへ渡す。public flow headerは削除する。
-  閉じたk6環境だけは別名`X-Isutools-Trusted-*`へのedge mappingと明示opt-inを許す。
-  観測した`METHOD URI`列は最大10,000 session、共有page辞書10,000、32 step、表示上位20 storyに
-  bounded集約する。flow label全体は`ISUTOOLS_FLOW_LABELS=off`でrequest pathから外れる
+  非秘密`scenario`、routerの登録済みtemplateとともにアプリ内`flowstats`へ直接渡す。
+  public flow headerは削除する。`ISUTOOLS_FLOW_SOURCE=proxy`だけが後方互換としてapp response headerを
+  proxy logから読む。閉じたk6環境だけは別名`X-Isutools-Trusted-*`へのedge mappingと明示opt-inを許す。
+  観測した`METHOD route-template`列は最大10,000 session、共有page辞書10,000、32 step、表示上位20 storyに
+  bounded集約する。`middleware`/`proxy`は混ぜず、`off`は両方を表示しない
 - **Consequences**: 環境変数と数行のrouter/proxy設定で複数ユーザーストーリーを比較できる。必須step、
   conversion、drop-offを持つfunnel定義は将来の明示DSLに分離する
 - **Status**: Implemented in post-v1 working tree

@@ -134,6 +134,8 @@ func flavorOf(driverName string) string {
 		return "mysql"
 	case strings.Contains(name, "pg") || strings.Contains(name, "postgres"):
 		return "postgres"
+	case strings.Contains(name, "sqlite"):
+		return "sqlite"
 	default:
 		return "unknown"
 	}

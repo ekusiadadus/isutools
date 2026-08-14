@@ -44,8 +44,8 @@ func TestParseJSONProtocolAliases(t *testing.T) {
 }
 
 func TestParseCaddyNativeJSON(t *testing.T) {
-	line := `{"level":"info","request":{"method":"GET","uri":"/posts/1?q=secret","proto":"HTTP/3.0","headers":{"X-Isutools-Session":["safe-session"],"X-Isutools-Scenario":["reader"]}},"status":200,"duration":0.025,"size":1234,"resp_headers":{"Content-Type":["text/html"]}}`
-	rec, err := ParseNginxJSON(line)
+	line := `{"level":"info","request":{"method":"GET","uri":"/posts/1?q=secret","proto":"HTTP/3.0","headers":{"X-Isutools-Session":["spoofed"],"X-Isutools-Scenario":["spoofed"]}},"status":200,"duration":0.025,"size":1234,"resp_headers":{"Content-Type":["text/html"],"X-Isutools-Session":["safe-session"],"X-Isutools-Scenario":["reader"]}}`
+	rec, err := ParseLineFormat(FormatCaddyJSON, line)
 	if err != nil {
 		t.Fatalf("Caddy JSON: %v", err)
 	}

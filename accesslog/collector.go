@@ -127,6 +127,31 @@ func WithPathRulesSpec(spec string, unmatched UnmatchedPolicy) Option {
 	}
 }
 
+// WithFormat selects one validated decoder contract.
+func WithFormat(format Format) Option {
+	return func(c *Collector) {
+		canonical, err := ParseFormat(string(format))
+		if err != nil {
+			c.formatError = "invalid-format"
+			return
+		}
+		c.format = canonical
+	}
+}
+
+// WithFormatSpec parses ISUTOOLS_ACCESS_LOG_FORMAT without retaining its raw
+// value in health output.
+func WithFormatSpec(spec string) Option {
+	return func(c *Collector) {
+		format, err := ParseFormat(spec)
+		if err != nil {
+			c.formatError = "invalid-format"
+			return
+		}
+		c.format = format
+	}
+}
+
 // Collector tails a log from a generation baseline. It retains an open file
 // descriptor so an inode-rotated file can be drained before the new path.
 type Collector struct {
@@ -140,6 +165,8 @@ type Collector struct {
 	agg             *Aggregator
 	pathRules       *PathRules
 	pathRulesError  string
+	format          Format
+	formatError     string
 
 	file     File
 	offset   int64
@@ -159,7 +186,7 @@ func New(path string, opts ...Option) *Collector {
 	c := &Collector{
 		path: path, fs: osFileSystem{}, sameFile: os.SameFile,
 		maxLineBytes: defaultMaxLineBytes, maxCollectBytes: defaultMaxCollectBytes,
-		agg:    NewAggregator(DefaultMaxKeys),
+		agg: NewAggregator(DefaultMaxKeys), format: FormatAuto,
 		health: Health{Status: StatusOK},
 	}
 	for _, opt := range opts {
@@ -167,6 +194,9 @@ func New(path string, opts ...Option) *Collector {
 	}
 	if c.pathRulesError != "" {
 		c.recordPartialLocked("path-rules-" + c.pathRulesError)
+	}
+	if c.formatError != "" {
+		c.recordPartialLocked(c.formatError)
 	}
 	c.mu.Lock()
 	if err := c.openLocked(true); err != nil {
@@ -458,8 +488,11 @@ func (c *Collector) consumeLocked(data []byte) {
 		if b == '\n' {
 			line := string(c.pending)
 			c.pending = c.pending[:0]
-			rec, err := ParseLine(line)
+			rec, err := ParseLineFormat(c.format, line)
 			if err != nil {
+				if errors.Is(err, ErrSkipLine) {
+					continue
+				}
 				c.health.Dropped++
 				c.health.LastError = err.Error()
 				c.recordPartialLocked("malformed access-log records were dropped")

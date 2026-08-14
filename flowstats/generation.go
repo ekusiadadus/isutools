@@ -1,0 +1,149 @@
+package flowstats
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/internal/runctl"
+)
+
+const SectionName = "flow"
+
+var (
+	ErrForeignHandle  = errors.New("flowstats: foreign generation handle")
+	ErrNotDrained     = errors.New("flowstats: generation was not drained")
+	ErrHandleReleased = errors.New("flowstats: generation handle was released")
+)
+
+type Frozen struct{ Snapshot Snapshot }
+
+type generation struct {
+	owner    *GenerationCollector
+	agg      *accesslog.Aggregator
+	frozen   Snapshot
+	settled  bool
+	released bool
+	mu       sync.Mutex
+}
+
+type boundaryKey struct {
+	runID string
+	epoch runctl.Epoch
+	phase runctl.Phase
+}
+
+type boundaryRecord struct {
+	result runctl.BoundaryResult
+	err    error
+}
+
+type GenerationCollector struct {
+	registry *Registry
+	mu       sync.Mutex
+	epoch    runctl.Epoch
+	gen      uint64
+	results  map[boundaryKey]boundaryRecord
+}
+
+var _ runctl.GenerationCollector = (*GenerationCollector)(nil)
+
+func NewGenerationCollector(registry *Registry) *GenerationCollector {
+	if registry == nil {
+		registry = Default
+	}
+	return &GenerationCollector{registry: registry, results: map[boundaryKey]boundaryRecord{}}
+}
+
+func (c *GenerationCollector) Name() string { return SectionName }
+
+func (c *GenerationCollector) BeginBoundary(ctx context.Context, runID string, epoch runctl.Epoch) (runctl.BoundaryResult, error) {
+	return c.boundary(ctx, runID, epoch, runctl.PhaseStartBoundary)
+}
+
+func (c *GenerationCollector) Freeze(ctx context.Context, runID string, epoch runctl.Epoch) (runctl.BoundaryResult, error) {
+	return c.boundary(ctx, runID, epoch, runctl.PhaseFinishFreeze)
+}
+
+func (c *GenerationCollector) boundary(_ context.Context, runID string, epoch runctl.Epoch, phase runctl.Phase) (runctl.BoundaryResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if epoch < c.epoch {
+		return runctl.BoundaryResult{At: time.Now()}, runctl.ErrStaleEpoch
+	}
+	key := boundaryKey{runID: runID, epoch: epoch, phase: phase}
+	if prior, ok := c.results[key]; ok {
+		return prior.result, prior.err
+	}
+	if epoch > c.epoch {
+		c.epoch = epoch
+		c.results = map[boundaryKey]boundaryRecord{}
+	}
+	g := &generation{owner: c, agg: c.registry.rotate()}
+	result := runctl.BoundaryResult{Handle: runctl.NewGenerationHandle(runID, epoch, SectionName, c.gen, g), At: time.Now(), Committed: true}
+	c.gen++
+	c.results[key] = boundaryRecord{result: result}
+	return result, nil
+}
+
+func (c *GenerationCollector) Drain(ctx context.Context, handle runctl.GenerationHandle) error {
+	g, err := c.resolve(handle)
+	if err != nil {
+		return err
+	}
+	g.mu.Lock()
+	if g.settled || g.released {
+		g.mu.Unlock()
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		g.mu.Unlock()
+		return err
+	}
+	if !g.settled && !g.released {
+		g.frozen = snapshotFromAccessLog(g.agg.Snapshot())
+		g.agg = nil
+		g.settled = true
+	}
+	g.mu.Unlock()
+	return nil
+}
+
+func (c *GenerationCollector) Collect(handle runctl.GenerationHandle) (any, error) {
+	g, err := c.resolve(handle)
+	if err != nil {
+		return nil, err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.released {
+		return nil, ErrHandleReleased
+	}
+	if !g.settled {
+		return nil, ErrNotDrained
+	}
+	return Frozen{Snapshot: cloneSnapshot(g.frozen)}, nil
+}
+
+func (c *GenerationCollector) Release(handle runctl.GenerationHandle) {
+	g, err := c.resolve(handle)
+	if err != nil {
+		return
+	}
+	g.mu.Lock()
+	g.agg = nil
+	g.frozen = Snapshot{}
+	g.released = true
+	g.mu.Unlock()
+}
+
+func (c *GenerationCollector) resolve(handle runctl.GenerationHandle) (*generation, error) {
+	g, ok := handle.Token().(*generation)
+	if !ok || g == nil || g.owner != c {
+		return nil, fmt.Errorf("%w: %s", ErrForeignHandle, handle.Collector)
+	}
+	return g, nil
+}

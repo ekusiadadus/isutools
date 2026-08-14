@@ -1,0 +1,12 @@
+accessLog:
+  filePath: /var/log/traefik/isutools-access.jsonl
+  format: json
+  fields:
+    defaultMode: keep
+    names:
+      RequestHost: drop
+    headers:
+      defaultMode: drop
+
+# Native Duration and OriginDuration are nanoseconds. Traefik's access-header
+# customization concerns request headers, so flow labels remain in middleware.

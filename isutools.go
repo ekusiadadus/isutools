@@ -42,6 +42,7 @@ import (
 	"github.com/ekusiadadus/isutools/dbcap"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
+	"github.com/ekusiadadus/isutools/flowstats"
 	"github.com/ekusiadadus/isutools/hoststats"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -52,6 +53,7 @@ import (
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
+	"github.com/ekusiadadus/isutools/redisstats"
 	"github.com/ekusiadadus/isutools/sessionlabel"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
@@ -92,6 +94,8 @@ const envDataDir = "ISUTOOLS_DATA_DIR"
 const (
 	envAccessLogPathRules = "ISUTOOLS_ACCESS_LOG_PATH_RULES"
 	envAccessLogUnmatched = "ISUTOOLS_ACCESS_LOG_UNMATCHED"
+	envAccessLogFormat    = "ISUTOOLS_ACCESS_LOG_FORMAT"
+	envFlowSource         = "ISUTOOLS_FLOW_SOURCE"
 )
 
 // Runtime profile configuration. All three default to off: the default
@@ -263,6 +267,8 @@ type generationCollectors struct {
 	http     runctl.GenerationCollector
 	sql      runctl.GenerationCollector
 	counters runctl.GenerationCollector
+	redis    runctl.GenerationCollector
+	flow     runctl.GenerationCollector
 }
 
 // processGenerationCollectors names the collectors the instrumented
@@ -273,6 +279,8 @@ func processGenerationCollectors() generationCollectors {
 		http:     httpstats.Default,
 		sql:      sqlstats.NewGenerationCollector(nil),
 		counters: counters.NewGenerationCollector(nil),
+		redis:    redisstats.NewGenerationCollector(nil),
+		flow:     flowstats.NewGenerationCollector(nil),
 	}
 }
 
@@ -542,8 +550,8 @@ func registerGenerationCollectors(ctrl *runctl.Controller, gens generationCollec
 }
 
 type generationRegistration struct {
-	names              []string
-	http, sql, counter bool
+	names                           []string
+	http, sql, counter, redis, flow bool
 }
 
 func registerGenerationCollectorsStatus(ctrl *runctl.Controller, gens generationCollectors) generationRegistration {
@@ -574,6 +582,8 @@ func registerGenerationCollectorsStatus(ctrl *runctl.Controller, gens generation
 	status.http = add(httpstats.CollectorName, gens.http)
 	status.sql = add(sqlstats.SectionName, gens.sql)
 	status.counter = add(counters.SectionName, gens.counters)
+	status.redis = add(redisstats.SectionName, gens.redis)
+	status.flow = add(flowstats.SectionName, gens.flow)
 	status.names = registered
 	return status
 }
@@ -1683,6 +1693,13 @@ func HTTP(next http.Handler) http.Handler {
 		collectorHealth.Set("profile-labels", health.StatusDegraded, fmt.Sprintf("unknown %s=%q; labels disabled", envCPUProfileLabels, labels))
 	}
 	flowLabels := sessionlabel.FromEnv(os.Getenv)
+	switch resolveFlowSource(os.Getenv) {
+	case "auto", "middleware":
+		flowLabels = flowLabels.WithObserver(flowstats.Default)
+	case "proxy", "off":
+	default:
+		collectorHealth.Set("flow", health.StatusDegraded, "invalid-flow-source")
+	}
 	flowHealth := flowLabels.Health()
 	switch {
 	case flowHealth.Enabled && flowHealth.Reason == "scenario-invalid":
@@ -1698,6 +1715,17 @@ func HTTP(next http.Handler) http.Handler {
 	return httpstats.Middleware(next)
 }
 
+func resolveFlowSource(getenv func(string) string) string {
+	if getenv == nil {
+		return "auto"
+	}
+	source := strings.ToLower(strings.TrimSpace(getenv(envFlowSource)))
+	if source == "" {
+		return "auto"
+	}
+	return source
+}
+
 var pathRulesOnce sync.Once
 
 // Count increments a named user counter by 1 (e.g. cache hit/miss). Shown
@@ -1710,6 +1738,31 @@ func AddCount(name string, delta int64) {
 		return
 	}
 	counters.Default.Add(name, delta)
+}
+
+// ObserveRedis records one Redis-compatible command latency. Only the first
+// command token is retained; keys, values, arguments, errors, and DSNs are
+// discarded. It works with go-redis, redigo, rueidis, and historical clients.
+func ObserveRedis(command string, duration time.Duration, err error) {
+	if Off() {
+		return
+	}
+	redisstats.Default.Observe(command, duration, err)
+}
+
+// MeasureRedis runs fn and records its duration under the sanitized command.
+// The original error is returned unchanged.
+func MeasureRedis(command string, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if Off() {
+		return fn()
+	}
+	started := time.Now()
+	err := fn()
+	ObserveRedis(command, time.Since(started), err)
+	return err
 }
 
 // Handler serves the report UI: GET / (dashboard with snapshot history),
@@ -1746,6 +1799,8 @@ func Handler() http.Handler {
 		SQLGenerationManaged:      core.generationManaged.sql,
 		HTTPGenerationManaged:     core.generationManaged.http,
 		CountersGenerationManaged: core.generationManaged.counter,
+		RedisGenerationManaged:    core.generationManaged.redis,
+		FlowGenerationManaged:     core.generationManaged.flow,
 		ProcRunManaged:            core.procManaged,
 		Health:                    collectorHealth,
 		HTTP:                      httpstats.Default,
@@ -1763,6 +1818,8 @@ func Handler() http.Handler {
 		DBCapabilities: func() []dbcap.Target { return dbcap.ForTargets(sqlstats.Targets(), nil) },
 		Advisor:        collectAdvice,
 		Counters:       counters.Default,
+		Redis:          redisstats.Default,
+		FlowSource:     resolveFlowSource(os.Getenv),
 		// The reset boundary is the run boundary: POST /reset opens a run on
 		// the shared Controller and answers with its id, so a bench script can
 		// name the run it just started. POST /finish and POST /save close it
@@ -1777,6 +1834,9 @@ func Handler() http.Handler {
 		RunSnapshot:     core.latestRunSnapshot,
 		Timeline:        core.timelineSection,
 		RuntimeProfiles: core.profiles,
+	}
+	if source := provider.FlowSource; source == "auto" || source == "middleware" {
+		provider.Flow = flowstats.Default
 	}
 	if core.cpuBridge != nil {
 		provider.CPUProfiles = core.cpuBridge
@@ -1804,7 +1864,10 @@ func Handler() http.Handler {
 		default:
 			collectorHealth.Set("accesslog-path-rules", health.StatusDegraded, "invalid-unmatched-policy")
 		}
-		collector := accesslog.New(path, accesslog.WithPathRulesSpec(os.Getenv(envAccessLogPathRules), unmatched))
+		collector := accesslog.New(path,
+			accesslog.WithFormatSpec(os.Getenv(envAccessLogFormat)),
+			accesslog.WithPathRulesSpec(os.Getenv(envAccessLogPathRules), unmatched),
+		)
 		provider.AccessLog = collector
 		provider.AccessLogGenerationManaged = core.watchAccessLogGeneration(collector)
 		provider.AccessLogQuiet = 100 * time.Millisecond

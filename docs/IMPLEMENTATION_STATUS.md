@@ -1,13 +1,49 @@
 # Implementation and verification status
 
-Updated: 2026-08-14 (Asia/Tokyo) — field-feedback implementation merged to
-`main` at `0f71797ab9ca968967b0a610ce98c8871bbd1624`, on top of **v1.4.0**
+Updated: 2026-08-15 (Asia/Tokyo)
+
+Released baseline: field-feedback implementation merged to `main` at
+`0f71797ab9ca968967b0a610ce98c8871bbd1624`, on top of **v1.4.0**.
 
 `v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1),
 `v1.2.0` tag = `833515e`, `v1.3.0` tag = `26aa2bb` (merge of PR #14),
 and v1.4.0 contains PR #18.
 The existing v1.2 sections below remain historical evidence; their numbers are
 not silently reused for the current working tree.
+
+## Unreleased v1.6 compatibility candidate
+
+Issue #45 audited every public ISUCON 1–14 problem repository. This working
+tree adds the compatibility layer derived from that audit:
+
+- framework adapters for every published Go reference-app router: Gorilla mux,
+  Martini, Goji v2, Echo v3/v4/v5, httprouter, and chi v5; Gin remains supported
+- explicit access-log decoder registry with canonical, Caddy, Traefik, IIS,
+  and nginx LTSV contracts; 12 HTTP product fixtures; nginx stream kept as L4
+- proxy-independent middleware flow collection with HMAC pseudonyms, bounded
+  scenarios, and registered route templates; proxy flow is a single-source
+  legacy mode and `off` does not fall back
+- Redis command-only timing collector; keys, values, arguments, errors, and
+  connection strings are never retained
+- MySQL/MariaDB/PostgreSQL/SQLite `database/sql` compatibility, with real
+  lib/pq PostgreSQL and go-sqlite3 integration tests in a separate module
+
+Current-tree verification (2026-08-15):
+
+| check | environment | result |
+|---|---|---|
+| root test + vet | Go 1.24.6, darwin/arm64 | PASS |
+| race + coverage | Go 1.24.6, darwin/arm64 | PASS, aggregate **84.1%** |
+| all framework adapters | each declared toolchain; race enabled | PASS |
+| new historical adapters | Go 1.24.6 compatibility | PASS |
+| SQL compatibility | SQLite local + PostgreSQL 17.6 container through real drivers | PASS |
+| native proxy configs | nginx 1.28.0, Apache httpd 2.4.65, H2O 2.2.5, Envoy 1.34.13 / legacy 1.33.11, Caddy 2.10.2 | PASS |
+| remaining proxy formats | 12-product golden fixture table + YAML structural parse | PASS; schema-compatible, not deployment-certified |
+
+These checks do not claim a benchmark on every historical VM image, managed
+edge support, or a release. The exact classifications and source links are in
+`docs/isucon-compatibility.md`; the repeatable native checks are in
+`integration/test-proxy-configs.sh`.
 
 ## v1.4.0 release implementation
 

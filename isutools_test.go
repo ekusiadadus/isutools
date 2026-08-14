@@ -105,6 +105,17 @@ func TestResolveAccessLogPathPrefersGenericName(t *testing.T) {
 	}
 }
 
+func TestResolveFlowSource(t *testing.T) {
+	for input, want := range map[string]string{"": "auto", " Middleware ": "middleware", "PROXY": "proxy", "off": "off"} {
+		if got := resolveFlowSource(func(string) string { return input }); got != want {
+			t.Errorf("resolveFlowSource(%q) = %q, want %q", input, got, want)
+		}
+	}
+	if got := resolveFlowSource(nil); got != "auto" {
+		t.Fatalf("nil getenv = %q", got)
+	}
+}
+
 func TestCollectAdviceReadsGenericProxyAndExternalHTTP3Evidence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "Caddyfile")
 	if err := os.WriteFile(path, []byte("example.com { reverse_proxy 127.0.0.1:8080 }"), 0o600); err != nil {

@@ -61,17 +61,20 @@ candidates and evidence instead of declaring a cause. Score and correctness rema
 
 ## User Flow and Scenario Stories
 
-`isutools.HTTP` can turn a Cookie into an HMAC pseudonymous session. Raw cookies and session tokens do
-not need to enter the proxy log, and the feature can be switched independently through environment variables.
+`isutools.HTTP` middleware turns a Cookie into an HMAC pseudonymous session and aggregates it with registered
+route templates inside the application. Raw cookies and session tokens never need to enter the proxy log, so
+User Flow and Scenario Stories work with proxies other than nginx.
 
 ```bash
 export ISUTOOLS_FLOW_LABELS=on
 export ISUTOOLS_SESSION_COOKIE=SESSIONID
 export ISUTOOLS_SESSION_HMAC_KEY='random-32-byte-or-longer-secret-not-in-git'
 export ISUTOOLS_SCENARIO=isucon13_official
+export ISUTOOLS_FLOW_SOURCE=middleware
 ```
 
-Echo v4/v5, Gin, and chi v5 adapters provide route templates and per-handler scenario labels.
+Adapters cover every framework used by a published ISUCON Go reference app: Gorilla mux, Martini, Goji v2,
+Echo v3/v4/v5, httprouter, and chi v5, plus Gin.
 
 ```go
 echov4.Install(e)
@@ -85,8 +88,10 @@ r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 ```
 
 `ISUTOOLS_FLOW_LABELS=off` disables only flow labels; `ISUTOOLS=off` disables all measurement.
-Public `X-Isutools-Session` and `X-Isutools-Scenario` headers are never trusted directly. See the
-[integration guide](./docs/INTEGRATION.md#user-flow-の-sess) for nginx and closed k6-edge examples.
+Public `X-Isutools-Session` and `X-Isutools-Scenario` headers are never trusted directly.
+`ISUTOOLS_FLOW_SOURCE=proxy` selects the legacy trusted-response-header path; `off` disables flow collection.
+See the [all-round compatibility matrix](./docs/isucon-compatibility.md) and
+[proxy examples](./examples/proxies/README.md).
 
 ## Measured stories
 
@@ -137,9 +142,9 @@ establish the strict two-percent overhead gate, so the failure is retained in th
 
 | Area | Support |
 |---|---|
-| Database | MySQL / MariaDB / PostgreSQL through `database/sql` |
-| HTTP | Go `net/http`, Echo v4/v5, Gin, and chi v5 |
-| Proxy logs | Explicit nginx / Caddy / Apache / Envoy formats |
+| Database / KV | MySQL / MariaDB / PostgreSQL / SQLite through `database/sql`; Redis command collector |
+| HTTP | Go `net/http`, Gorilla mux, Martini, Goji v2, Echo v3/v4/v5, httprouter, Gin, and chi v5 |
+| Proxy logs | nginx/OpenResty, Apache/OpenLiteSpeed, H2O, Envoy, Caddy, HAProxy, Traefik, lighttpd, Varnish, ATS, IIS, and Squid |
 | Runtime | CPU, mutex, block, and heap pprof |
 | Host | Linux procfs / sysfs / cgroup v2, network, and DB pool |
 | Output | Live dashboard, JSON, self-contained HTML, run diff, and multi-host hub |
@@ -152,7 +157,9 @@ establish the strict two-percent overhead gate, so the failure is retained in th
 | `ISUTOOLS_ADDR` | Admin server; default `127.0.0.1:19191` |
 | `ISUTOOLS_DATA_DIR` | Durable snapshot and profile directory |
 | `ISUTOOLS_ACCESS_LOG` | Proxy access log |
+| `ISUTOOLS_ACCESS_LOG_FORMAT` | Explicit decoder (`isutools-ltsv`, `isutools-json-v1`, `caddy-json`, `traefik-json`, or `iis-w3c`) |
 | `ISUTOOLS_FLOW_LABELS` | Set User Flow / Scenario Stories to `on`, `off`, or `auto` |
+| `ISUTOOLS_FLOW_SOURCE` | Flow source; default `auto`, or `middleware`, `proxy`, `off` |
 | `ISUTOOLS_PPROF_SECONDS` | Benchmark-scoped CPU-profile duration |
 | `ISUTOOLS_TIMELINE` | Opt in to a bounded run timeline |
 
@@ -174,7 +181,7 @@ go test -race ./...
 go vet ./...
 ```
 
-Adapters are separate Go modules. CI validates the root, Echo v4/v5, Gin, and chi v5 independently.
+Adapters are separate Go modules. CI validates the root and every framework adapter independently.
 
 ## License
 

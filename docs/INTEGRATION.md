@@ -96,11 +96,19 @@ import _ "github.com/lib/pq"
 db, err := sql.Open(isutools.SQLDriverName("postgres"), dsn)
 ```
 
-### その他の `database/sql` driver
+### SQLite / その他の `database/sql` driver
 
-SQLite 等も、driver が `database/sql` へ登録する名前を渡せば SQL 集計部分は利用できます。
-ただし個別 driver の DSN 検査と schema inspector は自動対応しません。driver 名は
-`sql.Drivers()` で確認できます。
+```go
+import _ "github.com/mattn/go-sqlite3"
+
+db, err := sql.Open(isutools.SQLDriverName("sqlite3"), "./tenant.db")
+```
+
+`modernc.org/sqlite`など別driverも、`database/sql`へ登録する名前（通常`sqlite`）を渡せば
+同じSQL集計とDB pool計測を利用できます。ISUCON12予選のtenant別SQLite fileでも、各
+`*sql.DB`を同じproxy driverで開きます。ただしSQLite/PostgreSQLのschema inspector、
+row-efficiency、EXPLAIN advisorは対応済みと偽装せず`unsupported`を表示します。driver名は
+`sql.Drivers()`で確認できます。
 
 ## 3. HTTP Handler
 
@@ -127,8 +135,9 @@ WebSocket は handshake が実際に 101 / Hijack へ成功した時だけ、SSE
 ### JSON は必須か
 
 必須ではありません。推奨の LTSV と JSON の両方に対応し、`ParseLine` は行頭の最初の
-非空白文字が `{` なら JSON、それ以外なら LTSV と判定します。標準 combined log を
-曖昧に推測することはありません。
+新規構成ではformatを明示します。`auto`は後方互換のJSON/LTSV判定だけで、製品ごとに異なる
+duration単位を推測しません。全proxyの対応表と設定断片は
+[互換性表](./isucon-compatibility.md)と[proxy例](../examples/proxies/README.md)にあります。
 
 1. [nginx-isutools.conf](../examples/nginx-isutools.conf) を `http {}` 内で include
 2. 計測対象の `server {}` に次を追加
@@ -140,6 +149,7 @@ access_log /var/log/nginx/isutools.log isutools;
 
 ```bash
 export ISUTOOLS_ACCESS_LOG=/var/log/nginx/isutools.log
+export ISUTOOLS_ACCESS_LOG_FORMAT=isutools-ltsv
 ```
 
 Docker では nginx とアプリの両コンテナへ同じ log volume を mount します。アプリの
@@ -158,15 +168,17 @@ nginx が静的ファイルを直接返す場合、`$upstream_response_time` は
 ### User Flow の `sess`
 
 `isutools.HTTP`は環境変数からflow-label middlewareを自動構成します。通常の実ユーザー計測は
-session Cookieをアプリ内でHMAC疑似IDへ変換し、upstream response headerとしてnginxへ返します。
+session Cookieをアプリ内でHMAC疑似IDへ変換し、登録済みroute templateと一緒にアプリ内の
+`flowstats`へ記録します。既定の`ISUTOOLS_FLOW_SOURCE=auto`はこのmiddleware方式です。
 
 ```bash
 export ISUTOOLS_FLOW_LABELS=on
 export ISUTOOLS_SESSION_COOKIE=SESSIONID
 export ISUTOOLS_SESSION_HMAC_KEY='32-byte以上のgitへ入れない乱数'
+export ISUTOOLS_FLOW_SOURCE=middleware
 ```
 
-同梱nginx設定はpublicおよび内部trusted headerをupstream requestから削除し、アプリが返した
+同梱nginx設定は後方互換の`ISUTOOLS_FLOW_SOURCE=proxy`用です。publicおよび内部trusted headerをupstream requestから削除し、アプリが返した
 `$upstream_http_x_isutools_session`だけを`sess:`へ記録します。そのresponse headerもclientへは
 返しません。nginx coreだけでは安全な暗号学的hashを作れないため、生Cookie、session token、
 emailを直接`log_format`へ入れてはいけません。cookie/key未設定の`auto`、不正なkey、または
@@ -183,7 +195,8 @@ r.GET("/checkout", ginadapter.Scenario("checkout"), checkout)
 r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 ```
 
-同梱nginx設定はupstream responseの値だけを`sess:`と`scenario:`へ出力します。isutoolsは
+既定ではmiddlewareがHMAC疑似session、明示scenario、routerの登録済みtemplateだけを使います。
+生URLへfallbackしないため、proxyにpath正規化を重複設定する必要はありません。isutoolsは
 `scenario + sess`ごとに`METHOD URI`の実測列を作り、同一journeyをまとめて
 `sessions / requests / observed journey`の上位20件をHTML/JSONへ表示します。
 1 journeyは32 step、追跡sessionと共有page辞書は各10,000件に制限され、超過は
@@ -194,9 +207,9 @@ health/partialに残ります。同一page文字列はsession間で共有し、�
 まだ実装しません。最初は例えば`anonymous_browse`、`login_and_browse`、`author_post`を
 別ラベルにし、k6のiterationごとに別の疑似`sess`を付けて比較してください。
 
-`/posts/123`のような動的IDを同じstoryへまとめる場合は、nginx `map`等でログの`uri`を
-`/posts/*`へ正規化します。isutoolsは意味を壊す可能性があるため、proxyログのURIを
-scenario用に勝手には書き換えません。
+`ISUTOOLS_FLOW_SOURCE=proxy`を使う場合だけ、`/posts/123`のような動的IDをnginx `map`または
+`ISUTOOLS_ACCESS_LOG_PATH_RULES`で`/posts/*`へ正規化します。middleware方式はframework adapterが
+`/posts/:id`や`/posts/{id}`を渡します。
 
 `scenario`は64 byte以下、`sess`は128 byte以下の英数字と`._~-`だけを受理します。
 生Cookie、session token、Authorization、email、user IDをそのまま入れてはいけません。
@@ -212,15 +225,16 @@ v1 は Apache の標準 combined log を自動判定しません。`%D` が micr
 nginx と単位が異なるため、推測すると誤集計になるからです。明示 JSON を使います。
 
 ```apache
-LogFormat "{\"method\":\"%m\",\"uri\":\"%U\",\"status\":%>s,\"reqtime_us\":%D,\"bytes\":%B,\"proto\":\"%H\",\"sess\":\"%{X-Isutools-Session}i\",\"scenario\":\"%{X-Isutools-Scenario}i\"}" isutools_json
+LogFormat "{\"schema\":\"isutools.http-access.v1\",\"method\":\"%m\",\"uri\":\"%U\",\"status\":%>s,\"duration_us\":%D,\"bytes\":%B,\"protocol\":\"%H\",\"sess\":\"%{X-Isutools-Session}o\",\"scenario\":\"%{X-Isutools-Scenario}o\"}" isutools_json
 CustomLog /var/log/apache2/isutools.json isutools_json
 ```
 
 そのファイルを `ISUTOOLS_ACCESS_LOG` に指定します。旧 `ISUTOOLS_NGINX_LOG` も
 後方互換で利用でき、両方ある場合は汎用名 `ISUTOOLS_ACCESS_LOG` を優先します。
-`reqtime_us` は parser が seconds へ変換します。`%B` は response body bytes です。
+`ISUTOOLS_ACCESS_LOG_FORMAT=isutools-json-v1`を設定します。`duration_us`はmicroseconds、`%B`はresponse body bytesです。
 `mod_logio` の `%O` は header を含む wire bytes で意味が異なるため、この例では使いません。
 Apache core のこの例からは upstream time / cache status を取得できないため、該当欄は空です。
+末尾の`o`はapplication response headerです。public requestを示す`i`はflow identityに使ってはいけません。
 
 JSON の文字列へ任意 header や生 Cookie を追加するときは、利用する Apache module が
 JSON escape を保証するか確認してください。保証できない値は追加しないでください。

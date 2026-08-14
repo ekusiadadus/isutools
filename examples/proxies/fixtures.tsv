@@ -1,0 +1,13 @@
+# product<TAB>format<TAB>one complete log line
+nginx/OpenResty	isutools-ltsv	method:GET	uri:/items/42	status:200	reqtime:0.025	upstime:0.012	bytes:123	cache:MISS	ctype:application/json	proto:HTTP/2
+Apache/OpenLiteSpeed	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/2","status":200,"duration_us":25000,"bytes":123}
+H2O	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/2","status":200,"duration_sec":0.025,"bytes":123}
+Envoy	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/2","status":200,"duration_ms":25,"bytes":123}
+Caddy	caddy-json	{"request":{"method":"GET","uri":"/items/42","proto":"HTTP/2"},"status":200,"duration":0.025,"size":123}
+HAProxy	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/1.1","status":200,"duration_ms":25,"bytes":123}
+Traefik	traefik-json	{"RequestMethod":"GET","RequestPath":"/items/42","RequestProtocol":"HTTP/2","DownstreamStatus":200,"DownstreamContentSize":123,"Duration":25000000,"OriginDuration":12000000}
+lighttpd	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/1.1","status":200,"duration_us":25000,"bytes":123}
+Varnish	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/1.1","status":200,"duration_us":25000,"bytes":123}
+Apache Traffic Server	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/2","status":200,"duration_ms":25,"bytes":123}
+IIS	iis-w3c	2026-08-14 12:34:56 GET /items/42 200 123 25 HTTP/2
+Squid	isutools-json-v1	{"schema":"isutools.http-access.v1","method":"GET","uri":"/items/42","protocol":"HTTP/1.1","status":200,"duration_ms":25,"bytes":123}

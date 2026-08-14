@@ -53,6 +53,7 @@ type MatrixRow struct {
 	MySQL       State  `json:"mysql"`
 	MariaDB     State  `json:"mariadb"`
 	PostgreSQL  State  `json:"postgresql"`
+	SQLite      State  `json:"sqlite"`
 	Requirement string `json:"requirement"`
 }
 
@@ -60,12 +61,12 @@ type MatrixRow struct {
 // by the UI and copied into the integration guide.
 func CanonicalMatrix() []MatrixRow {
 	return []MatrixRow{
-		{Feature: "sql_aggregate", MySQL: Supported, MariaDB: Supported, PostgreSQL: Supported, Requirement: "database/sql proxy driver"},
-		{Feature: "db_pool", MySQL: Supported, MariaDB: Supported, PostgreSQL: Supported, Requirement: "registered *sql.DB"},
-		{Feature: "schema", MySQL: Supported, MariaDB: Supported, PostgreSQL: Unsupported, Requirement: "MySQL-compatible information_schema"},
-		{Feature: "row_efficiency", MySQL: Supported, MariaDB: Unsupported, PostgreSQL: Unsupported, Requirement: "MySQL performance_schema capability probe"},
-		{Feature: "query_plan", MySQL: Supported, MariaDB: Unsupported, PostgreSQL: Unsupported, Requirement: "MySQL 8.0.17+ and dedicated explain credential"},
-		{Feature: "advisor", MySQL: Supported, MariaDB: Partial, PostgreSQL: Unsupported, Requirement: "dialect-specific rules"},
+		{Feature: "sql_aggregate", MySQL: Supported, MariaDB: Supported, PostgreSQL: Supported, SQLite: Supported, Requirement: "database/sql proxy driver"},
+		{Feature: "db_pool", MySQL: Supported, MariaDB: Supported, PostgreSQL: Supported, SQLite: Supported, Requirement: "registered *sql.DB"},
+		{Feature: "schema", MySQL: Supported, MariaDB: Supported, PostgreSQL: Unsupported, SQLite: Unsupported, Requirement: "MySQL-compatible information_schema"},
+		{Feature: "row_efficiency", MySQL: Supported, MariaDB: Unsupported, PostgreSQL: Unsupported, SQLite: Unsupported, Requirement: "MySQL performance_schema capability probe"},
+		{Feature: "query_plan", MySQL: Supported, MariaDB: Unsupported, PostgreSQL: Unsupported, SQLite: Unsupported, Requirement: "MySQL 8.0.17+ and dedicated explain credential"},
+		{Feature: "advisor", MySQL: Supported, MariaDB: Partial, PostgreSQL: Unsupported, SQLite: Unsupported, Requirement: "dialect-specific rules"},
 	}
 }
 
@@ -125,6 +126,12 @@ func forTarget(info sqlstats.TargetInfo, ev Evidence) Target {
 		for _, feature := range []string{"schema", "row_efficiency", "query_plan", "advisor"} {
 			add(feature, Unsupported, "postgresql-deep-adapter-not-installed")
 		}
+	case "sqlite":
+		add("sql_aggregate", Supported, "database-sql-proxy")
+		add("db_pool", Supported, "database-sql-pool")
+		for _, feature := range []string{"schema", "row_efficiency", "query_plan", "advisor"} {
+			add(feature, Unsupported, "sqlite-deep-adapter-not-installed")
+		}
 	default:
 		for _, feature := range []string{"sql_aggregate", "db_pool", "schema", "row_efficiency", "query_plan", "advisor"} {
 			add(feature, Unverified, "unknown-dialect")
@@ -140,6 +147,8 @@ func dialectFor(driver string) (string, string) {
 		return "mysql", "mysql-compatible"
 	case value == "pgx", strings.Contains(value, "postgres"), strings.Contains(value, "pq"):
 		return "postgresql", "postgresql"
+	case strings.Contains(value, "sqlite"):
+		return "sqlite", "sqlite"
 	default:
 		return "unknown", "unknown"
 	}
