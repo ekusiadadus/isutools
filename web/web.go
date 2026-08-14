@@ -66,6 +66,7 @@ const (
 	SaveReasonDataDirUnset      = "data-dir-unset"
 	SaveReasonInvalidPass       = "invalid-pass"
 	SaveReasonRunNotActive      = "run-not-active"
+	SaveReasonRunAlreadySaved   = "run-already-saved"
 	SaveReasonMutationBusy      = "mutation-busy"
 	SaveReasonSnapshotTooLarge  = "snapshot-too-large"
 	SaveReasonPersistFailed     = "persist-failed"
@@ -672,7 +673,13 @@ type handler struct {
 	// boundary fixed. A flush after that point would read log lines the
 	// boundary already excluded straight into the generation the coordinator
 	// is about to cut, so /collect refuses until the next reset.
-	runEnded   atomic.Bool
+	runEnded atomic.Bool
+	// runSaved fences the one benchmark outcome publication belonging to the
+	// coordinated run opened by the latest reset. FinishRun replay is
+	// intentionally idempotent, but /save must not turn that replay into a new
+	// score/pass artifact for the same run ID. Legacy providers whose save has
+	// no run ID keep their historical multi-save behavior.
+	runSaved   atomic.Bool
 	operation  chan struct{}
 	curDB      *dbinspect.Schema
 	curAdvisor []advisor.Check
@@ -1356,6 +1363,10 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	// collector generations.
 	h.resetMu.Lock()
 	defer h.resetMu.Unlock()
+	if h.runSaved.Load() {
+		h.writeAdminError(w, r, http.StatusConflict, SaveReasonRunAlreadySaved, "")
+		return
+	}
 	// Fix the boundary before waiting for the immutable snapshot. Runtime
 	// profiles must close here, while the background drain is still in flight;
 	// taking them after CompleteRun would include the collector's own teardown.
@@ -1463,6 +1474,9 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeAdminError(w, r, http.StatusInternalServerError, SaveReasonPersistFailed, run.RunID)
 		return
+	}
+	if run.RunID != "" {
+		h.runSaved.Store(true)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Isutools-Snapshot-SHA256", publication.SnapshotSHA256)
@@ -1745,6 +1759,7 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	// The generations are fresh again, so a flush has somewhere to land even
 	// when the run itself could not be opened.
 	h.runEnded.Store(false)
+	h.runSaved.Store(false)
 	// The opening runtime profiles are taken here, after the boundary is fixed
 	// and immediately before the response: the benchmarker starts loading when
 	// it sees the response, so anything captured later would already contain

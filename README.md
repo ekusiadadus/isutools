@@ -152,6 +152,14 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 | `ISUTOOLS_ACCESS_LOG` | proxy access log |
 | `ISUTOOLS_FLOW_LABELS` | User Flow / Scenario Storiesを`on` / `off` / `auto` |
 | `ISUTOOLS_PPROF_SECONDS` | benchmark区間のCPU profile秒数 |
+
+### CPU profileがないとき（`cpu-busy`）
+
+`cpu-busy`はCPU使用率が高いという意味ではありません。同じGoプロセスで、前のrunまたは
+手動`/pprof/profile`がprocess-wide CPU profilerを使っているため、新しい採取を開始できない状態です。
+別の採取が終わるのを待ち、`POST /reset`の応答で
+`X-Isutools-CPU-Profile-State: capturing`を確認してから、ベンチ、`POST /save`、
+`isutools-pprof`解析の順で1回だけ再計測してください。
 | `ISUTOOLS_TIMELINE` | boundedなrun時系列をopt-in |
 
 全設定、API、endpoint、EXPLAIN権限、複数台構成はREADMEへ重複させず、次へ集約しています。
@@ -162,6 +170,7 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 - [現場フィードバックと運用上の注意](./docs/FIELD_FEEDBACK.md)
 - [private-isu例](./examples/private-isu/README.md)
 - [ISUCON13 WSL2例](./examples/isucon13-wsl/README.md)
+- [2026-08-14 ISUCON13現場指摘の最終監査](./docs/isucon13-field-audit-20260814.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 
 ## 開発

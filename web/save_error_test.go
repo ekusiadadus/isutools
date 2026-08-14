@@ -131,3 +131,63 @@ func TestSaveBusyUsesMachineReadableReason(t *testing.T) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
+
+func TestCoordinatedRunCannotPublishTwoBenchmarkOutcomes(t *testing.T) {
+	dir := t.TempDir()
+	starter := &fakeRunStarter{id: "run-save-once"}
+	terminator := &fakeRunTerminator{id: starter.id}
+	h := NewHandler(Provider{
+		SQL:         agg.NewTable(agg.DefaultMaxKeys),
+		DataDir:     dir,
+		StartRun:    starter.start,
+		FinishRun:   terminator.finish,
+		CompleteRun: terminator.complete,
+		Sections:    terminator.sections,
+	})
+
+	reset := httptest.NewRecorder()
+	h.ServeHTTP(reset, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if reset.Code != http.StatusNoContent {
+		t.Fatalf("reset status = %d: %s", reset.Code, reset.Body.String())
+	}
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/save?score=12941&pass=true", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first save status = %d: %s", first.Code, first.Body.String())
+	}
+	before, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replay := httptest.NewRecorder()
+	h.ServeHTTP(replay, httptest.NewRequest(http.MethodPost, "/save?score=1710&pass=true", nil))
+	if replay.Code != http.StatusConflict {
+		t.Fatalf("replay status = %d, want 409: %s", replay.Code, replay.Body.String())
+	}
+	response := decodeAdminError(t, replay)
+	if response.Reason != SaveReasonRunAlreadySaved || replay.Header().Get(AdminReasonHeader) != SaveReasonRunAlreadySaved {
+		t.Fatalf("replay reason body=%q header=%q", response.Reason, replay.Header().Get(AdminReasonHeader))
+	}
+	after, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("replay published files: before=%d after=%d", len(before), len(after))
+	}
+	if terminator.finishes != 1 || terminator.completes != 1 {
+		t.Fatalf("replay touched coordinator: finish=%d complete=%d", terminator.finishes, terminator.completes)
+	}
+
+	nextReset := httptest.NewRecorder()
+	h.ServeHTTP(nextReset, httptest.NewRequest(http.MethodPost, "/reset", nil))
+	if nextReset.Code != http.StatusNoContent {
+		t.Fatalf("next reset status = %d: %s", nextReset.Code, nextReset.Body.String())
+	}
+	nextSave := httptest.NewRecorder()
+	h.ServeHTTP(nextSave, httptest.NewRequest(http.MethodPost, "/save?score=13000&pass=true", nil))
+	if nextSave.Code != http.StatusOK {
+		t.Fatalf("next run save status = %d: %s", nextSave.Code, nextSave.Body.String())
+	}
+}

@@ -2,7 +2,8 @@
 
 Updated: 2026-08-14
 
-This guide is the operational contract for issues #19–#29. Every feature is
+This guide is the operational contract for issues #19–#30 and the ISUCON13
+follow-ups in #39–#42. Every feature is
 bounded, opt-in where it opens a listener or adds database work, and emits
 stable reason codes instead of configuration values, DSNs, cookies, or tokens.
 
@@ -10,6 +11,8 @@ The merged implementation was exercised on the existing Windows/WSL2
 private-isu host on 2026-08-14. The exact revisions, commands, durable hashes,
 screenshots, copied-file locations, and evidence limits are recorded in
 [the field verification report](./private-isu-field-verification-20260814.md).
+The final single-host ISUCON13 WSL2 rerun and its explicit evidence boundaries
+are recorded in [the ISUCON13 field audit](./isucon13-field-audit-20260814.md).
 
 ## Safe global shutdown and `/save` diagnosis
 
@@ -22,12 +25,16 @@ not start admin or peer listeners, and makes counters/watch APIs no-ops.
 | HTTP | reason | operator action |
 |---|---|---|
 | 400 | `data-dir-unset` / `invalid-pass` | set `ISUTOOLS_DATA_DIR`; pass only `true` or `false` |
-| 409 | `run-not-active` / `mutation-busy` | take one reset→bench→save boundary; do not overlap mutations |
+| 409 | `run-not-active` / `run-already-saved` / `mutation-busy` | take one reset→bench→save boundary; do not replay a saved run or overlap mutations |
 | 413 | `snapshot-too-large` | inspect dropped/oversized sections; the 32 MiB cap is not bypassed |
 | 500 | `persist-failed` | verify the data directory, filesystem and free space |
 
 Successful publication reports `saved`. Underlying errors and request query
 values are excluded from both the response and the bounded audit record.
+A coordinated run publishes exactly one score/pass outcome. A later `/save`
+for the same run is rejected as `run-already-saved` without writing another
+artifact; `POST /reset` opens the next publication boundary. Legacy handlers
+without a run ID keep their historical explicit snapshot behavior.
 
 ## Access-log URI grouping and SQL comment policy
 
@@ -48,6 +55,11 @@ SQL normalization always removes comments. The default
 `/* controller:chairs */` for grouping; `off` removes every comment without a
 tag prefix. Hints, arbitrary
 comments, control bytes, and oversized tags are never retained.
+
+After comment removal and literal masking, placeholder-only `IN` and `NOT IN`
+lists are canonicalized to one arity-independent `IN (?)` key. This includes
+`IN /* */ (?, ?, ?)`, MySQL `?`, PostgreSQL positional parameters, and literal
+lists. Subqueries and row constructors remain distinct.
 
 ## Go router and framework-neutral route templates
 
@@ -107,6 +119,10 @@ waits a bounded 100 ms for a previous requested stop. If ownership remains,
 the new run is explicitly recorded as `skipped/cpu-busy`; a later retry can
 start after the owner releases. `/reset` exposes
 `X-Isutools-CPU-Profile-State` and `X-Isutools-CPU-Profile-Code`.
+Here, `cpu-busy` means process-local profiler ownership contention, not high
+host CPU utilization. Wait for the other capture to finish, then confirm
+`X-Isutools-CPU-Profile-State: capturing` on `POST /reset` before running the
+benchmark, `POST /save`, and `isutools-pprof` analysis once.
 
 The external analyzer publishes a deterministic bounded flame tree only when
 the input profile hashes and capture executable match. CPU uses interval

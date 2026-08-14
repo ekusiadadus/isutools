@@ -90,7 +90,7 @@ run profile manifestは`state=published`、`durability=durable`、coverage `comp
 run modeを一時的にoffにして5秒captureを取得できましたが、idle中でsample 0のため、これは
 endpointとcopy経路だけの確認です。通常の解析には上記run profileを使います。
 
-`ISUTOOLS_OFF=1`の一時systemd overrideでは、競技HTTPSを維持したまま管理listenerが消えることを
+`ISUTOOLS=off`の一時systemd overrideでは、競技HTTPSを維持したまま管理listenerが消えることを
 確認し、override削除後に元のrun modeへ戻しました。一時overrideは検証後に残していません。
 
 Windows SSH daemonとWSLが別network namespaceなので、単純な

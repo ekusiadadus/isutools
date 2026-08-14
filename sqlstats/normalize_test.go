@@ -99,3 +99,64 @@ func TestNormalizeCacheReturnsSameResult(t *testing.T) {
 		t.Errorf("normalize = %q", first)
 	}
 }
+
+func TestNormalizeCollapsesPlaceholderOnlyINLists(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "mysql variable arity",
+			in:   "SELECT * FROM tags WHERE id IN (?, ?, ?)",
+			want: "SELECT * FROM tags WHERE id IN (?)",
+		},
+		{
+			name: "empty comment before expanded placeholders",
+			in:   "SELECT * FROM tags WHERE id IN /* */ (?, ?, ?)",
+			want: "SELECT * FROM tags WHERE id IN (?)",
+		},
+		{
+			name: "literal list",
+			in:   "SELECT * FROM tags WHERE id NOT IN (10, 20, 30)",
+			want: "SELECT * FROM tags WHERE id NOT IN (?)",
+		},
+		{
+			name: "quoted literal list",
+			in:   "SELECT * FROM tags WHERE name IN ('red', 'green', 'blue')",
+			want: "SELECT * FROM tags WHERE name IN (?)",
+		},
+		{
+			name: "postgres positional placeholders",
+			in:   "SELECT * FROM tags WHERE id IN ($1, $2, $3)",
+			want: "SELECT * FROM tags WHERE id IN (?)",
+		},
+		{
+			name: "subquery remains distinct",
+			in:   "SELECT * FROM tags WHERE id IN (SELECT tag_id FROM livestream_tags WHERE livestream_id = ?)",
+			want: "SELECT * FROM tags WHERE id IN (SELECT tag_id FROM livestream_tags WHERE livestream_id = ?)",
+		},
+		{
+			name: "row constructor remains distinct",
+			in:   "SELECT * FROM pairs WHERE (a, b) IN ((?, ?), (?, ?))",
+			want: "SELECT * FROM pairs WHERE (a, b) IN ((?, ?), (?, ?))",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := computeNormalizeWithPolicy(tt.in, CommentTagsOff); got != tt.want {
+				t.Fatalf("normalize(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeINListRespectsCommentTagPolicy(t *testing.T) {
+	query := "SELECT * FROM tags WHERE id IN /* lookupTags */ (?, ?, ?)"
+	if got := computeNormalizeWithPolicy(query, CommentTagsOn); got != "[lookupTags] SELECT * FROM tags WHERE id IN (?)" {
+		t.Fatalf("tag-on normalize = %q", got)
+	}
+	if got := computeNormalizeWithPolicy(query, CommentTagsOff); got != "SELECT * FROM tags WHERE id IN (?)" {
+		t.Fatalf("tag-off normalize = %q", got)
+	}
+}

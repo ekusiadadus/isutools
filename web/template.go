@@ -240,13 +240,18 @@ func codeEvidence(manifest *ProfileManifest) (level, title, evidence, action str
 		if code == "" {
 			code = "unknown"
 		}
+		if code == "cpu-busy" {
+			return "warn", "コード位置: CPU profileなし（採取が競合）",
+				fmt.Sprintf("このrunでは、同じGoプロセスのCPU profilerが別のCPU profile採取（前のrun、または手動 /pprof/profile）に使われていたため、新しい採取を開始できませんでした（status=%s / code=%s）。これはCPU使用率が高すぎることが原因ではありません。", cpu.Status, code),
+				"別の採取が終わるのを待ち、同時に1本だけにします。次に 1) POST /reset 2) 応答が X-Isutools-CPU-Profile-State: capturing であることを確認 3) ベンチ実行 4) POST /save 5) 保存したrunをisutools-pprofで解析、の順で再計測します。再びcpu-busyなら、手動profileの実行中プロセスか前runの停止待ちをProfilesで確認します。" + requirement
+		}
 		return "hot", "コード位置: CPU profile採取失敗",
 			fmt.Sprintf("CPU profileはstatus=%s / code=%sで、行解析に使えるartifactがありません。", cpu.Status, code),
 			"Profilesのcapture状態を直してから再計測します。" + requirement
 	}
-	return "ok", "コード位置: CPU artifactあり・解析待ち",
-		fmt.Sprintf("%s をline granularityで解析すれば、function / file / lineを表示できます。artifactがあるだけでは行番号は未検証です。", cpu.File),
-		"isutools-pprofを実行後、このrunを開き直して行解析結果を確認します。" + requirement
+	return "ok", "コード位置: CPU artifactあり",
+		fmt.Sprintf("%s を採取済みです。artifactだけでは行番号は未検証です。", cpu.File),
+		"このrunの「行解析結果」にverified analysisがあればfunction / file / lineを確認します。なければisutools-pprofを実行してから開き直します。" + requirement
 }
 
 func humanCount(value int64) string {
