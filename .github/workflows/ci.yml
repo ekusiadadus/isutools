@@ -20,6 +20,11 @@ jobs:
         working-directory: adapters/gin
       - run: go test ./...
         working-directory: adapters/chiv5
+      - name: Historical ISUCON framework adapters (Go 1.24)
+        run: |
+          for module in echov3 gorillamux httprouter gojiv2 martini; do
+            (cd "adapters/$module" && go test ./...)
+          done
 
   linux-cgroup-worker:
     runs-on: ubuntu-latest
@@ -55,6 +60,21 @@ jobs:
         run: go test -race ./...
       - name: chi v5 adapter
         working-directory: adapters/chiv5
+        run: go test -race ./...
+      - name: Echo v3 adapter
+        working-directory: adapters/echov3
+        run: go test -race ./...
+      - name: Gorilla mux adapter
+        working-directory: adapters/gorillamux
+        run: go test -race ./...
+      - name: httprouter adapter
+        working-directory: adapters/httprouter
+        run: go test -race ./...
+      - name: Goji v2 adapter
+        working-directory: adapters/gojiv2
+        run: go test -race ./...
+      - name: Martini adapter
+        working-directory: adapters/martini
         run: go test -race ./...
       - name: coverage gate (80%)
         run: |
@@ -115,3 +135,37 @@ jobs:
         env:
           ISUTOOLS_INTEGRATION_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/?parseTime=true
         run: go test -tags=integration -count=1 ./integration/trajectorysql -run '^TestISUCON14TrajectoryExportExecutesOnMySQL8$'
+
+  sql-compat-integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-alpine
+        env:
+          POSTGRES_USER: isutools
+          POSTGRES_PASSWORD: isutools
+          POSTGRES_DB: isutools
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U isutools -d isutools"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: PostgreSQL and SQLite database/sql instrumentation
+        working-directory: integration/sqlcompat
+        env:
+          ISUTOOLS_INTEGRATION_POSTGRES_DSN: postgres://isutools:isutools@127.0.0.1:5432/isutools?sslmode=disable
+        run: go test -count=1 ./...
+
+  proxy-config-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native validation for published ISUCON proxy families
+        run: bash integration/test-proxy-configs.sh

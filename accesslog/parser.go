@@ -1,5 +1,4 @@
-// Package accesslog parses and aggregates explicitly configured nginx LTSV,
-// flat JSON, Caddy native JSON, and explicit Apache JSON access logs.
+// Package accesslog parses and aggregates explicitly configured proxy logs.
 // Collection is pull based, so it adds no work to an application's HTTP path.
 package accesslog
 
@@ -105,17 +104,13 @@ func ParseNginxJSON(line string) (Record, error) {
 		return Record{}, fmt.Errorf("accesslog: invalid JSON line: %w", err)
 	}
 	fields := make(map[string]string, len(raw))
-	// Caddy's native access log nests client request fields. Flatten only the
-	// bounded fields isutools understands; unknown and sensitive headers remain
-	// ignored.
+	// Auto mode retains native Caddy compatibility. Flow labels are intentionally
+	// read only from application response headers: request headers are controlled
+	// by the public client and are therefore not trustworthy identities.
 	if request, ok := raw["request"].(map[string]any); ok {
 		copyJSONScalar(fields, "method", request["method"])
 		copyJSONScalar(fields, "uri", request["uri"])
 		copyJSONScalar(fields, "proto", request["proto"])
-		if headers, ok := request["headers"].(map[string]any); ok {
-			copyFirstJSONHeader(fields, "sess", headers, "X-Isutools-Session")
-			copyFirstJSONHeader(fields, "scenario", headers, "X-Isutools-Scenario")
-		}
 	}
 	for key, value := range raw {
 		if alias, ok := jsonAliases[key]; ok {
@@ -140,6 +135,8 @@ func ParseNginxJSON(line string) (Record, error) {
 		if values, ok := headers["Content-Type"].([]any); ok && len(values) > 0 {
 			copyJSONScalar(fields, "ctype", values[0])
 		}
+		copyFirstJSONHeader(fields, "sess", headers, "X-Isutools-Session")
+		copyFirstJSONHeader(fields, "scenario", headers, "X-Isutools-Scenario")
 	}
 	if _, ok := fields["reqtime"]; !ok {
 		if micros, exists := fields["reqtime_us"]; exists {

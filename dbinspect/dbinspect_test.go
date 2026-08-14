@@ -77,7 +77,7 @@ func TestFlavorOf(t *testing.T) {
 		{"mysql:isutools", "mysql"},
 		{"pgx", "postgres"},
 		{"postgres", "postgres"},
-		{"sqlite3", "unknown"},
+		{"sqlite3", "sqlite"},
 	}
 	for _, tt := range tests {
 		if got := flavorOf(tt.driver); got != tt.want {

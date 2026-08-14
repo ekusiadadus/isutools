@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ekusiadadus/isutools/httpstats"
 	writercap "github.com/ekusiadadus/isutools/internal/httpwriter"
 )
 
@@ -55,6 +56,23 @@ type Adapter struct {
 	sessionEnabled bool
 	bypass         bool
 	health         Health
+	observer       Observer
+}
+
+// Observer receives only the HMAC pseudonym, bounded scenario, method, and
+// registered route template after the application handler completes.
+type Observer interface {
+	Observe(session, scenario, method, route string)
+}
+
+// WithObserver returns a shallow copy with one run-aligned flow sink.
+func (a *Adapter) WithObserver(observer Observer) *Adapter {
+	if a == nil {
+		return a
+	}
+	copy := *a
+	copy.observer = observer
+	return &copy
 }
 
 // New validates the source cookie and HMAC key. Invalid configuration is a
@@ -180,7 +198,15 @@ func (a *Adapter) Middleware(next http.Handler) http.Handler {
 		writer := &trustedWriter{ResponseWriter: w, label: label, scenario: state}
 		defer writer.commit()
 		next.ServeHTTP(preserveOptionalInterfaces(writer), r)
+		if a != nil && a.observer != nil && label != "" {
+			observeSafely(a.observer, label, state.get(), r.Method, httpstats.RoutePattern(r))
+		}
 	})
+}
+
+func observeSafely(observer Observer, session, scenario, method, route string) {
+	defer func() { _ = recover() }()
+	observer.Observe(session, scenario, method, route)
 }
 
 // SetScenario assigns a bounded, non-secret scenario to the current request.

@@ -1,6 +1,7 @@
 // Package sqlstats wraps database/sql drivers with a measuring proxy and
 // aggregates every query into an in-memory table. Works with any driver
-// (MySQL/MariaDB via go-sql-driver, PostgreSQL via pgx stdlib or lib/pq).
+// (MySQL/MariaDB via go-sql-driver, PostgreSQL via pgx stdlib or lib/pq,
+// and SQLite drivers). Native clients that bypass database/sql are not wrapped.
 package sqlstats
 
 import (

@@ -1079,8 +1079,8 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 
 <h2>DB Schema <span class="meta">(captured at generation start)</span></h2>
 <details><summary>Database capability matrix</summary>
-<table><thead><tr><th>feature</th><th>MySQL</th><th>MariaDB</th><th>PostgreSQL</th><th>requirement</th></tr></thead><tbody>
-{{range .Snapshot.DBCapabilityMatrix}}<tr><td class="l">{{.Feature}}</td><td>{{.MySQL}}</td><td>{{.MariaDB}}</td><td>{{.PostgreSQL}}</td><td class="l">{{.Requirement}}</td></tr>{{end}}
+<table><thead><tr><th>feature</th><th>MySQL</th><th>MariaDB</th><th>PostgreSQL</th><th>SQLite</th><th>requirement</th></tr></thead><tbody>
+{{range .Snapshot.DBCapabilityMatrix}}<tr><td class="l">{{.Feature}}</td><td>{{.MySQL}}</td><td>{{.MariaDB}}</td><td>{{.PostgreSQL}}</td><td>{{.SQLite}}</td><td class="l">{{.Requirement}}</td></tr>{{end}}
 </tbody></table>
 {{if .Snapshot.DBCapabilities}}<h3>Registered targets</h3>
 {{range .Snapshot.DBCapabilities}}<p class="meta"><strong>{{.TargetID}}</strong> dialect={{.Dialect}} flavor={{.Flavor}} version={{.Version}}</p>
@@ -1231,6 +1231,18 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 </table>
 {{else}}<p class="empty">no counters (アプリで isutools.Count("cache_hit") 等を呼ぶとここに出ます)</p>{{end}}
 
+<h2>Redis / Key-Value Commands <span class="meta">(command名のみ。key/value/argumentは保存しません)</span></h2>
+{{if .Snapshot.Redis}}
+<table>
+<thead><tr><th>total(ms)</th><th>count</th><th>errors</th><th>avg(ms)</th><th>p95*(ms)</th><th>command</th></tr></thead>
+<tbody>{{range .Snapshot.Redis}}<tr>
+<td data-v="{{.Total.Nanoseconds}}">{{ms .Total}}</td><td data-v="{{.Count}}">{{.Count}}</td>
+<td data-v="{{.ErrorCount}}"{{if .ErrorCount}} class="flag"{{end}}>{{.ErrorCount}}</td>
+<td data-v="{{.Avg.Nanoseconds}}">{{ms .Avg}}</td><td data-v="{{.P95.Nanoseconds}}">{{ms .P95}}</td><td class="l">{{.Command}}</td>
+</tr>{{end}}</tbody>
+</table>
+{{else}}<p class="empty">no Redis observations (isutools.ObserveRedis / MeasureRedis)</p>{{end}}
+
 <h2>Proxy Access Log</h2>
 {{if .Snapshot.AccessLog}}
 <p class="meta">status {{.Snapshot.AccessLog.Health.Status}} &middot; lines {{.Snapshot.AccessLog.Lines}} &middot; dropped {{.Snapshot.AccessLog.Health.Dropped}} &middot; {{.Snapshot.AccessLog.Health.Message}}</p>
@@ -1246,21 +1258,21 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 {{else}}<p class="empty">not configured (set ISUTOOLS_ACCESS_LOG)</p>{{end}}
 
 <h2>Scenario Stories <span class="meta">(明示scenarioラベル別の実測request列。疑似sessが必要)</span></h2>
-{{if and .Snapshot.AccessLog .Snapshot.AccessLog.Stories}}
+{{if .Snapshot.ScenarioStories}}
 <table>
 <thead><tr><th>sessions</th><th>requests</th><th>scenario</th><th>observed journey</th></tr></thead>
-<tbody>{{range .Snapshot.AccessLog.Stories}}<tr>
+<tbody>{{range .Snapshot.ScenarioStories}}<tr>
 <td data-v="{{.Sessions}}">{{.Sessions}}</td><td data-v="{{.Requests}}">{{.Requests}}</td><td class="l">{{.Scenario}}</td>
 <td class="l">{{range $i, $step := .Journey}}{{if $i}} &rarr; {{end}}{{$step}}{{end}}</td>
 </tr>{{end}}</tbody>
 </table>
-{{else}}<p class="empty">no scenario story data (proxy logに安全なsess:とscenario:を追加)</p>{{end}}
+{{else}}<p class="empty">no scenario story data (middlewareに疑似sessionとscenarioを設定)</p>{{end}}
 
-<h2>User Flow <span class="meta">(セッション毎のページ遷移 上位20。proxy ログの sess: フィールドが必要)</span></h2>
-{{if and .Snapshot.AccessLog .Snapshot.AccessLog.Flows}}
+<h2>User Flow <span class="meta">(疑似session毎のroute template遷移 上位20)</span></h2>
+{{if .Snapshot.UserFlows}}
 <table>
 <thead><tr><th>count</th><th>from</th><th></th><th>to</th></tr></thead>
-<tbody>{{range .Snapshot.AccessLog.Flows}}<tr>
+<tbody>{{range .Snapshot.UserFlows}}<tr>
 <td data-v="{{.Count}}">{{.Count}}</td><td class="l">{{.From}}</td><td>&rarr;</td><td class="l">{{.To}}</td>
 </tr>{{end}}</tbody>
 </table>

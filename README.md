@@ -60,17 +60,20 @@ JSON、live dashboard、自己完結HTMLは同じrunから生成されます。�
 
 ## User Flow / Scenario Stories
 
-`isutools.HTTP`はCookieをHMAC疑似sessionへ変換できます。生Cookieやsession tokenを
-proxy logへ書かず、機能だけを環境変数でON/OFFできます。
+`isutools.HTTP`はmiddlewareでCookieをHMAC疑似sessionへ変換し、登録済みroute templateと
+一緒にアプリ内で集計します。生Cookieやsession tokenをproxy logへ書かず、nginx以外でも
+同じUser Flow / Scenario Storiesを取得できます。
 
 ```bash
 export ISUTOOLS_FLOW_LABELS=on
 export ISUTOOLS_SESSION_COOKIE=SESSIONID
 export ISUTOOLS_SESSION_HMAC_KEY='32-byte以上のgitへ入れない乱数'
 export ISUTOOLS_SCENARIO=isucon13_official
+export ISUTOOLS_FLOW_SOURCE=middleware
 ```
 
-handler単位のscenarioとrouter templateには、Echo v4/v5、Gin、chi v5 adapterがあります。
+handler単位のscenarioとrouter templateには、全公開ISUCONで使われたGorilla mux、Martini、
+Goji v2、Echo v3/v4/v5、httprouter、chi v5に加えてGin adapterがあります。
 
 ```go
 echov4.Install(e)
@@ -85,7 +88,9 @@ r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 
 `ISUTOOLS_FLOW_LABELS=off`ならflow label処理だけを停止し、`ISUTOOLS=off`なら全計測を停止します。
 public clientが送った`X-Isutools-Session` / `X-Isutools-Scenario`は信用しません。
-nginx設定と閉じたk6 edgeの例は[導入ガイド](./docs/INTEGRATION.md#user-flow-の-sess)を参照してください。
+`ISUTOOLS_FLOW_SOURCE=proxy`は従来のtrusted response header方式、`off`はflow集計停止です。
+全ISUCON回とproxyの一覧は[互換性表](./docs/isucon-compatibility.md)、設定断片は
+[proxy例](./examples/proxies/README.md)を参照してください。
 
 ## 実測ストーリー
 
@@ -135,9 +140,9 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 
 | 領域 | 対応 |
 |---|---|
-| Database | MySQL / MariaDB / PostgreSQL (`database/sql`) |
-| HTTP | Go `net/http`、Echo v4/v5、Gin、chi v5 |
-| Proxy log | nginx / Caddy / Apache / Envoyの明示形式 |
+| Database / KV | MySQL / MariaDB / PostgreSQL / SQLite (`database/sql`)、Redis command collector |
+| HTTP | Go `net/http`、Gorilla mux、Martini、Goji v2、Echo v3/v4/v5、httprouter、Gin、chi v5 |
+| Proxy log | nginx/OpenResty、Apache/OpenLiteSpeed、H2O、Envoy、Caddy、HAProxy、Traefik、lighttpd、Varnish、ATS、IIS、Squid |
 | Runtime | CPU、mutex、block、heap pprof |
 | Host | Linux procfs / sysfs / cgroup v2、network、DB pool |
 | Output | Live dashboard、JSON、自己完結HTML、run間diff、multi-host hub |
@@ -150,7 +155,9 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 | `ISUTOOLS_ADDR` | 管理server。既定`127.0.0.1:19191` |
 | `ISUTOOLS_DATA_DIR` | snapshot / profileの永続保存先 |
 | `ISUTOOLS_ACCESS_LOG` | proxy access log |
+| `ISUTOOLS_ACCESS_LOG_FORMAT` | 明示decoder (`isutools-ltsv` / `isutools-json-v1` / `caddy-json` / `traefik-json` / `iis-w3c`) |
 | `ISUTOOLS_FLOW_LABELS` | User Flow / Scenario Storiesを`on` / `off` / `auto` |
+| `ISUTOOLS_FLOW_SOURCE` | flow集計元。既定`auto`、`middleware` / `proxy` / `off` |
 | `ISUTOOLS_PPROF_SECONDS` | benchmark区間のCPU profile秒数 |
 | `ISUTOOLS_TIMELINE` | boundedなrun時系列をopt-in |
 
@@ -172,7 +179,7 @@ go test -race ./...
 go vet ./...
 ```
 
-adapterは独立Go moduleです。CIではroot、Echo v4/v5、Gin、chi v5を個別に検証します。
+adapterは独立Go moduleです。CIではrootと全framework adapterを個別に検証します。
 
 ## License
 

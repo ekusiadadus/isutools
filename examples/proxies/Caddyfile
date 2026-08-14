@@ -1,0 +1,7 @@
+:80 {
+	log {
+		output file /var/log/caddy/isutools-access.jsonl
+		format json
+	}
+	reverse_proxy 127.0.0.1:8080
+}

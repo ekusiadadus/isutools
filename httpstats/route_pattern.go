@@ -77,3 +77,13 @@ func routePattern(request *http.Request) string {
 	}
 	return request.Pattern
 }
+
+// RoutePattern returns the registered route template shared with outer
+// middleware. It never falls back to URL.Path, which may contain secrets and
+// creates unbounded cardinality. Unmatched requests use a constant identity.
+func RoutePattern(request *http.Request) string {
+	if pattern := strings.TrimSpace(routePattern(request)); safeConstantRoute(pattern) && strings.HasPrefix(pattern, "/") {
+		return pattern
+	}
+	return RouteNotFound
+}

@@ -1,0 +1,2 @@
+# ExecStart fragment for varnishncsa. -j JSON-escapes string substitutions.
+ExecStart=/usr/bin/varnishncsa -j -a -w /var/log/varnish/isutools-access.jsonl -F '{"schema":"isutools.http-access.v1","method":"%m","uri":"%U","protocol":"%H","status":%s,"duration_us":%D,"bytes":%b}'

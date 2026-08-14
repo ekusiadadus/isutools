@@ -27,6 +27,7 @@ import (
 	"github.com/ekusiadadus/isutools/dbcap"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
+	"github.com/ekusiadadus/isutools/flowstats"
 	"github.com/ekusiadadus/isutools/hoststats"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -38,6 +39,7 @@ import (
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
+	"github.com/ekusiadadus/isutools/redisstats"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 )
@@ -165,6 +167,9 @@ type Provider struct {
 	SQLGenerationManaged      bool
 	HTTPGenerationManaged     bool
 	CountersGenerationManaged bool
+	RedisGenerationManaged    bool
+	FlowGenerationManaged     bool
+	FlowSource                string
 	Health                    *health.Registry
 	HTTP                      httpCollector
 	AccessLog                 accessLogCollector
@@ -213,6 +218,16 @@ type Provider struct {
 	// generation.
 	Counters interface {
 		Snapshot() []counters.Entry
+		Reset()
+	}
+	// Redis exposes sanitized command-only latency aggregates.
+	Redis interface {
+		Snapshot() []redisstats.Entry
+		Reset()
+	}
+	// Flow exposes proxy-independent middleware journeys.
+	Flow interface {
+		Snapshot() flowstats.Snapshot
 		Reset()
 	}
 	// DataDir persists snapshots for the dashboard history ("" = disabled).
@@ -434,6 +449,9 @@ type Snapshot struct {
 	DBCapabilityMatrix []dbcap.MatrixRow       `json:"db_capability_matrix,omitempty"`
 	Advisor            []advisor.Check         `json:"advisor,omitempty"`
 	Counters           []counters.Entry        `json:"counters,omitempty"`
+	Redis              []redisstats.Entry      `json:"redis,omitempty"`
+	Flow               *flowstats.Snapshot     `json:"flow,omitempty"`
+	FlowSource         string                  `json:"flow_source,omitempty"`
 	Connections        *httpstats.ConnSnapshot `json:"connections,omitempty"`
 	SQL                []agg.Entry             `json:"sql"`
 	HTTP               httpstats.Snapshot      `json:"http,omitempty"`
@@ -460,6 +478,64 @@ type Snapshot struct {
 	// statements on the measured database.
 	QueryPlan *queryplan.Section     `json:"queryplan,omitempty"`
 	Peers     []multihost.PeerResult `json:"peers,omitempty"`
+}
+
+// ScenarioStories enforces the configured source. Auto mode prefers the
+// proxy-independent middleware collector and falls back to legacy proxy-log
+// labels only when middleware produced no observations.
+func (s Snapshot) ScenarioStories() []accesslog.StoryEntry {
+	switch s.FlowSource {
+	case "middleware":
+		if s.Flow != nil {
+			return s.Flow.Stories
+		}
+		return nil
+	case "proxy":
+		if s.AccessLog != nil {
+			return s.AccessLog.Stories
+		}
+		return nil
+	case "off":
+		return nil
+	}
+	if s.FlowSource != "" && s.FlowSource != "auto" {
+		return nil
+	}
+	if s.Flow != nil && (len(s.Flow.Stories) > 0 || s.Flow.StoryDropped > 0) {
+		return s.Flow.Stories
+	}
+	if s.AccessLog != nil {
+		return s.AccessLog.Stories
+	}
+	return nil
+}
+
+// UserFlows follows the same single-source preference as ScenarioStories.
+func (s Snapshot) UserFlows() []accesslog.FlowEntry {
+	switch s.FlowSource {
+	case "middleware":
+		if s.Flow != nil {
+			return s.Flow.Flows
+		}
+		return nil
+	case "proxy":
+		if s.AccessLog != nil {
+			return s.AccessLog.Flows
+		}
+		return nil
+	case "off":
+		return nil
+	}
+	if s.FlowSource != "" && s.FlowSource != "auto" {
+		return nil
+	}
+	if s.Flow != nil && (len(s.Flow.Flows) > 0 || s.Flow.FlowDropped > 0) {
+		return s.Flow.Flows
+	}
+	if s.AccessLog != nil {
+		return s.AccessLog.Flows
+	}
+	return nil
 }
 
 // applyRunSections copies a completed run's baseline collector sections into
@@ -535,6 +611,20 @@ func applyRunIntervalSections(snap *Snapshot, sections map[string]any) {
 				Message: "name limit exceeded; identities merged into (other)", Dropped: frozen.Dropped,
 			})
 		}
+	}
+	if frozen, ok := sections[redisstats.SectionName].(redisstats.Frozen); ok {
+		snap.Redis = frozen.Entries
+		if frozen.Dropped > 0 {
+			snap.Meta.Partial = true
+			upsertHealth(&snap.Meta, health.Entry{
+				Collector: redisstats.SectionName, Status: health.StatusDegraded,
+				Message: "command limit exceeded; identities merged into (other)", Dropped: frozen.Dropped,
+			})
+		}
+	}
+	if frozen, ok := sections[flowstats.SectionName].(flowstats.Frozen); ok {
+		section := frozen.Snapshot
+		snap.Flow = &section
 	}
 	if value, ok := sections[procstats.CollectorName].(procstats.Snapshot); ok {
 		section := value
@@ -827,6 +917,7 @@ func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries [
 		DB:                 db,
 		DBCapabilityMatrix: dbcap.CanonicalMatrix(),
 		Advisor:            h.currentAdvisor(),
+		FlowSource:         h.p.FlowSource,
 		SQL:                entries,
 	}
 	if h.p.DBCapabilities != nil {
@@ -849,6 +940,20 @@ func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries [
 				Message: "name limit exceeded; identities merged into (other)", Dropped: dropped.Dropped(),
 			})
 		}
+	}
+	if h.p.Redis != nil {
+		snap.Redis = h.p.Redis.Snapshot()
+		if dropped, ok := h.p.Redis.(interface{ Dropped() uint64 }); ok && dropped.Dropped() > 0 {
+			snap.Meta.Partial = true
+			upsertHealth(&snap.Meta, health.Entry{
+				Collector: redisstats.SectionName, Status: health.StatusDegraded,
+				Message: "command limit exceeded; identities merged into (other)", Dropped: dropped.Dropped(),
+			})
+		}
+	}
+	if h.p.Flow != nil {
+		value := h.p.Flow.Snapshot()
+		snap.Flow = &value
 	}
 	if hc, ok := h.p.HTTP.(interface{ Connections() httpstats.ConnSnapshot }); ok && h.p.HTTP != nil {
 		conns := hc.Connections()
@@ -942,11 +1047,44 @@ func (h *handler) take() Snapshot {
 	// frozen generation is the authority on the interval it measured, and the
 	// live collectors were rotated past it the moment its boundary was taken.
 	applyRunIntervalSections(&snap, sections)
+	applyFlowSource(&snap)
 	h.applyProtocolAdvice(&snap)
 	h.applyQUICTelemetry(&snap)
 	h.applyCacheTelemetry(&snap)
 	applyQueryPlanAdvice(&snap)
 	return snap
+}
+
+func applyFlowSource(snap *Snapshot) {
+	if snap == nil {
+		return
+	}
+	clearProxy := func() {
+		if snap.AccessLog == nil {
+			return
+		}
+		snap.AccessLog.Stories = nil
+		snap.AccessLog.StoryDropped = 0
+		snap.AccessLog.Flows = nil
+		snap.AccessLog.FlowDropped = 0
+	}
+	switch snap.FlowSource {
+	case "auto":
+		if snap.Flow != nil && (len(snap.Flow.Stories) > 0 || snap.Flow.StoryDropped > 0 || len(snap.Flow.Flows) > 0 || snap.Flow.FlowDropped > 0) {
+			clearProxy()
+		}
+	case "middleware":
+		clearProxy()
+	case "proxy":
+		snap.Flow = nil
+	case "off":
+		clearProxy()
+		snap.Flow = nil
+	case "": // Saved snapshots before flow-source selection retain legacy data.
+	default:
+		clearProxy()
+		snap.Flow = nil
+	}
 }
 
 func applyProtocolAdvice(snap *Snapshot) {
@@ -1717,6 +1855,12 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.p.Counters != nil && !h.p.RunGenerationManaged && !h.p.CountersGenerationManaged {
 		h.p.Counters.Reset()
+	}
+	if h.p.Redis != nil && !h.p.RunGenerationManaged && !h.p.RedisGenerationManaged {
+		h.p.Redis.Reset()
+	}
+	if h.p.Flow != nil && !h.p.RunGenerationManaged && !h.p.FlowGenerationManaged {
+		h.p.Flow.Reset()
 	}
 	// Refresh schema and advisor inputs before the measured boundary opens.
 	// These callbacks issue their own SQL; running them after StartRun would put
