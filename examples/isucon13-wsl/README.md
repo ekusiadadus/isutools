@@ -12,7 +12,8 @@ isutools:   4111f0c3935040f6e0546f44e55ed332ae51b7ce
 WSL:        Ubuntu 22.04.3 LTS / ISUCON13 Go初期実装
 ```
 
-2026-08-14の実機では公式ベンチ`pass=true`、score `11,884`、SQL 56種、HTTP 42種、
+2026-08-14の実機では固定SHAをGo module proxyから解決したbinaryで公式ベンチ`pass=true`、
+score `12,079`、SQL 56種、HTTP 41種、
 DB pool/access log/run CPU profileのhealth `ok`まで確認しました。スコアは環境・runごとに変動し、
 性能保証ではありません。run ID、artifact hash、再起動・OFF・port forwardの確認結果とUI画像は
 [実機検証記録](../../docs/isucon13-wsl-verification-20260814.md)に分離しています。

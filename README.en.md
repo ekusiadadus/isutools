@@ -40,7 +40,7 @@ benchmark, durable save and SCP, run CPU profile, DB-pool capture, environment
 OFF switch, restart, and a scoped guest relay for SSH forwarding. See the
 [2026-08-14 field verification, artifact hashes, and screenshot](./docs/isucon13-wsl-verification-20260814.md).
 
-![2026-08-14 ISUCON13 WSL2 saved report](docs/images/isutools-isucon13-wsl-score11884.png)
+![2026-08-14 ISUCON13 WSL2 saved report](docs/images/isutools-isucon13-wsl-score12079.png)
 
 ### Makefile for a remote private-isu host
 

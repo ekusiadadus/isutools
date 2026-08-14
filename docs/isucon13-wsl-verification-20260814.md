@@ -36,12 +36,18 @@ Windows/WSL2上の公式ISUCON13 Go初期実装へ、アプリの挙動や性能
 ## 実行結果
 
 計測前の基準runは公式ベンチが終了code 0、最終check成功、`pass=true`、score `13,296`でした。
-計測配線後は二度公式ベンチを実行し、どちらも終了code 0、最終check成功でした。
+計測配線後は三度公式ベンチを実行し、いずれも終了code 0、最終check成功でした。三度目は
+local `replace`を使わず、公開済み固定SHAをGo module proxyから解決したbinaryです。
 
 | run | 公式結果 | isutools run | 用途 |
 |---|---|---|---|
 | 1 | `pass=true`, score `11,945` | `run-eeea4ce6b1debbac` | SQL/HTTP/access log/CPU profileの初回確認 |
-| 2 | `pass=true`, score `11,884` | `run-5f384f1f7c26afa1` | DB poolを含む最終確認 |
+| 2 | `pass=true`, score `11,884` | `run-5f384f1f7c26afa1` | DB poolを含むlocal source確認 |
+| 3 | `pass=true`, score `12,079` | `run-df7e35a4139403c2` | 固定SHA・`replace=none`の最終確認 |
+
+最終binaryのSHA-256は`f96d8f7e550ce3be6bf01bff38e52f2531cfa21ef5af035999b2f20c4969a7fd`です。
+`go list -m`ではrootが`v1.5.1-0.20260814080837-4111f0c39350`、Echo adapterが
+`v0.0.0-20260814080837-4111f0c39350`、Echoが`v4.11.1`で、`go.mod`に`replace`はありません。
 
 最終snapshotは`valid`かつ`partial=false`で、collector healthはSQL、HTTP、access log、
 DB pool、run CPU profile、profile provenanceがすべて`ok`、droppedは0でした。
@@ -49,11 +55,11 @@ DB pool、run CPU profile、profile provenanceがすべて`ok`、droppedは0で�
 | 内容 | 最終runの値 |
 |---|---:|
 | SQL集約行 | 56 |
-| HTTP集約行 | 42 |
-| nginx access log集約行 | 1,517 |
+| HTTP集約行 | 41 |
+| nginx access log集約行 | 1,626 |
 | DB pool target | `app` |
-| DB pool | max-open 10、open 2、idle 2、wait-count 11,149 |
-| run境界 | 2026-08-14 16:59:01–17:00:47 JST |
+| DB pool | max-open 10、open 2、idle 2、wait-count 11,543 |
+| run境界 | 2026-08-14 17:17:13–17:18:58 JST |
 
 Echo route adapterにより、HTTP keyは例えば`/api/user/:username/icon`と
 `/api/livestream/:livestream_id/livecomment`へ集約され、実usernameやlivestream IDを
@@ -67,11 +73,11 @@ profile manifestをWindows共有directoryへstageしたあと、SCPで制御PC�
 
 | 成果物 | SHA-256 |
 |---|---|
-| `20260814-170047.728826820-000001_gen3_876bd43-dirty_score11884.json` | `a1b517de3245f7c33ed218c403cc5a9f6db99c95aae51fd25c6c93a582abebcc` |
-| 同名`.html` | `2b96b5e20445b5692b6a8a045562ae84325d02d648371e07382f8e01ec0cb9a5` |
-| `official-benchmark-20260814-170047-run-5f384f1f7c26afa1.json` | `e8a7d463d6ba28c7c1c93ebdad686ba6b1d154342b05502fc2d9f05d00d2982b` |
-| `cpu_019fff4813830c68f30ce8c9557a8d64.pprof` | `2039202839f9a63fc13560f8bb231898fb5b6841a09b1aa6fabc01a167020a1c` |
-| CPU profile manifest | `624f564b1feaf4b1ab47ce8f07ae5d06feda1819f978ca3477a1a208061560d5` |
+| `20260814-171858.902906426-000001_gen3_876bd43-dirty_score12079.json` | `184248801f40d482643d130cf6bd7472d03cb59351edec4c6d777b7673503d66` |
+| 同名`.html` | `2dc665b00fcf834357cc8e950ee8626519dee05658a616577628b360c55bd988` |
+| `official-benchmark-20260814-171858-run-df7e35a4139403c2.json` | `97bc3b206e7fd9b00e75075ccf95fab2aa9b0a02d50919edaf465494fe3ff7bc` |
+| `cpu_019fff58bda3bbf3957a4109043c2989.pprof` | `2668c38f604f3d74e08e39c63a747702a3583a04a5a291a9fbd515cc5e458cb3` |
+| CPU profile manifest | `4096b45964f5f9b482ceeda4c6e9d9024fdf0ce62e89789f016f3b1201891691` |
 
 リモートと制御PCの上記hashは一致しました。`wsl.exe -t isucon13`の前後でもext4上の
 保存済み成果物hashは一致し、4 service、HTTPS、管理APIが再起動後に復帰しました。一方、
@@ -80,7 +86,7 @@ profile manifestをWindows共有directoryへstageしたあと、SCPで制御PC�
 ## CPU profile、OFF、port forward
 
 run profile manifestは`state=published`、`durability=durable`、coverage `complete=true`です。
-`go tool pprof -top`で105.80秒のcaptureと164.95秒のsampleを読み出せました。manual endpointも
+`go tool pprof -top`で104.94秒のcaptureと162.40秒のsampleを読み出せました。manual endpointも
 run modeを一時的にoffにして5秒captureを取得できましたが、idle中でsample 0のため、これは
 endpointとcopy経路だけの確認です。通常の解析には上記run profileを使います。
 
@@ -97,7 +103,7 @@ Windows SSH daemonとWSLが別network namespaceなので、単純な
 最終自己完結HTMLを制御PCのChrome headlessで1600×1400 PNGへ描画しました。これは保存済み
 reportの表示確認であり、公式ベンチの成否は上記公式JSONとrun metadataで別に判定しています。
 
-![ISUCON13 score 11884 saved report](./images/isutools-isucon13-wsl-score11884.png)
+![ISUCON13 score 12079 saved report](./images/isutools-isucon13-wsl-score12079.png)
 
 利用手順は[`examples/isucon13-wsl`](../examples/isucon13-wsl/README.md)にまとめ、
 `make status`、`make check`、`make bench`、`make tunnel`、`make pprof`、OFF/rollbackを記載しました。
