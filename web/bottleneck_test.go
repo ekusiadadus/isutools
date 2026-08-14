@@ -166,6 +166,51 @@ func TestReportPutsDecisionAndCodeEvidenceBeforeDenseTables(t *testing.T) {
 	}
 }
 
+func TestCPUBusyDiagnosisExplainsProfilerContentionAndRecovery(t *testing.T) {
+	manifest := &ProfileManifest{CPU: &CPUIntervalCapture{
+		Status: "skipped",
+		Code:   "cpu-busy",
+	}}
+	level, title, evidence, action := codeEvidence(manifest)
+	if level != "warn" || title != "コード位置: CPU profileなし（採取が競合）" {
+		t.Fatalf("code evidence heading = %q/%q", level, title)
+	}
+	for _, want := range []string{
+		"同じGoプロセス",
+		"別のCPU profile採取",
+		"CPU使用率が高すぎる",
+		"原因ではありません",
+	} {
+		if !strings.Contains(evidence, want) {
+			t.Errorf("CPU busy evidence is missing %q: %q", want, evidence)
+		}
+	}
+	for _, want := range []string{
+		"POST /reset",
+		"X-Isutools-CPU-Profile-State: capturing",
+		"ベンチ",
+		"POST /save",
+		"isutools-pprof",
+	} {
+		if !strings.Contains(action, want) {
+			t.Errorf("CPU busy recovery is missing %q: %q", want, action)
+		}
+	}
+	if strings.Contains(action, "capture状態を直して") {
+		t.Fatalf("CPU busy recovery is still opaque: %q", action)
+	}
+	body := renderReport(t, Snapshot{Meta: Meta{Profiles: manifest}})
+	for _, want := range []string{
+		"CPU profileなし（採取が競合）",
+		"CPU使用率が高すぎることが原因ではありません",
+		"X-Isutools-CPU-Profile-State: capturing",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rendered CPU busy diagnosis is missing %q", want)
+		}
+	}
+}
+
 func TestPublishedCPUArtifactDiagnosisStaysTrueAfterDerivedAnalysis(t *testing.T) {
 	manifest := &ProfileManifest{CPU: &CPUIntervalCapture{
 		Status: "published",
