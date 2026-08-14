@@ -170,3 +170,10 @@ an optional failure makes it partial. Every started peer is sealed exactly
 once by ACK or abort, and a silent hub cannot block the next run beyond the
 90-second peer lease. Only literal loopback HTTP origins are accepted, so a
 missing SSH tunnel fails preflight instead of falling back to a public route.
+
+The hub page identifies every row by configured peer name, role and persistent
+agent ID. It renders the hub-observed start/finish send-to-ack uncertainty
+intervals beside each peer's local collector boundary spread. Peer clocks are
+never compared or shifted; the same raw timestamps and host-separated sections
+remain in JSON. A preflight failure still carries the configured peer name even
+when no identity response could be obtained.

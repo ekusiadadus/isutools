@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ekusiadadus/isutools/multihost"
 )
@@ -45,6 +46,27 @@ func TestHubHTTPResetFinishPersistsSealedReport(t *testing.T) {
 	handler.ServeHTTP(jsonResult, httptest.NewRequest(http.MethodGet, "/json", nil))
 	if jsonResult.Code != http.StatusOK || strings.Contains(jsonResult.Body.String(), token) {
 		t.Fatalf("json=%d %s", jsonResult.Code, jsonResult.Body.String())
+	}
+	page := httptest.NewRecorder()
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	for _, want := range []string{"db", "start send→ack uncertainty", "finish send→ack uncertainty", "Peer clocks are not compared"} {
+		if !strings.Contains(page.Body.String(), want) {
+			t.Fatalf("hub page missing %q: %s", want, page.Body.String())
+		}
+	}
+	if strings.Contains(page.Body.String(), token) {
+		t.Fatal("hub page disclosed peer token")
+	}
+}
+
+func TestFormatBarrierWindow(t *testing.T) {
+	start := time.Date(2026, 8, 14, 0, 13, 11, 792751000, time.UTC)
+	got := formatBarrierWindow([2]time.Time{start, start.Add(1844 * time.Microsecond)})
+	if !strings.Contains(got, "00:13:11.792751Z") || !strings.Contains(got, "1.844ms") {
+		t.Fatalf("formatBarrierWindow=%q", got)
+	}
+	if got := formatBarrierWindow([2]time.Time{}); got != "-" {
+		t.Fatalf("empty formatBarrierWindow=%q", got)
 	}
 }
 

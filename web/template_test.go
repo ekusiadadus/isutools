@@ -33,6 +33,17 @@ func float64Ptr(v float64) *float64 { return &v }
 
 func uint64Ptr(v uint64) *uint64 { return &v }
 
+func TestBarrierWindow(t *testing.T) {
+	start := time.Date(2026, 8, 14, 0, 13, 11, 792751000, time.UTC)
+	got := barrierWindow([2]time.Time{start, start.Add(1844 * time.Microsecond)})
+	if !strings.Contains(got, "00:13:11.792751Z") || !strings.Contains(got, "1.8 ms") {
+		t.Fatalf("barrierWindow=%q", got)
+	}
+	if got := barrierWindow([2]time.Time{}); got != "-" {
+		t.Fatalf("empty barrierWindow=%q", got)
+	}
+}
+
 // fullSnapshot is a snapshot carrying all four new sections.
 func fullSnapshot() Snapshot {
 	baseline := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)

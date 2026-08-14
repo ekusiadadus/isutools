@@ -861,6 +861,17 @@ func planErrorLabel(err *queryplan.PlanError) string {
 	}
 }
 
+func barrierWindow(window [2]time.Time) string {
+	if window[0].IsZero() || window[1].IsZero() {
+		return "-"
+	}
+	duration := window[1].Sub(window[0])
+	if duration < 0 {
+		return "invalid"
+	}
+	return fmt.Sprintf("%s → %s (%s)", window[0].UTC().Format("15:04:05.000000Z"), window[1].UTC().Format("15:04:05.000000Z"), humanDuration(duration))
+}
+
 // reportFuncs is the report template's function set. The formatting helpers
 // are named functions rather than closures so each one can be tested on its
 // own, without rendering a page to find out what it prints.
@@ -890,6 +901,7 @@ var reportFuncs = template.FuncMap{
 	// so a capture's distance from its boundary reads in the same units as
 	// every other duration on the page.
 	"ns":           func(nanos int64) string { return humanDuration(time.Duration(nanos)) },
+	"barrier":      barrierWindow,
 	"pf1":          optFloat,
 	"psize":        optBytes,
 	"clock":        clockTime,
@@ -1003,15 +1015,17 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 {{if .Snapshot.Peers}}
 <span id="multi-host"></span><h2>Multi-host Participants <span class="meta">(hostごとの値。合算しません)</span></h2>
 <table>
-<thead><tr><th>role</th><th>agent</th><th>form</th><th>required</th><th>state</th><th>validity</th><th>sealed</th><th>budget</th><th>failure</th></tr></thead>
+<thead><tr><th>peer / role</th><th>agent</th><th>form</th><th>required</th><th>state</th><th>validity</th><th>start send→ack</th><th>start local spread</th><th>finish send→ack</th><th>finish local spread</th><th>sealed</th><th>budget</th><th>failure</th></tr></thead>
 <tbody>{{range .Snapshot.Peers}}<tr>
-<td class="l">{{.Info.Role}}</td><td class="l">{{.Info.AgentID}}</td><td>{{.Form}}</td><td>{{.Required}}</td>
-<td>{{if .Status}}{{.Status.State}}{{else}}-{{end}}</td><td>{{if .Status}}{{.Status.Validity}}{{else}}-{{end}}</td><td>{{.Sealed}}</td>
+<td class="l">{{.Name}} / {{.Info.Role}}</td><td class="l">{{.Info.AgentID}}</td><td>{{.Form}}</td><td>{{.Required}}</td>
+<td>{{if .Status}}{{.Status.State}}{{else}}-{{end}}</td><td>{{if .Status}}{{.Status.Validity}}{{else}}-{{end}}</td>
+<td class="l">{{barrier .StartSendAck}}</td><td>{{if .Start}}{{dur .Start.BoundaryWindow.Spread}}{{else}}-{{end}}</td>
+<td class="l">{{barrier .FinishSendAck}}</td><td>{{if .Finish}}{{dur .Finish.BoundaryWindow.Spread}}{{else}}-{{end}}</td><td>{{.Sealed}}</td>
 <td>{{if .Local}}{{.Local.Budget.EncodedBytes}} / {{.Local.Budget.MaxBytes}}{{else}}-{{end}}</td>
 <td class="l">{{if .Failure}}{{.Failure.Phase}} / {{.Failure.Code}}{{else}}-{{end}}</td>
 </tr>{{end}}</tbody>
 </table>
-<p class="meta">Start/Finishのsend→ack区間、host identity、section issues、local snapshotはJSONに保持されます。required participantの欠落はinvalid、optionalの欠落はpartialです。</p>
+<p class="meta">send→ackはhub観測の不確実性区間、local spreadは各peer内のcollector境界幅です。peer間の時計は比較・補正しません。host identity、section issues、local snapshotはJSONにも保持されます。required participantの欠落はinvalid、optionalの欠落はpartialです。</p>
 {{end}}
 
 {{with .Snapshot.Timeline}}

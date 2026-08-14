@@ -180,6 +180,7 @@ type ParticipantFailureDTO struct {
 }
 
 type PeerResult struct {
+	Name          string                 `json:"name"`
 	Info          PeerInfoDTO            `json:"info"`
 	Required      bool                   `json:"required"`
 	Form          string                 `json:"form"`

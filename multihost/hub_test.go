@@ -45,6 +45,9 @@ func TestHubTwoPeerRunUsesCommonWireIdentityAndAssemblesBoth(t *testing.T) {
 	if len(run.Peers) != 2 || run.Peers[0].Start.RunID != "run-shared" || run.Peers[1].Start.RunID != "run-shared" || run.Peers[0].Start.Epoch != run.Peers[1].Start.Epoch {
 		t.Fatalf("starts=%#v", run.Peers)
 	}
+	if run.Peers[0].Name != "app" || run.Peers[1].Name != "db" {
+		t.Fatalf("peer names=%#v", run.Peers)
+	}
 	peers, validity := hub.Finish(ctx, run, 1024)
 	if validity != "valid" || len(peers) != 2 {
 		t.Fatalf("validity=%s peers=%#v", validity, peers)
@@ -85,8 +88,29 @@ func TestHubThreePeerOptionalFinishFailureIsPartialAndOthersSeal(t *testing.T) {
 	if peers[2].Failure == nil || peers[2].Failure.Phase != "finish" {
 		t.Fatalf("optional failure=%#v", peers[2])
 	}
+	if peers[2].Name != "proxy" {
+		t.Fatalf("optional peer name=%q", peers[2].Name)
+	}
 	if peers[0].Sealed != "ack" || peers[1].Sealed != "ack" {
 		t.Fatalf("required peers not sealed: %#v", peers)
+	}
+}
+
+func TestHubSelfBudgetOverflowInvalidatesButSealsPeer(t *testing.T) {
+	_, server := peerServer(t, "123e4567-e89b-42d3-a456-426614174014", []string{"hoststats"}, nil)
+	hub, err := NewHub(HubConfig{Peers: []HubPeerConfig{{Name: "app", Endpoint: server.URL, Token: testToken, Required: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	run, err := hub.Start(ctx, "run-hub-budget", "nonce-hub-budget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peers, validity := hub.Finish(ctx, run, HubSelfReserve+1)
+	if validity != "invalid" || len(peers) != 1 || peers[0].Sealed != "ack" || peers[0].Failure == nil || peers[0].Failure.Code != "budget-exhausted" {
+		t.Fatalf("validity=%s peers=%#v", validity, peers)
 	}
 }
 

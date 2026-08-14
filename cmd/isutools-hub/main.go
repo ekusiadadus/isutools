@@ -253,7 +253,28 @@ func (s *server) render(w http.ResponseWriter) {
 	_ = hubPage.Execute(w, current)
 }
 
-var hubPage = template.Must(template.New("hub").Parse(`<!doctype html><meta charset="utf-8"><title>isutools multi-host</title><style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;text-align:left}</style><h1>isutools multi-host</h1>{{if .}}<p>run {{.RunID}} / validity {{.Validity}} / file {{.File}}</p><table><tr><th>role</th><th>agent</th><th>form</th><th>required</th><th>state</th><th>sealed</th><th>failure</th></tr>{{range .Peers}}<tr><td>{{.Info.Role}}</td><td>{{.Info.AgentID}}</td><td>{{.Form}}</td><td>{{.Required}}</td><td>{{if .Status}}{{.Status.State}}{{end}}</td><td>{{.Sealed}}</td><td>{{if .Failure}}{{.Failure.Phase}}/{{.Failure.Code}}{{end}}</td></tr>{{end}}</table><p><a href="/json">JSON</a></p>{{else}}<p>no run yet</p>{{end}}`))
+var hubPage = template.Must(template.New("hub").Funcs(template.FuncMap{
+	"barrier": formatBarrierWindow,
+	"spread":  formatBoundarySpread,
+}).Parse(`<!doctype html><meta charset="utf-8"><title>isutools multi-host</title><style>body{font:14px system-ui;margin:2rem}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4rem;text-align:left;vertical-align:top}.meta{color:#666}.warn{color:#b45309}.mono{font-family:ui-monospace,monospace;white-space:nowrap}</style><h1>isutools multi-host</h1>{{if .}}<p>run <span class="mono">{{.RunID}}</span> / validity <strong>{{.Validity}}</strong> / file {{.File}}</p><table><tr><th>peer / role</th><th>agent</th><th>form</th><th>required</th><th>state</th><th>start send→ack uncertainty</th><th>start local spread</th><th>finish send→ack uncertainty</th><th>finish local spread</th><th>sealed</th><th>failure</th></tr>{{range .Peers}}<tr><td><strong>{{.Name}}</strong><br>{{.Info.Role}}</td><td class="mono">{{.Info.AgentID}}</td><td>{{.Form}}</td><td>{{.Required}}</td><td>{{if .Status}}{{.Status.State}}{{end}}</td><td class="mono">{{barrier .StartSendAck}}</td><td>{{if .Start}}{{spread .Start.BoundaryWindow.Spread}}{{else}}-{{end}}</td><td class="mono">{{barrier .FinishSendAck}}</td><td>{{if .Finish}}{{spread .Finish.BoundaryWindow.Spread}}{{else}}-{{end}}</td><td>{{.Sealed}}</td><td class="warn">{{if .Failure}}{{.Failure.Phase}}/{{.Failure.Code}}{{end}}</td></tr>{{end}}</table><p class="meta">send→ack is the hub-observed uncertainty interval. Local boundary spread is measured inside each peer. Peer clocks are not compared or shifted. Metrics remain host-by-host and are never summed. <a href="/json">JSON</a></p>{{else}}<p>no run yet</p>{{end}}`))
+
+func formatBarrierWindow(window [2]time.Time) string {
+	if window[0].IsZero() || window[1].IsZero() {
+		return "-"
+	}
+	duration := window[1].Sub(window[0])
+	if duration < 0 {
+		return "invalid"
+	}
+	return fmt.Sprintf("%s → %s (%s)", window[0].UTC().Format("15:04:05.000000Z"), window[1].UTC().Format("15:04:05.000000Z"), duration.Round(time.Microsecond))
+}
+
+func formatBoundarySpread(spread time.Duration) string {
+	if spread < 0 {
+		return "invalid"
+	}
+	return spread.Round(time.Microsecond).String()
+}
 
 func newID() string {
 	var value [16]byte

@@ -24,6 +24,8 @@ type HubPeerConfig struct {
 	RequiredCapabilities []string
 }
 
+const peerControlRequestTimeout = 2 * time.Second
+
 type HubConfig struct {
 	Peers   []HubPeerConfig
 	Client  *http.Client
@@ -125,7 +127,7 @@ func (h *Hub) Preflight(ctx context.Context) []PeerResult {
 }
 
 func (h *Hub) preflightPeer(ctx context.Context, peer hubPeer) PeerResult {
-	result := PeerResult{Required: peer.config.Required, Sealed: "", Form: ""}
+	result := PeerResult{Name: peer.config.Name, Required: peer.config.Required, Sealed: "", Form: ""}
 	var info PeerInfoDTO
 	status, err := h.do(ctx, peer, http.MethodGet, "/peer/info", nil, &info, 256<<10)
 	if err != nil || status != http.StatusOK {
@@ -255,13 +257,24 @@ func (h *Hub) Finish(ctx context.Context, run *HubRun, hubBytes int64) ([]PeerRe
 		}()
 	}
 	wg.Wait()
+	var pollWG sync.WaitGroup
 	for i := range run.Peers {
 		if run.Peers[i].Start == nil || run.Peers[i].Finish == nil {
 			continue
 		}
-		h.pollPeer(ctx, &run.Peers[i], h.peers[i], run.RunID)
+		i := i
+		pollWG.Add(1)
+		go func() {
+			defer pollWG.Done()
+			h.pollPeer(ctx, &run.Peers[i], h.peers[i], run.RunID)
+		}()
 	}
+	pollWG.Wait()
+	hubBudgetInvalid := hubBytes < 0 || hubBytes > HubSelfReserve
 	remaining := int64(TotalSnapshotCap) - hubBytes
+	if remaining < 0 {
+		remaining = 0
+	}
 	active := 0
 	for i := range run.Peers {
 		if run.Peers[i].Status != nil && run.Peers[i].Status.SnapshotReady {
@@ -272,17 +285,27 @@ func (h *Hub) Finish(ctx context.Context, run *HubRun, hubBytes int64) ([]PeerRe
 	if active > 0 && remaining/int64(active) < budget {
 		budget = remaining / int64(active)
 	}
+	var fetchWG sync.WaitGroup
 	for i := range run.Peers {
 		if run.Peers[i].Status == nil || !run.Peers[i].Status.SnapshotReady {
 			continue
 		}
-		if budget < MinPeerBytes {
+		if hubBudgetInvalid || budget < MinPeerBytes {
 			run.Peers[i].Failure = failure("fetch", "budget-exhausted", h.now())
 			continue
 		}
-		h.fetchPeer(ctx, &run.Peers[i], h.peers[i], run.RunID, budget)
+		i := i
+		fetchWG.Add(1)
+		go func() {
+			defer fetchWG.Done()
+			h.fetchPeer(ctx, &run.Peers[i], h.peers[i], run.RunID, budget)
+		}()
 	}
+	fetchWG.Wait()
 	validity := run.Validity
+	if hubBudgetInvalid {
+		validity = "invalid"
+	}
 	for i := range run.Peers {
 		peer := &run.Peers[i]
 		if peer.Failure != nil {
@@ -369,43 +392,70 @@ func (h *Hub) renewLeases(ctx context.Context, run *HubRun) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			var wg sync.WaitGroup
 			for i := range run.Peers {
 				if run.Peers[i].Start == nil {
 					continue
 				}
-				var dto LeaseDTO
-				_, _ = h.do(context.Background(), h.peers[i], http.MethodPost, "/peer/runs/"+url.PathEscape(run.RunID)+"/lease", struct{}{}, &dto, 64<<10)
+				i := i
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					requestCtx, cancel := context.WithTimeout(ctx, peerControlRequestTimeout)
+					defer cancel()
+					var dto LeaseDTO
+					_, _ = h.do(requestCtx, h.peers[i], http.MethodPost, "/peer/runs/"+url.PathEscape(run.RunID)+"/lease", struct{}{}, &dto, 64<<10)
+				}()
 			}
+			wg.Wait()
 		}
 	}
 }
 func (h *Hub) abortAll(ctx context.Context, run *HubRun) {
+	var wg sync.WaitGroup
 	for i := range run.Peers {
 		if run.Peers[i].Start == nil {
 			continue
 		}
-		var dto AbortResultDTO
-		status, err := h.do(ctx, h.peers[i], http.MethodPost, "/peer/runs/"+url.PathEscape(run.RunID)+"/abort", AbortRequest{Reason: "hub start barrier failed"}, &dto, 256<<10)
-		if err == nil && status == http.StatusOK {
-			run.Peers[i].Aborted = &dto
-			run.Peers[i].Sealed = "abort"
-		} else {
-			run.Peers[i].Sealed = "failed"
-		}
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			requestCtx, cancel := context.WithTimeout(ctx, peerControlRequestTimeout)
+			defer cancel()
+			var dto AbortResultDTO
+			status, err := h.do(requestCtx, h.peers[i], http.MethodPost, "/peer/runs/"+url.PathEscape(run.RunID)+"/abort", AbortRequest{Reason: "hub start barrier failed"}, &dto, 256<<10)
+			if err == nil && status == http.StatusOK {
+				run.Peers[i].Aborted = &dto
+				run.Peers[i].Sealed = "abort"
+			} else {
+				run.Peers[i].Sealed = "failed"
+			}
+		}()
 	}
+	wg.Wait()
 }
 func (h *Hub) ackAll(ctx context.Context, run *HubRun) {
+	var wg sync.WaitGroup
 	for i := range run.Peers {
 		if run.Peers[i].Start == nil {
 			continue
 		}
-		status, err := h.do(ctx, h.peers[i], http.MethodPost, "/peer/runs/"+url.PathEscape(run.RunID)+"/ack", struct{}{}, nil, 64<<10)
-		if err == nil && status == http.StatusNoContent {
-			run.Peers[i].Sealed = "ack"
-		} else {
-			run.Peers[i].Sealed = "failed"
-		}
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			requestCtx, cancel := context.WithTimeout(ctx, peerControlRequestTimeout)
+			defer cancel()
+			status, err := h.do(requestCtx, h.peers[i], http.MethodPost, "/peer/runs/"+url.PathEscape(run.RunID)+"/ack", struct{}{}, nil, 64<<10)
+			if err == nil && status == http.StatusNoContent {
+				run.Peers[i].Sealed = "ack"
+			} else {
+				run.Peers[i].Sealed = "failed"
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 func (h *Hub) do(ctx context.Context, peer hubPeer, method, path string, input, output any, limit int64) (int, error) {

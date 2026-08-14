@@ -3,17 +3,21 @@ package profilemodel
 import "time"
 
 const (
-	SchemaVersionV1       = 1
-	SHA256HexLength       = 64
-	MaxAnalysisBodyBytes  = 2 << 20
-	MaxAttempts           = 8
-	MaxSummaries          = 32
-	MaxTopNodes           = 50
-	MaxReportNodes        = 2000
-	MaxFlameNodes         = 2048
-	MaxFlameDepth         = 64
-	MaxWorkerMemoryBytes  = uint64(512 << 20)
-	MaxWorkerAddressBytes = uint64(1 << 30)
+	SchemaVersionV1      = 1
+	SHA256HexLength      = 64
+	MaxAnalysisBodyBytes = 2 << 20
+	MaxAttempts          = 8
+	MaxSummaries         = 32
+	MaxTopNodes          = 50
+	MaxReportNodes       = 2000
+	MaxFlameNodes        = 2048
+	MaxFlameDepth        = 64
+	MaxWorkerMemoryBytes = uint64(512 << 20)
+	// Go reserves substantially more virtual address space than resident
+	// memory on 64-bit systems. Keep physical memory fail-closed at 512 MiB via
+	// cgroup memory.max, while allowing a still-bounded 4 GiB address space so
+	// real multi-second runtime CPU profiles can be decoded.
+	MaxWorkerAddressBytes = uint64(4 << 30)
 )
 
 const (

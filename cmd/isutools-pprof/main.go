@@ -253,17 +253,21 @@ func runFetch(args []string, stdout, stderr io.Writer) error {
 	if hashBytes(snapshotBody) != *pinnedHash {
 		return errors.New("fetched snapshot does not match ledger SHA-256")
 	}
-	var envelope struct {
-		Snapshot web.Snapshot `json:"snapshot"`
+	// Saved run JSON embeds Snapshot at the top level and may carry one
+	// comparison predecessor. Keep this decoder structurally identical to
+	// web.jsonPayload instead of inventing a {"snapshot": ...} wire wrapper.
+	var persisted struct {
+		web.Snapshot
+		Prev json.RawMessage `json:"prev,omitempty"`
 	}
-	if err := decodeStrict(snapshotBody, &envelope); err != nil {
+	if err := decodeStrict(snapshotBody, &persisted); err != nil {
 		return fmt.Errorf("decode snapshot: %w", err)
 	}
-	manifest := envelope.Snapshot.Meta.Profiles
+	manifest := persisted.Meta.Profiles
 	if manifest == nil || manifest.RunID == "" || manifest.Executable == nil {
 		return errors.New("snapshot has no profile manifest or capture-time executable identity")
 	}
-	bundle, files, err := bundleFromManifest(*base, *pinnedHash, envelope.Snapshot.Meta.SchemaVersion, manifest)
+	bundle, files, err := bundleFromManifest(*base, *pinnedHash, persisted.Meta.SchemaVersion, manifest)
 	if err != nil {
 		return err
 	}
