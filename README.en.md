@@ -29,6 +29,19 @@ curl -fsS -X POST http://127.0.0.1:19191/reset
 curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
 ```
 
+Reproducible integrations are available for
+[private-isu](./examples/private-isu/README.md),
+[ISUCON13 on WSL2](./examples/isucon13-wsl/README.md), and
+[ISUCON14](./examples/isucon14/README.md). They add measurement wiring only;
+application tuning is out of scope.
+
+The ISUCON13 example was exercised on Windows/WSL2 through the official
+benchmark, durable save and SCP, run CPU profile, DB-pool capture, environment
+OFF switch, restart, and a scoped guest relay for SSH forwarding. See the
+[2026-08-14 field verification, artifact hashes, and screenshot](./docs/isucon13-wsl-verification-20260814.md).
+
+![2026-08-14 ISUCON13 WSL2 saved report](docs/images/isutools-isucon13-wsl-score12079.png)
+
 ### Makefile for a remote private-isu host
 
 The repository `Makefile` wraps readiness checks, a real benchmark, artifact

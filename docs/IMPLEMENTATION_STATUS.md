@@ -44,7 +44,7 @@ Current-tree verification:
 | vulnerability scan | current local machine | not rerun; `govulncheck` is not installed |
 | new direct dependency licenses | google/pprof Apache-2.0; x/sys BSD-3-Clause | compatible; license files inspected in the resolved module versions |
 | scripts | shellcheck, `bash -n`, ABBA contract | PASS |
-| minimum Go | Go 1.24.13, darwin/arm64 toolchain | root all-package test PASS; Echo v4/v5 are independent modules because current upstream releases require Go 1.25 |
+| minimum Go | Go 1.24.13, darwin/arm64 toolchain | root all-package test PASS; Echo v4 supports Go 1.24 / Echo v4.11.1, while Echo v5 remains an independent Go 1.25 module |
 | hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
 | GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, race/coverage, MySQL integration | PASS on PR #33 and follow-up PR #34 before merge |
 | remote private-isu | Windows/WSL2 over SSH, merged SHA | readiness, real benchmark, durable save/SCP, run CPU capture, verified-binary flame publication, required/optional peer hub PASS; [full record](./private-isu-field-verification-20260814.md) |

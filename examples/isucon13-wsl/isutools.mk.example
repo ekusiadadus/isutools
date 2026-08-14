@@ -1,0 +1,6 @@
+REMOTE_HOST := ekusiadadus@ssh.almightty.org
+WSL_DISTRO := isucon13
+LOCAL_PORT := 19196
+REMOTE_ADMIN_PORT := 19196
+WINDOWS_USER := ekusi
+RESULTS_DIR := $(HOME)/isutools-isucon13-results
