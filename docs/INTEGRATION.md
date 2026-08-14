@@ -157,22 +157,33 @@ nginx が静的ファイルを直接返す場合、`$upstream_response_time` は
 
 ### User Flow の `sess`
 
-同梱設定は `X-Isutools-Session` を `sess:` として記録します。これは認証 Cookie ではなく、
-128 byte 以下の短い疑似 ID にしてください。k6 例は VU 番号とiteration由来のテスト ID を送ります。
-実ユーザーではアプリ、njs、Lua 等で Cookie を HMAC/SHA-256 化してから header へ渡します。
-nginx core だけでは安全な暗号学的 hash を作れないため、生 Cookie、session token、email を
-直接 log_format に入れてはいけません。安全な ID を作れない場合は `sess` を省略できます。
+`isutools.HTTP`は環境変数からflow-label middlewareを自動構成します。通常の実ユーザー計測は
+session Cookieをアプリ内でHMAC疑似IDへ変換し、upstream response headerとしてnginxへ返します。
+
+```bash
+export ISUTOOLS_FLOW_LABELS=on
+export ISUTOOLS_SESSION_COOKIE=SESSIONID
+export ISUTOOLS_SESSION_HMAC_KEY='32-byte以上のgitへ入れない乱数'
+```
+
+同梱nginx設定はpublicおよび内部trusted headerをupstream requestから削除し、アプリが返した
+`$upstream_http_x_isutools_session`だけを`sess:`へ記録します。そのresponse headerもclientへは
+返しません。nginx coreだけでは安全な暗号学的hashを作れないため、生Cookie、session token、
+emailを直接`log_format`へ入れてはいけません。cookie/key未設定の`auto`、不正なkey、または
+`ISUTOOLS_FLOW_LABELS=off`はfail closedとなり、session labelを出力しません。
 
 ### Scenario Stories（最小のファネル/フロー基盤）
 
-`sess`に加えて、アプリまたは負荷生成側が短い非秘密ラベルを送ります。
+`sess`に加えて、アプリは短い非秘密ラベルを設定できます。process全体が同じscenarioなら
+`ISUTOOLS_SCENARIO=login_and_browse`、handler単位なら各adapterの`Scenario` helperを使います。
 
-```text
-X-Isutools-Session: k6-vu-3-iter-12
-X-Isutools-Scenario: login_and_browse
+```go
+e.GET("/checkout", checkout, echov4.Scenario("checkout"))
+r.GET("/checkout", ginadapter.Scenario("checkout"), checkout)
+r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 ```
 
-同梱nginx設定はそれぞれ`sess:`と`scenario:`へ出力します。isutoolsは
+同梱nginx設定はupstream responseの値だけを`sess:`と`scenario:`へ出力します。isutoolsは
 `scenario + sess`ごとに`METHOD URI`の実測列を作り、同一journeyをまとめて
 `sessions / requests / observed journey`の上位20件をHTML/JSONへ表示します。
 1 journeyは32 step、追跡sessionと共有page辞書は各10,000件に制限され、超過は
@@ -189,9 +200,11 @@ scenario用に勝手には書き換えません。
 
 `scenario`は64 byte以下、`sess`は128 byte以下の英数字と`._~-`だけを受理します。
 生Cookie、session token、Authorization、email、user IDをそのまま入れてはいけません。
-これらのheaderは計測ラベルであり、認証・認可・監査ログには使えません。public clientからは
-偽装できるため、実ユーザー計測では外部から来た同名headerをedgeで削除し、trusted app/proxyが
-HMAC等から作った値で上書きしてください。同梱k6例は閉じたベンチ環境用です。
+これらのheaderは計測ラベルであり、認証・認可・監査ログには使えません。public clientからの
+`X-Isutools-Session` / `X-Isutools-Scenario`は常にアプリで削除され、直接は信用しません。
+同梱private-isu/k6例だけは、閉じたベンチnginxがpublic labelを別名の
+`X-Isutools-Trusted-*`へ写し、アプリ側で`ISUTOOLS_TRUST_INBOUND_FLOW_LABELS=1`を明示します。
+このopt-inを通常のInternet-facing構成で有効にしないでください。
 
 ## 5. Apache HTTP Server
 
@@ -446,7 +459,7 @@ snapshot を partial にしません。自動配線はアプリ自身の PID を
 
 - k6: 負荷生成を行う場合だけ必要。isutools の Go dependency ではありません
 - curl: reset / collect / save の制御例で使用
-- jq: JSON の手動確認と ABBA gate script で使用
+- jq（任意）: JSON の手動確認に使用。ABBA gate scriptはjqが無ければPython 3へfallback
 - Graphviz: pprof のグラフ描画だけに任意
 
 ABBA release gate は [abba.sh](../examples/abba.sh) を使います。最低3ブロック、固定 warm-up、
@@ -1110,13 +1123,13 @@ initialize handler 側に build tag も分岐も要りません。
 §13のpeer/hubプロトコルで開始・終了barrierを揃え、participantごとのsend→ack区間と
 immutable snapshotを保存してください。
 
-## 13. Echo、trusted session、複数台計測
+## 13. Go router、trusted flow label、複数台計測
 
 現場指摘で追加された次の配線は、設定例、失敗理由、秘密情報の境界、SSH tunnel、
 agent/hubの起動手順を一つの運用文書に集約しています。
 
-- Echo v4/v5 とframework-neutral route template
-- nginxへ渡すHMAC session pseudonym
+- Echo v4/v5、Gin、chi v5 とframework-neutral route template
+- nginxへ渡すHMAC session pseudonymと明示scenario
 - access-log path groupingとSQL comment tag policy
 - managed CPU handoffとbounded flame view
 - advisor provenanceとDB capability matrix

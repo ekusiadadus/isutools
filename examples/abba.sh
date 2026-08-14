@@ -33,7 +33,34 @@ if [ "$ABBA_BLOCKS" -lt 3 ]; then
   echo "ABBA_BLOCKS must be >= 3 for a confidence interval" >&2
   exit 2
 fi
-command -v jq >/dev/null || { echo "jq is required" >&2; exit 2; }
+if ! command -v jq >/dev/null && ! command -v python3 >/dev/null; then
+  echo "jq or python3 is required" >&2
+  exit 2
+fi
+
+json_number() {
+  local field=$1
+  local comparison=$2
+  local input=$3
+  if command -v jq >/dev/null; then
+    if [ "$comparison" = positive ]; then
+      jq -er --arg field "$field" '.[$field] | numbers | select(. > 0)' <<<"$input"
+    else
+      jq -er --arg field "$field" '.[$field] | numbers | select(. >= 0)' <<<"$input"
+    fi
+    return
+  fi
+  python3 -c '
+import json, sys
+field, comparison = sys.argv[1:]
+value = json.load(sys.stdin).get(field)
+valid_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+valid_bound = value > 0 if comparison == "positive" and valid_number else valid_number and value >= 0
+if not valid_bound:
+    raise SystemExit(1)
+print(value)
+' "$field" "$comparison" <<<"$input"
+}
 
 printf 'block\tposition\tmode\tscore\tp95_ms\terror_rate\tfingerprint\ttimestamp_utc\n' > "$ABBA_OUTPUT"
 {
@@ -82,9 +109,9 @@ for ((block = 1; block <= ABBA_BLOCKS; block++)); do
     bash -c "$WARMUP" >/dev/null
     result=$(bash -c "$BENCH")
     final_json=$(printf '%s\n' "$result" | tail -n 1)
-    score=$(jq -er '.score | numbers | select(. > 0)' <<<"$final_json")
-    p95=$(jq -er '.p95_ms | numbers | select(. > 0)' <<<"$final_json")
-    error_rate=$(jq -er '.error_rate | numbers | select(. >= 0)' <<<"$final_json")
+    score=$(json_number score positive "$final_json")
+    p95=$(json_number p95_ms positive "$final_json")
+    error_rate=$(json_number error_rate nonnegative "$final_json")
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf '%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$block" "$((position + 1))" "$mode" "$score" "$p95" "$error_rate" \

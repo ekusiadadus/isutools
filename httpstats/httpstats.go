@@ -253,6 +253,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 		next = http.NotFoundHandler()
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = withRoutePatternState(r)
 		g := c.begin()
 		start := time.Now()
 		event := c.beginHTTPEvent(start)
@@ -676,7 +677,7 @@ var (
 )
 
 func (c *Collector) pathFor(r *http.Request) string {
-	if pattern := requestPatternPath(r.Pattern); pattern != "" {
+	if pattern := requestPatternPath(routePattern(r)); pattern != "" {
 		return pattern
 	}
 	path := r.URL.Path

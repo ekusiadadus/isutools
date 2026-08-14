@@ -225,6 +225,9 @@ func TestMiddlewarePreservesOptionalInterfaces(t *testing.T) {
 		if _, ok := w.(http.Pusher); !ok {
 			t.Error("wrapped writer lost http.Pusher")
 		}
+		if _, ok := w.(interface{ CloseNotify() <-chan bool }); !ok {
+			t.Error("wrapped writer lost http.CloseNotifier")
+		}
 		rf, ok := w.(io.ReaderFrom)
 		if !ok {
 			t.Fatal("wrapped writer lost io.ReaderFrom")
@@ -259,6 +262,9 @@ func TestMiddlewarePreservesOptionalInterfaces(t *testing.T) {
 		}
 		if _, ok := w.(io.ReaderFrom); ok {
 			t.Error("wrapper invented io.ReaderFrom")
+		}
+		if _, ok := w.(interface{ CloseNotify() <-chan bool }); ok {
+			t.Error("wrapper invented http.CloseNotifier")
 		}
 	})).ServeHTTP(plain, httptest.NewRequest(http.MethodGet, "/plain", nil))
 }
@@ -385,6 +391,7 @@ func (w *allFeaturesWriter) Push(string, *http.PushOptions) error {
 	w.pushed = true
 	return nil
 }
+func (w *allFeaturesWriter) CloseNotify() <-chan bool { return nil }
 func (w *allFeaturesWriter) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(&w.body, r)
 }

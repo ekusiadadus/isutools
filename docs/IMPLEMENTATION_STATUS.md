@@ -297,10 +297,10 @@ Stated explicitly so it is not read out of the sections above:
 - stable secret-free `/save` reason codes and audit events
 - access-log full-match grouping and SQL comment/tag policy
 - provenance-checked bounded flame view
-- HMAC trusted-session adapter and corrected nginx upstream logging
+- HMAC session/scenario flow labels and corrected nginx upstream logging
 - strict multi-host protocol, embedded peer, standalone agent, hub, lease
   recovery, participant budgets and host-by-host report rendering
-- framework-neutral route templates plus Echo v4/v5 adapters
+- framework-neutral route templates plus Echo v4/v5, Gin, and chi v5 adapters
 - immutable global hard-off mode
 - deterministic advisor provenance and per-target DB capability matrix
 

@@ -61,7 +61,7 @@ lists are canonicalized to one arity-independent `IN (?)` key. This includes
 `IN /* */ (?, ?, ?)`, MySQL `?`, PostgreSQL positional parameters, and literal
 lists. Subqueries and row constructors remain distinct.
 
-## Echo and framework-neutral route templates
+## Go router and framework-neutral route templates
 
 The generic adapter is `httpstats.SetRoutePattern(*http.Request, template)`.
 It accepts only a trusted registered template and never falls back to the raw
@@ -80,25 +80,37 @@ echov4.Install(e)
 Echo v5 uses the same call from `adapters/echov5`. Named parameters, groups,
 wildcards, 404s, handler errors and panics are covered by adapter tests.
 
-## Trusted session labels for nginx
-
-The client-supplied `X-Isutools-Session` is never trusted. Generate a fixed
-URL-safe HMAC pseudonym inside the application and return it as an upstream
-response header:
+Gin and chi v5 have the same install shape:
 
 ```go
-adapter := sessionlabel.FromEnv(os.Getenv)
-handler := adapter.Middleware(applicationHandler)
+ginadapter.Install(engine)
+chiv5.Install(router)
 ```
+
+Use `ginadapter.Scenario("checkout")`, `chiv5.Scenario("checkout")`, or the
+matching Echo adapter helper on individual routes. `ISUTOOLS_SCENARIO` is the
+lower-effort choice when every request in a benchmark process shares one label.
+
+## Trusted session labels for nginx
+
+Client-supplied flow headers are never trusted. `isutools.HTTP` automatically
+installs the flow-label middleware and returns a fixed URL-safe HMAC pseudonym
+as an upstream response header:
 
 ```bash
 export ISUTOOLS_SESSION_COOKIE=session
 export ISUTOOLS_SESSION_HMAC_KEY='at-least-32-random-bytes-kept-out-of-git'
+export ISUTOOLS_SCENARIO=official_benchmark
 ```
 
 nginx records `$upstream_http_x_isutools_session`, hides the upstream header
 from the public response, and clears the inbound spoofable header. Invalid
 cookie/key configuration fails closed and reports only a bounded reason.
+Set `ISUTOOLS_FLOW_LABELS=off` for an immediate request-path opt-out. A closed
+synthetic test edge may instead map public labels to distinct
+`X-Isutools-Trusted-*` headers and opt in with
+`ISUTOOLS_TRUST_INBOUND_FLOW_LABELS=1`; never enable that mode for arbitrary
+Internet traffic.
 
 ## CPU handoff and flame view
 
@@ -107,6 +119,10 @@ waits a bounded 100 ms for a previous requested stop. If ownership remains,
 the new run is explicitly recorded as `skipped/cpu-busy`; a later retry can
 start after the owner releases. `/reset` exposes
 `X-Isutools-CPU-Profile-State` and `X-Isutools-CPU-Profile-Code`.
+Here, `cpu-busy` means process-local profiler ownership contention, not high
+host CPU utilization. Wait for the other capture to finish, then confirm
+`X-Isutools-CPU-Profile-State: capturing` on `POST /reset` before running the
+benchmark, `POST /save`, and `isutools-pprof` analysis once.
 
 The external analyzer publishes a deterministic bounded flame tree only when
 the input profile hashes and capture executable match. CPU uses interval

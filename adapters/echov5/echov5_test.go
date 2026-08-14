@@ -8,7 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ekusiadadus/isutools"
 	"github.com/ekusiadadus/isutools/httpstats"
+	"github.com/ekusiadadus/isutools/sessionlabel"
 	"github.com/labstack/echo/v5"
 )
 
@@ -55,4 +57,20 @@ func countFor(entries httpstats.Snapshot, path string) int64 {
 		}
 	}
 	return 0
+}
+
+func TestEchoV5ScenarioMiddlewareSetsTrustedScenario(t *testing.T) {
+	t.Setenv(sessionlabel.EnvFlowLabels, "on")
+	t.Setenv(sessionlabel.EnvSourceCookie, "SESSIONID")
+	t.Setenv(sessionlabel.EnvHMACKey, strings.Repeat("e", sessionlabel.MinKeyBytes))
+	e := echo.New()
+	e.Use(Scenario("viewer"))
+	e.GET("/users/:id", func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) })
+	req := httptest.NewRequest(http.MethodGet, "/users/private-id", nil)
+	req.AddCookie(&http.Cookie{Name: "SESSIONID", Value: "raw-cookie"})
+	rec := httptest.NewRecorder()
+	isutools.HTTP(e).ServeHTTP(rec, req)
+	if got := rec.Header().Get(sessionlabel.ScenarioHeaderName); got != "viewer" {
+		t.Fatalf("scenario = %q", got)
+	}
 }
