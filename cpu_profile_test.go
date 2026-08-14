@@ -120,8 +120,8 @@ func TestMeasurementOffDoesNotConstructManagedCPUOwner(t *testing.T) {
 		envCPUProfileMode: "run",
 		envDataDir:        t.TempDir(),
 	}), runctl.Options{DisableWatchdog: true}, isolatedGenerationCollectors())
-	t.Cleanup(m.ctrl.Close)
-	if m.cpu != nil || m.cpuBridge != nil || m.cpuRoot != nil || m.cpuMode != "" {
+	if m.ctrl != nil || m.proc != nil || m.timeline != nil || m.boundary != nil ||
+		m.cpu != nil || m.cpuBridge != nil || m.cpuRoot != nil || m.cpuMode != "" {
 		t.Fatalf("off measurement constructed CPU owner: %#v", m)
 	}
 }

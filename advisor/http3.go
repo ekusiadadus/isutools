@@ -499,6 +499,9 @@ func formatErrorRate(errors, total int64) string {
 }
 
 func sortChecks(checks []Check) []Check {
+	for i := range checks {
+		checks[i] = ensureProvenance(checks[i])
+	}
 	sort.SliceStable(checks, func(i, j int) bool {
 		return statusRank[checks[i].Status] < statusRank[checks[j].Status]
 	})

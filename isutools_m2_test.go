@@ -29,7 +29,7 @@ func TestHTTPFacadeUsesDefaultCollector(t *testing.T) {
 }
 
 func TestHTTPFacadeIsZeroOverheadWhenOff(t *testing.T) {
-	t.Setenv("ISUTOOLS", "off")
+	setHardOffForTest(t)
 	next := &fixedHandler{}
 	if got := HTTP(next); got != next {
 		t.Fatal("HTTP must return the original handler when ISUTOOLS=off")

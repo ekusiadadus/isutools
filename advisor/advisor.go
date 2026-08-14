@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -35,11 +34,27 @@ const (
 
 // Check is one advisor finding.
 type Check struct {
-	ID             string `json:"id"`
-	Title          string `json:"title"`
-	Status         Status `json:"status"`
-	Detail         string `json:"detail,omitempty"`
-	Recommendation string `json:"recommendation,omitempty"`
+	ID             string     `json:"id"`
+	Title          string     `json:"title"`
+	Status         Status     `json:"status"`
+	Detail         string     `json:"detail,omitempty"`
+	Recommendation string     `json:"recommendation,omitempty"`
+	Provenance     Provenance `json:"provenance"`
+}
+
+// Provenance explains the deterministic rule without copying raw config,
+// SQL, driver errors, DSNs or credentials into the report.
+type Provenance struct {
+	RuleVersion string `json:"rule_version"`
+	Category    string `json:"category"`
+	Source      string `json:"source"`
+	Freshness   string `json:"freshness"`
+	Scope       string `json:"scope"`
+	Formula     string `json:"formula"`
+	Actual      string `json:"actual"`
+	Unit        string `json:"unit"`
+	Limitation  string `json:"limitation"`
+	Docs        string `json:"docs"`
 }
 
 // Options supplies the inspectable inputs. Zero values skip the related checks.
@@ -85,10 +100,48 @@ func Collect(ctx context.Context, opts Options) []Check {
 	checks = append(checks, queryPlanChecks(nil, "")...)
 	checks = append(checks, checkECH(opts)...)
 	checks = append(checks, checkTransport(opts)...)
-	sort.SliceStable(checks, func(i, j int) bool {
-		return statusRank[checks[i].Status] < statusRank[checks[j].Status]
-	})
-	return checks
+	return sortChecks(checks)
+}
+
+func ensureProvenance(check Check) Check {
+	if check.Provenance.RuleVersion != "" {
+		return check
+	}
+	category, source, freshness, scope, limitation := provenanceClass(check.ID)
+	check.Provenance = Provenance{
+		RuleVersion: "advisor-v1", Category: category, Source: source,
+		Freshness: freshness, Scope: scope,
+		Formula: "deterministic predicate for rule " + check.ID + "; no generated score",
+		Actual:  "status=" + string(check.Status), Unit: "state",
+		Limitation: limitation,
+		Docs:       "docs/ADVISOR_RULES.md#" + check.ID,
+	}
+	return check
+}
+
+func provenanceClass(id string) (category, source, freshness, scope, limitation string) {
+	switch {
+	case strings.HasPrefix(id, "dsn-"):
+		return "config-inspection", "registered driver metadata", "connection-open", "process", "static DSN option inspection is not server runtime proof"
+	case strings.HasPrefix(id, "mysql-"):
+		return "measured-metric", "MySQL variables and information_schema", "generation-start", "registered-target", "requires a reachable MySQL-compatible inspector"
+	case strings.HasPrefix(id, "nginx-"):
+		return "config-inspection", "bounded proxy configuration", "generation-start", "configured-proxy", "static configuration does not prove the active process loaded it"
+	case strings.HasPrefix(id, "os-"):
+		return "measured-metric", "local procfs and cgroup files", "generation-start", "local-host", "off-host kernel state is unavailable"
+	case strings.HasPrefix(id, "go-"):
+		return "config-inspection", "Go runtime or executable metadata", "generation-start", "process", "build and runtime evidence do not establish workload impact"
+	case strings.HasPrefix(id, "plan-"):
+		return "measured-metric", "bounded query-plan capture", "run-finish", "registered-target", "plan evidence is sampled and correlation is not causation"
+	case strings.HasPrefix(id, "cache-"):
+		return "measured-metric", "application cache telemetry", "run-finish", "configured-cache", "counters require the same measured interval"
+	case strings.HasPrefix(id, "http3-"):
+		return "measured-metric", "protocol and QUIC evidence", "run-finish", "declared-hop", "origin traffic cannot prove client-to-edge protocol use"
+	case strings.HasPrefix(id, "ech-"):
+		return "external-evidence", "operator-declared edge evidence", "startup", "declared-edge", "declaration is not an active external probe"
+	default:
+		return "config-inspection", "bounded local inspection", "generation-start", "local-process", "recommendation requires workload-specific validation"
+	}
 }
 
 func checkDSN(opts Options) []Check {

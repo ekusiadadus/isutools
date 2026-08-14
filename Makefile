@@ -20,7 +20,7 @@ SSH := ssh $(SSH_OPTIONS) $(REMOTE_HOST)
 SCP := scp $(SSH_OPTIONS)
 
 .DEFAULT_GOAL := help
-.PHONY: help require-config status check bench pull-results verify-results pprof tunnel dashboard
+.PHONY: help require-config status check bench pull-results verify-results open-results pprof tunnel dashboard build-tools
 
 help:
 	@printf '%s\n' \
@@ -29,9 +29,11 @@ help:
 	  'make bench         run reset -> benchmark -> collect -> save, then copy results' \
 	  'make pull-results  stage isutools artifacts remotely and fetch them with scp' \
 	  'make verify-results summarize the newest local JSON artifact' \
+	  'make open-results   open the newest self-contained HTML copied by SCP' \
 	  'make pprof         capture a manual CPU profile and copy it locally' \
 	  'make tunnel        forward localhost:$(LOCAL_PORT) (Ctrl-C to stop)' \
-	  'make dashboard     open http://127.0.0.1:$(LOCAL_PORT)/ on this Mac'
+	  'make dashboard     open http://127.0.0.1:$(LOCAL_PORT)/ on this Mac' \
+	  'make build-tools   build isutools agent, hub, pprof, and trajectory CLIs'
 
 require-config:
 	@test -n '$(REMOTE_HOST)' || { printf 'REMOTE_HOST is required; copy .isutools.mk.example to .isutools.mk\n' >&2; exit 2; }
@@ -93,6 +95,13 @@ verify-results:
 	printf 'artifact: %s\n' "$$latest"; \
 	jq -e '{time:.meta.time,generation:.meta.generation,score:.meta.score,benchmark_pass:.meta.benchmark_pass,partial:.meta.partial,run_id:.meta.run.run_id,validity:.meta.run.validity,sql_rows:(.sql|length),http_rows:(.http|length),accesslog_lines:(.accesslog.lines // 0),accesslog_partial:(.accesslog.partial_lines // 0),profile_status:([.meta.health[]? | select(.collector=="profile")][0].status // "missing")}' "$$latest"
 
+open-results:
+	@set -eu; \
+	latest=$$(find '$(RESULTS_DIR)' -maxdepth 1 -type f -name '*.html' -print | sort | tail -n 1); \
+	test -n "$$latest" || { printf 'no HTML artifacts in %s\n' '$(RESULTS_DIR)' >&2; exit 1; }; \
+	printf 'opening %s\n' "$$latest"; \
+	open "$$latest"
+
 pprof: check
 	@set -eu; \
 	case '$(PPROF_SECONDS)' in ''|*[!0-9]*) printf 'PPROF_SECONDS must be an integer\n' >&2; exit 2;; esac; \
@@ -117,3 +126,15 @@ tunnel: require-config
 
 dashboard:
 	@open 'http://127.0.0.1:$(LOCAL_PORT)/'
+
+build-tools:
+	@mkdir -p bin
+	go build -o bin/isutools-agent ./cmd/isutools-agent
+	go build -o bin/isutools-hub ./cmd/isutools-hub
+	go build -o bin/isutools-pprof ./cmd/isutools-pprof
+	go build -o bin/isutools-trajectory ./cmd/isutools-trajectory
+
+.PHONY: test-adapters
+test-adapters:
+	cd adapters/echov4 && go test ./...
+	cd adapters/echov5 && go test ./...

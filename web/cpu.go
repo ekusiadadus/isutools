@@ -151,12 +151,12 @@ type SafeLabelTuple struct {
 
 const cpuStopPublicationBudget = 2 * time.Second
 
-func (h *handler) startCPUProfiles(ctx context.Context, run RunStart, generation int64) {
+func (h *handler) startCPUProfiles(ctx context.Context, run RunStart, generation int64) CPUStartResult {
 	if h.p.CPUProfiles == nil {
 		// Compatibility path for standalone web.Provider users. The standard
 		// isutools stack injects its process-wide owner instead.
 		h.captureCPUProfile(generation)
-		return
+		return CPUStartResult{}
 	}
 	switch h.p.CPUProfileMode {
 	case "run":
@@ -165,9 +165,10 @@ func (h *handler) startCPUProfiles(ctx context.Context, run RunStart, generation
 			BoundaryStart: cpuStartBoundary(run), GenerationWindow: run.GenerationWindow, BoundaryWindow: run.BoundaryWindow,
 		})
 		h.noteCPUStart(result)
+		return result
 	case "fixed":
 		if h.p.PprofDuration <= 0 {
-			return
+			return CPUStartResult{}
 		}
 		result := h.p.CPUProfiles.StartFixed(ctx, FixedCPUStartRequest{
 			RunID: run.RunID, Epoch: run.Epoch, State: run.State, Validity: run.Validity,
@@ -175,7 +176,9 @@ func (h *handler) startCPUProfiles(ctx context.Context, run RunStart, generation
 			GenerationWindow: run.GenerationWindow, BoundaryWindow: run.BoundaryWindow,
 		})
 		h.noteCPUStart(result)
+		return result
 	}
+	return CPUStartResult{}
 }
 
 func cpuStartBoundary(run RunStart) time.Time {

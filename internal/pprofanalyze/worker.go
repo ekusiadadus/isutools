@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	pprofprofile "github.com/google/pprof/profile"
+
 	"github.com/ekusiadadus/isutools/internal/profilecapture"
 	"github.com/ekusiadadus/isutools/internal/profilemodel"
 )
@@ -52,6 +54,7 @@ type WorkerJob struct {
 type WorkerResult struct {
 	Isolation           profilemodel.WorkerIsolation  `json:"isolation"`
 	Summaries           []profilemodel.ProfileSummary `json:"summaries,omitempty"`
+	Flame               *profilemodel.FlameGraph      `json:"flame,omitempty"`
 	ForeignProfileLabel bool                          `json:"foreign_profile_label,omitempty"`
 	ErrorCode           string                        `json:"error_code,omitempty"`
 	ErrorMessage        string                        `json:"error_message,omitempty"`
@@ -390,6 +393,10 @@ func executeWorkerRequest(request workerRequest, isolation profilemodel.WorkerIs
 	var err error
 	if request.Mode == profilemodel.ProfileModeInterval {
 		result.Summaries, err = AnalyzeInterval(profiles[0], request.TopN)
+		if err == nil {
+			flame, flameErr := BuildFlame(profiles[0].Profile)
+			result.Flame, err = &flame, flameErr
+		}
 		if err == nil && request.Dictionary != nil {
 			for index := range result.Summaries {
 				labels, foreign, labelErr := AggregateTrustedLabels(profiles[0].Profile, index, *request.Dictionary)
@@ -403,9 +410,18 @@ func executeWorkerRequest(request workerRequest, isolation profilemodel.WorkerIs
 		}
 	} else {
 		result.Summaries, err = AnalyzeDelta(profiles[0], profiles[1], request.TopN)
+		if err == nil {
+			var delta *pprofprofile.Profile
+			delta, err = DeltaProfile(profiles[0], profiles[1], request.TopN)
+			if err == nil {
+				flame, flameErr := BuildFlame(delta)
+				result.Flame, err = &flame, flameErr
+			}
+		}
 	}
 	if err != nil {
 		result.Summaries = nil
+		result.Flame = nil
 		result.ErrorCode, result.ErrorMessage = workerDiagnostic(err), boundedError(err)
 	}
 	return result

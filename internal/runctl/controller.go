@@ -3,6 +3,7 @@ package runctl
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -251,6 +252,23 @@ func (c *Controller) RegisterBaseline(r Registration, b BaselineCollector) error
 	}
 	c.bases = append(c.bases, registeredBaseline{reg: r, coll: b})
 	return nil
+}
+
+// RegisteredCollectors returns the runtime-derived section names advertised
+// by the multi-host embedded peer. Non-collector snapshot sections are added
+// by the transport separately.
+func (c *Controller) RegisteredCollectors() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	names := make([]string, 0, len(c.gens)+len(c.bases))
+	for _, item := range c.gens {
+		names = append(names, item.reg.Name)
+	}
+	for _, item := range c.bases {
+		names = append(names, item.reg.Name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // checkBudget rejects a collector asking for more time than its parent allows.

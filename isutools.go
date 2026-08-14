@@ -39,6 +39,7 @@ import (
 	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/counters"
+	"github.com/ekusiadadus/isutools/dbcap"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
 	"github.com/ekusiadadus/isutools/hoststats"
@@ -67,8 +68,9 @@ var (
 	collectorHealth = health.NewRegistry()
 )
 
-// Off reports whether measurement is globally disabled via ISUTOOLS=off.
-func Off() bool { return os.Getenv("ISUTOOLS") == "off" }
+// Off reports the immutable process-start decision for ISUTOOLS. Accepted
+// hard-off spellings are off, 0, false, no, and disabled (case-insensitive).
+func Off() bool { return resolvedProcessConfig().Off }
 
 // Feature flags for the optional collectors. Every one of them defaults to
 // on; the flag exists so a run can be measured with the collector removed
@@ -85,6 +87,11 @@ const (
 // to read the same one: the two halves of a profile pair are matched by the
 // directory they were written to.
 const envDataDir = "ISUTOOLS_DATA_DIR"
+
+const (
+	envAccessLogPathRules = "ISUTOOLS_ACCESS_LOG_PATH_RULES"
+	envAccessLogUnmatched = "ISUTOOLS_ACCESS_LOG_UNMATCHED"
+)
 
 // Runtime profile configuration. All three default to off: the default
 // configuration must add zero overhead, and a profile rate is a process-wide
@@ -279,6 +286,10 @@ func newMeasurement(getenv func(string) string, opts runctl.Options) *measuremen
 // set, so a test can drive a private Controller without advancing the epoch of
 // the process-wide collectors.
 func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens generationCollectors) *measurement {
+	mode := resolveGlobalConfig(getenv)
+	if mode.Off {
+		return &measurement{}
+	}
 	if opts.Health == nil {
 		opts.Health = collectorHealth
 	}
@@ -288,9 +299,7 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		cpuRoot   *safefs.Root
 		cpuMode   string
 	)
-	if getenv("ISUTOOLS") != "off" {
-		cpu, cpuBridge, cpuRoot, cpuMode = newRunCPUCoordinator(getenv)
-	}
+	cpu, cpuBridge, cpuRoot, cpuMode = newRunCPUCoordinator(getenv)
 	recovery := newRunRecoveryLedger()
 	timelineRuntime := newTimelineRuntime(getenv)
 	observers := joinedRunObservers{}
@@ -309,12 +318,9 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 	// a Controller's hook is fixed at construction. Preserve an Enrich supplied
 	// by the caller and compose query-plan capture after it; enabling EXPLAIN
 	// must not silently disable another snapshot enrichment.
-	var explain *explainCapture
-	if getenv("ISUTOOLS") != "off" {
-		explain = newExplainCapture(getenv, collectorHealth)
-		if explain != nil {
-			opts.Enrich = composeEnrich(opts.Enrich, explain.enrich)
-		}
+	explain := newExplainCapture(getenv, collectorHealth)
+	if explain != nil {
+		opts.Enrich = composeEnrich(opts.Enrich, explain.enrich)
 	}
 	ctrl, err := runctl.New(opts)
 	if err != nil {
@@ -338,8 +344,6 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 			timelineRuntime = nil
 		}
 	}
-	// The process collector is built even when measurement is off, because
-	// Handler() has always served a report regardless of ISUTOOLS=off.
 	m := &measurement{
 		ctrl:        ctrl,
 		cpu:         cpu,
@@ -352,9 +356,6 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		proc:        newProcCollector(),
 		explain:     explain,
 		generation:  sqlstats.Default.CurrentGeneration,
-	}
-	if getenv("ISUTOOLS") == "off" {
-		return m
 	}
 	baselines := registerCollectorsStatus(ctrl, getenv)
 	m.procManaged = registerProcCollector(ctrl, m.proc)
@@ -1009,18 +1010,34 @@ func (m *measurement) resetNow(ctx context.Context, o runctl.StartRunOptions) (S
 	}
 	m.captureOpenProfiles(result)
 	if m.cpuBridge != nil && m.cpuMode == "run" {
-		m.cpuBridge.StartRun(ctx, web.CPUStartRequest{
+		cpuStart := m.cpuBridge.StartRun(ctx, web.CPUStartRequest{
 			RunID: result.RunID, Epoch: uint64(result.Epoch), State: string(result.State), Validity: string(result.Validity),
 			BoundaryStart: cpuStartBoundary(result), GenerationWindow: webBoundaryWindow(result.GenerationWindow), BoundaryWindow: webBoundaryWindow(result.BoundaryWindow),
 		})
+		result.CPUProfileStart = &runctl.ProfileStartEvidence{CaptureID: cpuStart.CaptureID, State: cpuStart.State, Code: cpuStart.Code}
+		noteCPUStartHealth(cpuStart)
 	} else if m.cpuBridge != nil && m.cpuMode == "fixed" {
-		m.cpuBridge.StartFixed(ctx, web.FixedCPUStartRequest{
+		cpuStart := m.cpuBridge.StartFixed(ctx, web.FixedCPUStartRequest{
 			RunID: result.RunID, Epoch: uint64(result.Epoch), State: string(result.State), Validity: string(result.Validity),
 			Generation: m.generation(), Duration: m.cpuDuration, RequestedAt: time.Now(),
 			GenerationWindow: webBoundaryWindow(result.GenerationWindow), BoundaryWindow: webBoundaryWindow(result.BoundaryWindow),
 		})
+		result.CPUProfileStart = &runctl.ProfileStartEvidence{CaptureID: cpuStart.CaptureID, State: cpuStart.State, Code: cpuStart.Code}
+		noteCPUStartHealth(cpuStart)
 	}
 	return result, nil
+}
+
+func noteCPUStartHealth(result web.CPUStartResult) {
+	if result.State == "capturing" || result.State == "replayed" {
+		collectorHealth.Set("profile-cpu", health.StatusOK, "")
+		return
+	}
+	code := result.Code
+	if code == "" {
+		code = "start-unavailable"
+	}
+	collectorHealth.Set("profile-cpu", health.StatusDegraded, code)
 }
 
 func cpuStartBoundary(result runctl.StartResult) time.Time {
@@ -1366,6 +1383,9 @@ func SerializeInitialize(ctx context.Context, fn func(context.Context) error) er
 // would split a single database across two rows of every report. Obtain the
 // ID from RegisterDBTarget, or look it up with sqlstats.TargetIDForDSN.
 func WatchDBPool(targetID string, db *sql.DB) error {
+	if Off() {
+		return nil
+	}
 	if db == nil {
 		return fmt.Errorf("%w: target %q", dbpool.ErrNilDB, targetID)
 	}
@@ -1376,7 +1396,7 @@ func WatchDBPool(targetID string, db *sql.DB) error {
 	// The argument checks above run even when measurement is off, so a wiring
 	// bug surfaces in the configuration the application actually ships rather
 	// than only in the one it benchmarks.
-	if Off() || !featureEnabled(os.Getenv, envDBPool) {
+	if !featureEnabled(os.Getenv, envDBPool) {
 		return nil
 	}
 	defaultMeasurement()
@@ -1497,6 +1517,9 @@ func resolveAccessLogPath(getenv func(string) string) string {
 // startAdmin starts the admin HTTP server once. Failures are logged and
 // otherwise ignored: the report becomes unavailable, the app is unaffected.
 func startAdmin() {
+	if Off() {
+		return
+	}
 	adminOnce.Do(func() {
 		addr := resolveAdminAddr(os.Getenv)
 		if addr == "" {
@@ -1689,7 +1712,16 @@ func AddCount(name string, delta int64) {
 // observe one run lifecycle and one process baseline rather than two
 // unrelated ones.
 func Handler() http.Handler {
+	if Off() {
+		return http.NotFoundHandler()
+	}
 	core := defaultMeasurement()
+	sqlCommentPolicy, sqlCommentReason := sqlstats.ResolveCommentTagPolicy(os.Getenv)
+	if sqlCommentReason == "invalid-value" {
+		collectorHealth.Set("sql-comment-tags", health.StatusDegraded, sqlCommentReason)
+	} else {
+		collectorHealth.Set("sql-comment-tags", health.StatusOK, string(sqlCommentPolicy))
+	}
 	provider := web.Provider{
 		SQL:           sqlstats.Default,
 		SQLGeneration: sqlstats.Default.CurrentGeneration,
@@ -1714,8 +1746,9 @@ func Handler() http.Handler {
 			}
 			return dbinspect.Collect(ctx, name, dsn)
 		},
-		Advisor:  collectAdvice,
-		Counters: counters.Default,
+		DBCapabilities: func() []dbcap.Target { return dbcap.ForTargets(sqlstats.Targets(), nil) },
+		Advisor:        collectAdvice,
+		Counters:       counters.Default,
 		// The reset boundary is the run boundary: POST /reset opens a run on
 		// the shared Controller and answers with its id, so a bench script can
 		// name the run it just started. POST /finish and POST /save close it
@@ -1749,7 +1782,15 @@ func Handler() http.Handler {
 	}
 	collectorHealth.Set("http", health.StatusOK, "")
 	if path := resolveAccessLogPath(os.Getenv); path != "" {
-		collector := accesslog.New(path)
+		unmatched := accesslog.UnmatchedKeep
+		switch strings.ToLower(strings.TrimSpace(os.Getenv(envAccessLogUnmatched))) {
+		case "", "keep":
+		case "collapse":
+			unmatched = accesslog.UnmatchedCollapse
+		default:
+			collectorHealth.Set("accesslog-path-rules", health.StatusDegraded, "invalid-unmatched-policy")
+		}
+		collector := accesslog.New(path, accesslog.WithPathRulesSpec(os.Getenv(envAccessLogPathRules), unmatched))
 		provider.AccessLog = collector
 		provider.AccessLogGenerationManaged = core.watchAccessLogGeneration(collector)
 		provider.AccessLogQuiet = 100 * time.Millisecond

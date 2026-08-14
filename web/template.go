@@ -1000,6 +1000,20 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 </details>
 {{else}}<p class="empty">no core collector warnings</p>{{end}}
 
+{{if .Snapshot.Peers}}
+<span id="multi-host"></span><h2>Multi-host Participants <span class="meta">(hostごとの値。合算しません)</span></h2>
+<table>
+<thead><tr><th>role</th><th>agent</th><th>form</th><th>required</th><th>state</th><th>validity</th><th>sealed</th><th>budget</th><th>failure</th></tr></thead>
+<tbody>{{range .Snapshot.Peers}}<tr>
+<td class="l">{{.Info.Role}}</td><td class="l">{{.Info.AgentID}}</td><td>{{.Form}}</td><td>{{.Required}}</td>
+<td>{{if .Status}}{{.Status.State}}{{else}}-{{end}}</td><td>{{if .Status}}{{.Status.Validity}}{{else}}-{{end}}</td><td>{{.Sealed}}</td>
+<td>{{if .Local}}{{.Local.Budget.EncodedBytes}} / {{.Local.Budget.MaxBytes}}{{else}}-{{end}}</td>
+<td class="l">{{if .Failure}}{{.Failure.Phase}} / {{.Failure.Code}}{{else}}-{{end}}</td>
+</tr>{{end}}</tbody>
+</table>
+<p class="meta">Start/Finishのsend→ack区間、host identity、section issues、local snapshotはJSONに保持されます。required participantの欠落はinvalid、optionalの欠落はpartialです。</p>
+{{end}}
+
 {{with .Snapshot.Timeline}}
 <span id="run-timeline"></span><h2>Run Timeline <span class="meta">(時系列相関。原因の断定ではありません)</span></h2>
 <p class="meta">{{ns .IntervalNs}} buckets &middot; {{len .Buckets}} / {{.MaxBuckets}} retained{{if .Truncated}} &middot; <span class="warn">truncated</span>{{end}}{{if .OverflowedEvents}} &middot; overflowed events {{.OverflowedEvents}}{{end}}</p>
@@ -1033,19 +1047,32 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <h2>Advisor <span class="meta">(ISUCON 定石で未設定のもの)</span></h2>
 {{if .Snapshot.Advisor}}
 <table>
-<thead><tr><th>status</th><th>check</th><th>current</th><th>recommendation</th></tr></thead>
+<thead><tr><th>status</th><th>check</th><th>current</th><th>recommendation</th><th>why</th></tr></thead>
 <tbody>
 {{range .Snapshot.Advisor}}<tr>
 <td class="l">{{if eq (printf "%s" .Status) "missing"}}<strong class="warn">missing</strong>{{else if eq (printf "%s" .Status) "warn"}}<span class="warn">warn</span>{{else}}{{.Status}}{{end}}</td>
 <td class="l">{{.Title}}</td>
 <td class="l">{{.Detail}}</td>
 <td class="l">{{.Recommendation}}</td>
+<td class="l"><details><summary>{{.Provenance.RuleVersion}} / {{.Provenance.Category}}</summary>
+source: {{.Provenance.Source}} ({{.Provenance.Freshness}}, {{.Provenance.Scope}})<br>
+formula: {{.Provenance.Formula}}<br>actual: {{.Provenance.Actual}} {{.Provenance.Unit}}<br>
+limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></td>
 </tr>{{end}}
 </tbody>
 </table>
 {{else}}<p class="empty">not captured</p>{{end}}
 
 <h2>DB Schema <span class="meta">(captured at generation start)</span></h2>
+<details><summary>Database capability matrix</summary>
+<table><thead><tr><th>feature</th><th>MySQL</th><th>MariaDB</th><th>PostgreSQL</th><th>requirement</th></tr></thead><tbody>
+{{range .Snapshot.DBCapabilityMatrix}}<tr><td class="l">{{.Feature}}</td><td>{{.MySQL}}</td><td>{{.MariaDB}}</td><td>{{.PostgreSQL}}</td><td class="l">{{.Requirement}}</td></tr>{{end}}
+</tbody></table>
+{{if .Snapshot.DBCapabilities}}<h3>Registered targets</h3>
+{{range .Snapshot.DBCapabilities}}<p class="meta"><strong>{{.TargetID}}</strong> dialect={{.Dialect}} flavor={{.Flavor}} version={{.Version}}</p>
+<table><thead><tr><th>feature</th><th>state</th><th>reason</th></tr></thead><tbody>{{range .Capabilities}}<tr><td class="l">{{.Feature}}</td><td>{{.State}}</td><td class="l">{{.Reason}}</td></tr>{{end}}</tbody></table>{{end}}
+{{else}}<p class="empty">no registered database targets</p>{{end}}
+</details>
 {{if .Snapshot.DB}}{{if .Snapshot.DB.Error}}<p class="empty warn">{{.Snapshot.DB.Error}}</p>{{else}}
 <table>
 <thead><tr><th>table</th><th>engine</th><th>~rows</th><th>data(MB)</th><th>indexes</th></tr></thead>

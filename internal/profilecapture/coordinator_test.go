@@ -362,6 +362,57 @@ func TestStopStallBecomesWedgedAndLateCompletionRecoversOwner(t *testing.T) {
 	}
 }
 
+func TestPreemptingStartPerformsBoundedStopToStartHandoff(t *testing.T) {
+	stopWait := make(chan struct{})
+	backend, factory := &fakeBackend{stopWait: stopWait}, &fakeFactory{}
+	c := newTestCoordinator(t, backend, factory, func(o *Options) { o.StartJoin = 100 * time.Millisecond })
+	first := validStartRequest()
+	if result := c.StartRun(context.Background(), first); result.State != StateCapturing {
+		t.Fatalf("first=%#v", result)
+	}
+	c.RequestStop(StopRequest{RunID: first.RunID, Epoch: first.Epoch, State: "aborted", Validity: "invalid", Reason: "preempted", BoundaryAt: time.Now()})
+	second := validStartRequest()
+	second.RunID, second.Epoch = "run-2", 2
+	resultCh := make(chan StartResult, 1)
+	go func() { resultCh <- c.StartRun(context.Background(), second) }()
+	select {
+	case result := <-resultCh:
+		t.Fatalf("handoff returned before prior owner released: %#v", result)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(stopWait)
+	select {
+	case result := <-resultCh:
+		if result.State != StateCapturing || result.Code != "" || backend.starts.Load() != 2 {
+			t.Fatalf("handoff result=%#v starts=%d", result, backend.starts.Load())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handoff did not start after prior owner released")
+	}
+}
+
+func TestPreemptingStartTimeoutPersistsMissingAttempt(t *testing.T) {
+	stopWait := make(chan struct{})
+	backend, factory := &fakeBackend{stopWait: stopWait}, &fakeFactory{}
+	c := newTestCoordinator(t, backend, factory, func(o *Options) { o.StartJoin = 10 * time.Millisecond })
+	first := validStartRequest()
+	c.StartRun(context.Background(), first)
+	c.RequestStop(StopRequest{RunID: first.RunID, Epoch: first.Epoch, State: "aborted", Validity: "invalid", Reason: "preempted", BoundaryAt: time.Now()})
+	second := validStartRequest()
+	second.RunID, second.Epoch = "run-2", 2
+	result := c.StartRun(context.Background(), second)
+	if result.State != StateSkipped || result.Code != CodeCPUBusy || result.CaptureID == "" {
+		close(stopWait)
+		t.Fatalf("second=%#v", result)
+	}
+	status, ok := c.Status(second.RunID, second.Epoch)
+	if !ok || status.State != StateSkipped || status.Code != CodeCPUBusy || status.CaptureID != result.CaptureID {
+		close(stopWait)
+		t.Fatalf("status=%#v ok=%v", status, ok)
+	}
+	close(stopWait)
+}
+
 func TestStartStallLateSuccessIsStoppedAndOrphaned(t *testing.T) {
 	t.Parallel()
 

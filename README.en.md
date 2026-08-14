@@ -79,6 +79,7 @@ Using only isutools measurements, one day of private-isu tuning improved the sco
 - [How we optimized the ISUCON14 Go web application](./docs/case-studies/isucon14-webapp-optimization.en.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 - [Integration guide](./docs/INTEGRATION.md)
+- [Field feedback: save errors, Echo, sessions, flame views, and multi-host](./docs/FIELD_FEEDBACK.md)
 - [Design](./DESIGN.md) / [Implementation status](./docs/IMPLEMENTATION_STATUS.md)
 
 ## Coverage
@@ -87,6 +88,7 @@ Using only isutools measurements, one day of private-isu tuning improved the sco
 |---|---|
 | Database | MySQL / MariaDB / PostgreSQL through `database/sql` |
 | HTTP | Go `net/http` middleware |
+| Router adapters | Echo v4/v5 and a framework-neutral route-template API |
 | Reverse-proxy logs | Explicit nginx / Caddy / Apache / Envoy formats |
 | Runtime | pprof, CPU, mutex, block, and heap profiles |
 | Host | Linux procfs / sysfs / cgroup v2 |
@@ -338,10 +340,14 @@ you can match a run to the benchmark that produced it afterwards.
 | `ISUTOOLS_ALLOW_UNAUTHENTICATED` | — | `1` explicitly allows a non-loopback bind. **Only for Docker setups with an SSH tunnel + publish restricted to `127.0.0.1`** (shows a security warning, kept separate from measurement `partial`) |
 | `ISUTOOLS_DATA_DIR` | — | Where snapshots / profiles are persisted (the backing store of the run list) |
 | `ISUTOOLS_ACCESS_LOG` | — | Path to the nginx/Caddy/Apache/Envoy log. **LTSV / JSON lines auto-detected** (see the integration guide for supported formats) |
+| `ISUTOOLS_ACCESS_LOG_PATH_RULES` / `_UNMATCHED` | — / `keep` | Full-match access-log regexp to constant paths; unmatched paths are kept or collapsed |
+| `ISUTOOLS_SQL_COMMENT_TAGS` | on | Retains one safe leading tag; `off` removes all SQL comments without a tag prefix |
 | `ISUTOOLS_NGINX_LOG` | — | Legacy name; used as a fallback only when `ACCESS_LOG` is unset |
 | `ISUTOOLS_PPROF_SECONDS` | 0 | Capture duration in fixed mode; hard maximum in run mode (1–600 seconds) |
 | `ISUTOOLS_CPU_PROFILE_MODE` | off | `fixed` keeps timer capture; `run` aligns CPU capture to run boundaries. Manual `/pprof/profile` returns 409 while run mode owns it |
 | `ISUTOOLS_PROFILE_ANALYSIS` | off | `1` enables read-only capabilities, CAS publication, and derived analysis display |
+| `ISUTOOLS_PEER` / `_TOKEN` | off / — | Explicitly enables the embedded loopback peer; token must be at least 32 bytes |
+| `ISUTOOLS_SESSION_COOKIE` / `_HMAC_KEY` | — | Source cookie and 32-byte-or-longer key for trusted HMAC session labels |
 | `ISUTOOLS_PPROF_LABELS` | off | `1` adds opaque capture/tuple private labels to CPU samples; raw URLs are never stored |
 | `ISUTOOLS_PPROF_SAFE_ROUTE_RULES` | — | Full-match regexp to constant route-label rules used only when no router pattern exists; one invalid rule disables the set |
 | `ISUTOOLS_GIT_HASH` / `_DIRTY` | — | Inject rev info when a Docker build lacks embedded VCS information |
@@ -640,13 +646,13 @@ Network, DB Pool, Query Plans, Profiles) / **Go API** (`ResetNow`,
 `ResetNowWithNonce`, `SerializeInitialize`, runtime profile pairs at both ends
 of a run).
 
-**Multi-host measurement (the peer protocol) is NOT implemented — it exists
-only as a plan** ([plans/10-multi-host.md](./plans/10-multi-host.md)).
-This release measures **a single host**. No code reads the planned
-`ISUTOOLS_PEER` / `ISUTOOLS_PEER_TOKEN` / `ISUTOOLS_AGENT_TARGETS_FILE`
-variables. For a multi-server setup, run isutools separately on each host and
-open one dashboard per host. `SerializeInitialize` is likewise process-local
-and cannot serialize an initialize across hosts.
+Multi-host measurement is implemented through the opt-in embedded peer,
+`cmd/isutools-agent`, and the loopback `cmd/isutools-hub`. The hub coordinates
+start/finish barriers, records send-to-ack uncertainty, applies required vs
+optional validity, enforces per-peer/total size caps, and seals every peer by
+ACK or abort. Transport is SSH local forwarding only; metrics remain separate
+per host and are never summed. See the field-feedback guide for the owner-only
+target/peer JSON formats and lease recovery procedure.
 
 Other known limits: hoststats and netstats are Linux-only; SQL row efficiency
 needs MySQL's performance_schema; EXPLAIN needs MySQL 8.0.17+ plus a dedicated

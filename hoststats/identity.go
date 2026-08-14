@@ -32,6 +32,15 @@ func (c *Collector) readIdentity() Identity {
 	return id
 }
 
+// Identity returns the current credential-free host identity used by the
+// multi-host handshake. Each source degrades independently to an empty field.
+func (c *Collector) Identity() Identity {
+	if c == nil {
+		return Identity{}
+	}
+	return c.readIdentity()
+}
+
 // namespace reads one namespace id from /proc/self/ns. The value is the link
 // target verbatim ("pid:[4026531836]"): it is compared, never interpreted, and
 // two agents reporting the same id are provably in the same namespace.

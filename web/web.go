@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"regexp"
@@ -23,6 +24,7 @@ import (
 	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/counters"
+	"github.com/ekusiadadus/isutools/dbcap"
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
 	"github.com/ekusiadadus/isutools/hoststats"
@@ -32,6 +34,7 @@ import (
 	"github.com/ekusiadadus/isutools/internal/safefs"
 	"github.com/ekusiadadus/isutools/internal/sysinfo"
 	"github.com/ekusiadadus/isutools/internal/timeline"
+	"github.com/ekusiadadus/isutools/multihost"
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
@@ -52,6 +55,42 @@ const (
 )
 
 var errSnapshotTooLarge = errors.New("snapshot exceeds 32 MiB limit")
+
+// AdminReasonHeader mirrors the stable machine-readable reason in an admin
+// endpoint error response. It lets shell wrappers classify a failure without
+// parsing human text.
+const AdminReasonHeader = "X-Isutools-Reason"
+
+const (
+	SaveReasonMethodNotAllowed  = "method-not-allowed"
+	SaveReasonDataDirUnset      = "data-dir-unset"
+	SaveReasonInvalidPass       = "invalid-pass"
+	SaveReasonRunNotActive      = "run-not-active"
+	SaveReasonMutationBusy      = "mutation-busy"
+	SaveReasonSnapshotTooLarge  = "snapshot-too-large"
+	SaveReasonPersistFailed     = "persist-failed"
+	SaveReasonPersistenceUnsafe = "persistence-unavailable"
+	SaveReasonSaved             = "saved"
+)
+
+// AdminErrorResponse is deliberately small and stable. Internal errors,
+// request values, filesystem paths, DSNs and credentials never enter it.
+type AdminErrorResponse struct {
+	Error  string `json:"error"`
+	Reason string `json:"reason"`
+}
+
+// AdminAudit is a bounded, secret-free audit event for mutating admin calls.
+// Provider.AdminAudit may ship it to an application logger; otherwise web
+// writes the JSON object to the standard logger.
+type AdminAudit struct {
+	Time       time.Time `json:"time"`
+	Operation  string    `json:"operation"`
+	Status     int       `json:"status"`
+	Reason     string    `json:"reason"`
+	RunID      string    `json:"run_id,omitempty"`
+	Generation int64     `json:"generation"`
+}
 
 type sqlSnapshotter interface {
 	Snapshot() []agg.Entry
@@ -153,6 +192,11 @@ type Provider struct {
 	// DB captures the database schema (tables/indexes). Called at handler
 	// startup and on every reset so each generation records the pre-run state.
 	DB func(context.Context) *dbinspect.Schema
+	// DBCapabilities returns credential-free, per-target support states.
+	DBCapabilities func() []dbcap.Target
+	// PeerResults returns the sealed, host-by-host multi-host evidence. Values
+	// are displayed separately and are never summed across machines.
+	PeerResults func() []multihost.PeerResult
 	// Advisor reports well-known settings that are not configured. Captured
 	// alongside the DB schema at startup and on every reset.
 	Advisor func(context.Context) []advisor.Check
@@ -174,6 +218,9 @@ type Provider struct {
 	// DataDir persists snapshots for the dashboard history ("" = disabled).
 	DataDir    string
 	Executable *buildinfo.ExecutableIdentity
+	// AdminAudit receives bounded structured audit records for /save failures
+	// and publication. Request values and underlying error strings are omitted.
+	AdminAudit func(AdminAudit)
 	// ProfileAnalysis enables the opt-in derived analysis publication endpoint.
 	// Original snapshot bytes remain immutable regardless of this setting.
 	ProfileAnalysis bool
@@ -381,16 +428,18 @@ type Meta struct {
 
 // Snapshot is the complete state of all measurements at one point in time.
 type Snapshot struct {
-	Meta        Meta                    `json:"meta"`
-	DB          *dbinspect.Schema       `json:"db,omitempty"`
-	Advisor     []advisor.Check         `json:"advisor,omitempty"`
-	Counters    []counters.Entry        `json:"counters,omitempty"`
-	Connections *httpstats.ConnSnapshot `json:"connections,omitempty"`
-	SQL         []agg.Entry             `json:"sql"`
-	HTTP        httpstats.Snapshot      `json:"http,omitempty"`
-	AccessLog   *accesslog.Snapshot     `json:"accesslog,omitempty"`
-	Proc        *procstats.Snapshot     `json:"proc,omitempty"`
-	Timeline    *timeline.Section       `json:"timeline,omitempty"`
+	Meta               Meta                    `json:"meta"`
+	DB                 *dbinspect.Schema       `json:"db,omitempty"`
+	DBCapabilities     []dbcap.Target          `json:"db_capabilities,omitempty"`
+	DBCapabilityMatrix []dbcap.MatrixRow       `json:"db_capability_matrix,omitempty"`
+	Advisor            []advisor.Check         `json:"advisor,omitempty"`
+	Counters           []counters.Entry        `json:"counters,omitempty"`
+	Connections        *httpstats.ConnSnapshot `json:"connections,omitempty"`
+	SQL                []agg.Entry             `json:"sql"`
+	HTTP               httpstats.Snapshot      `json:"http,omitempty"`
+	AccessLog          *accesslog.Snapshot     `json:"accesslog,omitempty"`
+	Proc               *procstats.Snapshot     `json:"proc,omitempty"`
+	Timeline           *timeline.Section       `json:"timeline,omitempty"`
 
 	// The sections below come from the run coordinator's baseline collectors
 	// rather than from a live collector read, so they describe the interval
@@ -409,7 +458,8 @@ type Snapshot struct {
 	// It is filled from the same section map as the others rather than from a
 	// live read, which is what keeps a dashboard refresh from putting EXPLAIN
 	// statements on the measured database.
-	QueryPlan *queryplan.Section `json:"queryplan,omitempty"`
+	QueryPlan *queryplan.Section     `json:"queryplan,omitempty"`
+	Peers     []multihost.PeerResult `json:"peers,omitempty"`
 }
 
 // applyRunSections copies a completed run's baseline collector sections into
@@ -774,9 +824,16 @@ func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries [
 			Partial:         partial,
 			Health:          healthEntries,
 		},
-		DB:      db,
-		Advisor: h.currentAdvisor(),
-		SQL:     entries,
+		DB:                 db,
+		DBCapabilityMatrix: dbcap.CanonicalMatrix(),
+		Advisor:            h.currentAdvisor(),
+		SQL:                entries,
+	}
+	if h.p.DBCapabilities != nil {
+		snap.DBCapabilities = h.p.DBCapabilities()
+	}
+	if h.p.PeerResults != nil {
+		snap.Peers = h.p.PeerResults()
 	}
 	var sections map[string]any
 	if run != nil {
@@ -1268,11 +1325,11 @@ func (h *handler) listTrajectories() []string {
 func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		h.writeAdminError(w, r, http.StatusMethodNotAllowed, SaveReasonMethodNotAllowed, "")
 		return
 	}
 	if h.p.DataDir == "" {
-		http.Error(w, "ISUTOOLS_DATA_DIR is not configured", http.StatusBadRequest)
+		h.writeAdminError(w, r, http.StatusBadRequest, SaveReasonDataDirUnset, "")
 		return
 	}
 	score := ""
@@ -1281,10 +1338,17 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	}
 	benchmarkPass, passSet, err := parseBenchmarkPass(r.URL.Query().Get("pass"))
 	if err != nil {
-		http.Error(w, "isutools: save failed: pass must be true, false, 1, or 0", http.StatusBadRequest)
+		h.writeAdminError(w, r, http.StatusBadRequest, SaveReasonInvalidPass, "")
 		return
 	}
-	if !h.beginOperation(w) {
+	// Refuse a clearly unusable root before changing run state. The root is
+	// opened again for publication so a later filesystem race still fails
+	// closed, but configuration errors cannot consume the active run.
+	if err := h.preflightPersistence(); err != nil {
+		h.writeAdminError(w, r, http.StatusInternalServerError, SaveReasonPersistFailed, "")
+		return
+	}
+	if !h.beginOperation(w, r) {
 		return
 	}
 	defer h.endOperation()
@@ -1312,9 +1376,9 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 			completeAttempted = true
 			if !validRecoveryRun(recovered) {
 				if h.p.Health != nil {
-					h.p.Health.Set("runctl", health.StatusDegraded, err.Error())
+					h.p.Health.Set("runctl", health.StatusDegraded, SaveReasonRunNotActive)
 				}
-				http.Error(w, "isutools: no run to save: "+err.Error(), http.StatusConflict)
+				h.writeAdminError(w, r, http.StatusConflict, SaveReasonRunNotActive, "")
 				return
 			}
 			run = recovered
@@ -1394,10 +1458,10 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	publication, err := h.writeSnapshot(snap, base)
 	if err != nil {
 		if errors.Is(err, errSnapshotTooLarge) {
-			http.Error(w, "isutools: save failed: "+err.Error(), http.StatusRequestEntityTooLarge)
+			h.writeAdminError(w, r, http.StatusRequestEntityTooLarge, SaveReasonSnapshotTooLarge, run.RunID)
 			return
 		}
-		http.Error(w, "isutools: save failed: "+err.Error(), http.StatusInternalServerError)
+		h.writeAdminError(w, r, http.StatusInternalServerError, SaveReasonPersistFailed, run.RunID)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1409,6 +1473,15 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		Visibility:     publication.Visibility,
 		Durability:     publication.Durability,
 	})
+	h.emitAdminAudit(r, http.StatusOK, SaveReasonSaved, run.RunID)
+}
+
+func (h *handler) preflightPersistence() error {
+	root, err := safefs.Open(h.p.DataDir, safefs.Options{RequireStrongVisibility: true, Exclusive: false})
+	if err != nil {
+		return err
+	}
+	return root.Close()
 }
 
 func parseBenchmarkPass(value string) (bool, bool, error) {
@@ -1585,7 +1658,7 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	if !h.beginOperation(w) {
+	if !h.beginOperation(w, r) {
 		return
 	}
 	defer h.endOperation()
@@ -1680,7 +1753,13 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	h.captureRuntimeProfiles(run, ProfilePointOpen, generation)
 	// CPU starts after cumulative profiles so their serialization is not
 	// charged to the run-aligned CPU interval.
-	h.startCPUProfiles(r.Context(), run, generation)
+	cpuStart := h.startCPUProfiles(r.Context(), run, generation)
+	if cpuStart.State != "" {
+		w.Header().Set(cpuStartStateHeader, cpuStart.State)
+	}
+	if cpuStart.Code != "" {
+		w.Header().Set(cpuStartCodeHeader, cpuStart.Code)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1722,6 +1801,11 @@ func (h *handler) rebaselineAccessLog() {
 // runIDHeader names the run a reset opened. Bench scripts read it to label
 // the measurements they are about to produce.
 const runIDHeader = "X-Isutools-Run-Id"
+
+const (
+	cpuStartStateHeader = "X-Isutools-CPU-Profile-State"
+	cpuStartCodeHeader  = "X-Isutools-CPU-Profile-Code"
+)
 
 // startRun opens the run this reset measures. A coordinator failure degrades
 // health and is returned to /reset, which fails closed: a benchmark must not
@@ -1787,7 +1871,7 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: this build has no run coordinator", http.StatusServiceUnavailable)
 		return
 	}
-	if !h.beginOperation(w) {
+	if !h.beginOperation(w, r) {
 		return
 	}
 	defer h.endOperation()
@@ -1836,7 +1920,7 @@ func (h *handler) abort(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "isutools: this build has no run coordinator", http.StatusServiceUnavailable)
 		return
 	}
-	if !h.beginOperation(w) {
+	if !h.beginOperation(w, r) {
 		return
 	}
 	defer h.endOperation()
@@ -1883,7 +1967,7 @@ func (h *handler) collect(w http.ResponseWriter, r *http.Request) {
 	if h.collectPause != nil {
 		h.collectPause()
 	}
-	if !h.beginOperation(w) {
+	if !h.beginOperation(w, r) {
 		return
 	}
 	defer h.endOperation()
@@ -1937,15 +2021,61 @@ func (h *handler) refuseAfterBoundary(w http.ResponseWriter) bool {
 	return true
 }
 
-func (h *handler) beginOperation(w http.ResponseWriter) bool {
+func (h *handler) beginOperation(w http.ResponseWriter, r *http.Request) bool {
 	select {
 	case h.operation <- struct{}{}:
 		return true
 	default:
 		w.Header().Set("Retry-After", "1")
-		http.Error(w, "another reset, collect, or save is already running", http.StatusConflict)
+		h.writeAdminError(w, r, http.StatusConflict, SaveReasonMutationBusy, "")
 		return false
 	}
+}
+
+func (h *handler) writeAdminError(w http.ResponseWriter, r *http.Request, status int, reason, runID string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set(AdminReasonHeader, reason)
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "admin request failed", Reason: reason})
+	h.emitAdminAudit(r, status, reason, runID)
+}
+
+func (h *handler) emitAdminAudit(r *http.Request, status int, reason, runID string) {
+	operation := "admin"
+	if r != nil {
+		switch r.URL.Path {
+		case "/save", "/reset", "/collect", "/finish", "/abort":
+			operation = strings.TrimPrefix(r.URL.Path, "/")
+		}
+	}
+	event := AdminAudit{
+		Time: time.Now().UTC(), Operation: operation, Status: status, Reason: reason,
+		RunID: safeAuditID(runID), Generation: h.gen.Load(),
+	}
+	if h.p.AdminAudit != nil {
+		h.p.AdminAudit(event)
+		return
+	}
+	if payload, err := json.Marshal(event); err == nil {
+		log.Printf("isutools-admin-audit %s", payload)
+	}
+}
+
+func safeAuditID(value string) string {
+	if value == "" {
+		return ""
+	}
+	if len(value) > 96 {
+		return "invalid"
+	}
+	for _, r := range value {
+		allowed := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' || strings.ContainsRune("-_.:", r)
+		if !allowed {
+			return "invalid"
+		}
+	}
+	return value
 }
 
 func (h *handler) endOperation() { <-h.operation }

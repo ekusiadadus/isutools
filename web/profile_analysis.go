@@ -48,6 +48,10 @@ const profileAnalysisTemplateText = `<section id="isutools-profile-analysis">
 <p>coverage: complete={{.Coverage.Complete}} · run={{.Coverage.RunSpanNs}}ns · capture={{.Coverage.CaptureSpanNs}}ns · head loss={{.Coverage.HeadLossNs}}ns · tail excess={{.Coverage.TailExcessNs}}ns · tail loss={{.Coverage.TailLossNs}}ns · stop={{.Coverage.StopReason}}</p>
 {{if .Diagnostics}}<h4>Diagnostics</h4><ul>{{range .Diagnostics}}<li><strong>{{.Level}} / {{.Code}}</strong>: {{.Message}}</li>{{end}}</ul>{{end}}
 <h4>Inputs</h4><ul>{{range .ExpectedInputs}}<li>expected {{.Point}}: <code>{{.File}}</code></li>{{end}}{{range .ObservedInputs}}<li>observed: <a href="/files/{{.File}}">{{.File}}</a> · {{.Bytes}} bytes · <code>{{.SHA256}}</code>{{if .Sidecar}}<br>completion: <a href="/files/{{.Sidecar}}">{{.Sidecar}}</a> · <code>{{.SidecarSHA256}}</code>{{end}}{{if .CoverageFile}}<br>coverage: <a href="/files/{{.CoverageFile}}">{{.CoverageFile}}</a> · <code>{{.CoverageSHA256}}</code>{{end}}</li>{{end}}</ul>
+{{with .Flame}}<details class="isutools-flame"><summary>Flame view ({{.Mode}} / {{.Status}})</summary>
+{{if eq .Status "ready"}}<p>sample={{.SampleType}}/{{.Unit}} · input SHA={{range .InputSHA256}}<code>{{.}}</code> {{end}}· binary SHA=<code>{{.BinarySHA256}}</code> · analyzer={{.AnalyzerVersion}} · generated={{.GeneratedAt}} · truncated={{.Truncated}}</p>
+<svg role="img" aria-label="bounded flame graph" viewBox="0 0 1000 {{flameHeight .}}" width="100%" height="{{flameHeight .}}">{{range .Nodes}}<g><title>{{.Function}} · {{.Value}}</title>{{if eq .Sign "negative"}}<rect x="{{flameX .}}" y="{{flameY .}}" width="{{flameWidth .}}" height="22" fill="#8bb9e8" stroke="#fff"/>{{else}}<rect x="{{flameX .}}" y="{{flameY .}}" width="{{flameWidth .}}" height="22" fill="#e9975b" stroke="#fff"/>{{end}}{{if ge .Width 240}}<text x="{{flameTextX .}}" y="{{flameTextY .}}" font-size="12">{{.Function}}</text>{{end}}</g>{{end}}</svg>
+{{else}}<p>flame view unavailable: {{.Reason}}. Missing/unsupported capture is not treated as an empty successful graph.</p>{{end}}</details>{{end}}
 {{range .Summaries}}{{$denominator := .PercentDenominator}}<h4>{{.SampleType}} / {{.Unit}}</h4>
 <p>net {{.NetTotal}} · positive {{.PositiveTotal}} · negative {{.NegativeMagnitude}} · denominator {{.PercentDenominator}} ({{.DenominatorMode}})</p>
 {{if .Labels}}<h5>Labels</h5>{{range .Labels}}<table><caption>{{.Key}}</caption><thead><tr><th>value</th><th>total</th></tr></thead><tbody>{{range .Values}}<tr><td>{{.Value}}</td><td>{{.Total}}</td></tr>{{end}}</tbody></table>{{end}}{{end}}
@@ -128,6 +132,20 @@ func profilePercent(value, denominator int64) string {
 var profileAnalysisTemplate = template.Must(template.New("profile-analysis").Funcs(template.FuncMap{
 	"profileRows":         profileRows,
 	"profileLineHotspots": profileLineHotspots,
+	"flameHeight": func(graph profilemodel.FlameGraph) int {
+		maxDepth := 0
+		for _, node := range graph.Nodes {
+			if node.Depth > maxDepth {
+				maxDepth = node.Depth
+			}
+		}
+		return (maxDepth + 1) * 24
+	},
+	"flameY":     func(node profilemodel.FlameNode) int { return node.Depth * 24 },
+	"flameX":     func(node profilemodel.FlameNode) int { return node.X / 10 },
+	"flameWidth": func(node profilemodel.FlameNode) int { return max(1, node.Width/10) },
+	"flameTextX": func(node profilemodel.FlameNode) int { return node.X/10 + 2 },
+	"flameTextY": func(node profilemodel.FlameNode) int { return node.Depth*24 + 16 },
 }).Parse(profileAnalysisTemplateText))
 
 type ProfileAnalysisPublishRequest struct {

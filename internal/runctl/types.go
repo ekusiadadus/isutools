@@ -390,6 +390,18 @@ type StartResult struct {
 	// PreemptedRunID names the run this one displaced, if any.
 	PreemptedRunID string
 	StartedAt      time.Time
+	// CPUProfileStart is optional transport-neutral evidence added by the
+	// embedding measurement after the run boundary opens. The controller does
+	// not interpret it.
+	CPUProfileStart *ProfileStartEvidence
+}
+
+// ProfileStartEvidence makes an optional profiler start attempt visible to
+// direct ResetNow callers without coupling runctl to a profiler package.
+type ProfileStartEvidence struct {
+	CaptureID string
+	State     string
+	Code      string
 }
 
 // clone returns a defensively copied value so a caller cannot mutate the
@@ -397,6 +409,10 @@ type StartResult struct {
 func (r StartResult) clone() StartResult {
 	out := r
 	out.Collectors = cloneBoundaries(r.Collectors)
+	if r.CPUProfileStart != nil {
+		copy := *r.CPUProfileStart
+		out.CPUProfileStart = &copy
+	}
 	return out
 }
 

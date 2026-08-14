@@ -1,6 +1,6 @@
 # Implementation and verification status
 
-Updated: 2026-08-07 (Asia/Tokyo) — current release: **v1.4.0**
+Updated: 2026-08-14 (Asia/Tokyo) — unreleased field-feedback implementation on top of **v1.4.0**
 
 `v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1),
 `v1.2.0` tag = `833515e`, `v1.3.0` tag = `26aa2bb` (merge of PR #14),
@@ -36,22 +36,22 @@ Current-tree verification:
 
 | check | environment | result |
 |---|---|---|
-| race + shuffle + coverage | Go 1.26.5, darwin/arm64 | PASS, aggregate **87.1%** |
+| race + coverage | Go 1.26.5, darwin/arm64 | PASS, aggregate **84.2%** |
 | vet | Go 1.26.5, darwin/arm64 | PASS |
 | lint | `golangci-lint run ./...` | PASS, **0 issues** |
 | Actions lint | actionlint v1.7.12 | PASS |
-| vulnerability scan | govulncheck v1.6.0 | PASS, **0 reachable vulnerabilities** (one required-module advisory is unreachable from this code) |
+| vulnerability scan | current local machine | not rerun; `govulncheck` is not installed |
 | new direct dependency licenses | google/pprof Apache-2.0; x/sys BSD-3-Clause | compatible; license files inspected in the resolved module versions |
 | scripts | shellcheck, `bash -n`, ABBA contract | PASS |
-| minimum Go | Go 1.24.x, Linux/arm64 Docker | all-package test + vet PASS |
+| minimum Go | Go 1.24.13, darwin/arm64 toolchain | root all-package test PASS; Echo v4/v5 are independent modules because current upstream releases require Go 1.25 |
 | hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
 | GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, test, MySQL integration | PASS on PR #18 before release |
 
-The pprof external-analysis Darwin crash-fault test and a complete private-isu
-ABBA release gate remain unverified. Repeated initialize/reset can also omit a
-managed CPU artifact while the previous asynchronous stop still owns the
-process-wide profiler; this is tracked in issue #19. Plan 10 multi-host
-aggregation remains intentionally unimplemented.
+The complete private-isu ABBA release gate remains unverified. The issue #19
+process-wide profiler race now has bounded stop→start handoff and an explicit
+`skipped/cpu-busy` outcome. Plan 10 now has embedded/agent peers, strict wire
+DTOs, hub barriers, leases, budgets, SSH-only endpoints and sealed JSON output;
+physical multi-host topology coverage is still an operational verification item.
 
 ## Implemented and released
 
@@ -287,14 +287,20 @@ Stated explicitly so it is not read out of the sections above:
    inactive fragment can still be included. The advisor explicitly says that
    the result is not proof of the running nginx master's effective settings.
 
-## Not implemented
+## Field-feedback implementation (#19–#29)
 
-- **Multi-host / peer protocol (plan 10): single host only.** There is no
-  `PeerHandler`, no `cmd/isutools-agent`, no `ISUTOOLS_PEER`, and no wire
-  protocol in the tree. `runctl` reserves three constants for it
-  (`AckedByHub`, `AckedByLease`, `ReasonHubAbort`) and nothing more. Every number isutools
-  reports describes the host the library is linked into. `plans/10-multi-host.md`
-  is the remaining design document.
+- bounded managed CPU profiler handoff with explicit reset headers
+- stable secret-free `/save` reason codes and audit events
+- access-log full-match grouping and SQL comment/tag policy
+- provenance-checked bounded flame view
+- HMAC trusted-session adapter and corrected nginx upstream logging
+- strict multi-host protocol, embedded peer, standalone agent, hub, lease
+  recovery, participant budgets and host-by-host report rendering
+- framework-neutral route templates plus Echo v4/v5 adapters
+- immutable global hard-off mode
+- deterministic advisor provenance and per-target DB capability matrix
+
+The full operator contract is [FIELD_FEEDBACK.md](./FIELD_FEEDBACK.md).
 
 ## Field verification (private-isu, WSL2 Docker, 2026-08-03..04)
 
