@@ -32,10 +32,18 @@ curl -fsS -X POST 'http://127.0.0.1:19191/save?score=12345'
 公式の初期実装へ計測だけを追加する再現可能な例も用意しています。
 
 - [private-isu 最小導入サンプル](./examples/private-isu/README.md)
+- [ISUCON13 WSL2 最小導入・Makefileサンプル](./examples/isucon13-wsl/README.md)
 - [ISUCON14 最小導入サンプル](./examples/isucon14/README.md)
 
-どちらもSQLドライバーとHTTPハンドラーの計測、`reset -> benchmark -> save`だけを追加し、
+いずれもSQLドライバーとHTTPハンドラーの計測、`reset -> benchmark -> save`だけを追加し、
 インデックス、キャッシュ、マッチングなどのチューニングは含みません。
+
+ISUCON13例はWindows/WSL2実機で公式ベンチ、SCP保存、run CPU profile、DB pool、OFF、
+再起動、guest relay付きSSH転送まで確認しています。
+
+- [2026-08-14: ISUCON13 WSL2実機検証と成果物hash](./docs/isucon13-wsl-verification-20260814.md)
+
+![2026-08-14 ISUCON13 WSL2 saved report](docs/images/isutools-isucon13-wsl-score11884.png)
 
 ### 別PCからprivate-isuを操作するMakefile
 

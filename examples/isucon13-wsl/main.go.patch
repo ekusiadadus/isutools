@@ -1,0 +1,46 @@
+diff --git a/webapp/go/main.go b/webapp/go/main.go
+--- a/webapp/go/main.go
++++ b/webapp/go/main.go
+@@ -12,6 +12,8 @@ import (
+ 	"os/exec"
+ 	"strconv"
+ 
++	"github.com/ekusiadadus/isutools"
++	"github.com/ekusiadadus/isutools/adapters/echov4"
+ 	"github.com/go-sql-driver/mysql"
+ 	"github.com/jmoiron/sqlx"
+ 	"github.com/labstack/echo/v4"
+@@ -93,16 +95,24 @@ func connectDB(logger echo.Logger) (*sqlx.DB, error) {
+ 		conf.ParseTime = parseTime
+ 	}
+ 
+-	db, err := sqlx.Open("mysql", conf.FormatDSN())
++	dsn := conf.FormatDSN()
++	if err := isutools.RegisterDBTarget("app", "mysql", dsn); err != nil {
++		logger.Warnf("isutools: failed to register DB target: %v", err)
++	}
++	db, err := sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	db.SetMaxOpenConns(10)
+ 
+ 	if err := db.Ping(); err != nil {
+ 		return nil, err
+ 	}
+ 
++	if err := isutools.WatchDBPool("app", db.DB); err != nil {
++		logger.Warnf("isutools: failed to watch DB pool: %v", err)
++	}
++
+ 	return db, nil
+ }
+ 
+@@ -121,5 +131,7 @@ func main() {
+ func main() {
+ 	e := echo.New()
++	echov4.Install(e)
++	e.Use(echo.WrapMiddleware(isutools.HTTP))
+ 	e.Debug = true
+ 	e.Logger.SetLevel(echolog.DEBUG)
+ 	e.Use(middleware.Logger())
