@@ -416,7 +416,7 @@ symlink/non-regular inputは拒否する。409 responseのcurrent IDを自動採
 
 Linux analyzerは書込み権限を委譲したcgroup v2 directoryを
 `ISUTOOLS_PPROF_CGROUP_ROOT`へ絶対pathで指定する。workerはそのcgroupへ出生時から所属し、
-512 MiB `memory.max`、swap 0、1 GiB `RLIMIT_AS`、SIGSTOP/membership readbackが全て成立してから
+512 MiB `memory.max`、swap 0、4 GiB `RLIMIT_AS`、SIGSTOP/membership readbackが全て成立してから
 profile FDを読む。Darwinはhard `RLIMIT_AS`を設定・readbackできる場合だけ解析する。
 hard primitiveが無い場合はsoft limit/RSS pollingへdowngradeせず、expected-only failed JSONを残して
 exit 4となる。
