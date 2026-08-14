@@ -53,6 +53,21 @@ jobs:
         run: |
           bash -n examples/abba.sh examples/abba_test.sh
           bash examples/abba_test.sh
+      - name: Makefile saved-snapshot selection
+        run: |
+          output=$(make verify-results RESULTS_DIR=integration/testdata/results)
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | sed '1d' | jq -e '
+            .time == "2026-08-14T01:01:01+09:00" and
+            .generation == 9 and
+            .score == "123" and
+            .run_id == "run-fixture-snapshot" and
+            .validity == "valid"
+          '
+          if make verify-results RESULTS_DIR=integration/testdata/no-snapshots; then
+            echo "verify-results accepted a directory without a saved snapshot" >&2
+            exit 1
+          fi
       # Informational only: shared runners are too noisy for a hard latency
       # gate. The real overhead gate is the on/off benchmark comparison on
       # the target host before tagging a release (DESIGN.md §7).
