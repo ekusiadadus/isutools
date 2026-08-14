@@ -53,14 +53,19 @@ manual `/pprof/profile` endpoint, so it stops on the expected 409 while managed
 run CPU mode owns the process-wide profiler. Do not work around an SSH/Tunnel
 failure by exposing the unauthenticated admin endpoint on `0.0.0.0:19191`.
 
-On 2026-08-13, the complete workflow was rechecked over SSH against the existing
-private-isu environment on Windows/WSL2: readiness, a real `make bench`, durable
-snapshot download over SCP, manual pprof capture, and loopback port forwarding.
-The score-0/pass-true run proves the integration path, not performance.
+On 2026-08-14, the complete workflow was rechecked over SSH against the existing
+private-isu environment on Windows/WSL2 at the merged isutools commit: readiness,
+a real `make bench`, durable snapshot download over SCP, run-aligned CPU capture,
+hard-isolated flame analysis, required/optional multi-host peers, and loopback
+port forwarding. The score-0/pass-true run proves the integration path, not
+performance.
 
-- [Verification commands, run ID, hashes, and limitations](./docs/private-isu-ssh-verification-20260813.md)
+- [2026-08-14 merged revision, commands, run IDs, hashes, file formats, and limits](./docs/private-isu-field-verification-20260814.md)
+- [2026-08-13 initial SSH verification](./docs/private-isu-ssh-verification-20260813.md)
 
-![2026-08-13 private-isu SSH verification report](docs/images/private-isu-ssh-verification-20260813.png)
+![2026-08-14 private-isu pprof verification](docs/images/private-isu-pprof-field-verification-20260814.png)
+
+![2026-08-14 private-isu multi-host verification](docs/images/private-isu-multihost-field-verification-20260814.png)
 
 ## What it answers first
 
