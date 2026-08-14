@@ -11,6 +11,8 @@ The merged implementation was exercised on the existing Windows/WSL2
 private-isu host on 2026-08-14. The exact revisions, commands, durable hashes,
 screenshots, copied-file locations, and evidence limits are recorded in
 [the field verification report](./private-isu-field-verification-20260814.md).
+The final single-host ISUCON13 WSL2 rerun and its explicit evidence boundaries
+are recorded in [the ISUCON13 field audit](./isucon13-field-audit-20260814.md).
 
 ## Safe global shutdown and `/save` diagnosis
 

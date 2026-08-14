@@ -8,12 +8,12 @@ nginx access log、run境界CPU profile、管理画面を追加する実例で�
 
 ```text
 wsl-isucon: 876bd43a6f6f1048b8d341b2ab62d7afff01efd2
-isutools:   6003f82f6dd0a8076beaff8ac23df136f10b7f96
+isutools:   797573799dead8997f899dfdcb842571b779fa2d
 WSL:        Ubuntu 22.04.3 LTS / ISUCON13 Go初期実装
 ```
 
 2026-08-14の最終追試では固定SHAをGo module proxyから解決したbinaryで公式ベンチ`pass=true`、
-score `12,509`、SQL 56種、HTTP 42種、access log 11,956行、DB pool/access log/run CPU
+score `11,695`、SQL 56種、HTTP 42種、access log 11,616行、DB pool/access log/run CPU
 profileのhealth `ok`まで確認しました。スコアは環境・runごとに変動し、性能保証ではありません。
 run ID、artifact hash、URI丸め、二重save拒否、flame、OFF、port forwardの確認結果とUI画像は
 [現場指摘の最終監査](../../docs/isucon13-field-audit-20260814.md)に分離しています。初回導入の履歴は
@@ -72,8 +72,8 @@ cd /home/isucon
 patch -p1 < /home/isucon/isutools-example/main.go.patch
 cd /home/isucon/webapp/go
 GOTOOLCHAIN=auto go get \
-  github.com/ekusiadadus/isutools@6003f82f6dd0a8076beaff8ac23df136f10b7f96 \
-  github.com/ekusiadadus/isutools/adapters/echov4@6003f82f6dd0a8076beaff8ac23df136f10b7f96
+  github.com/ekusiadadus/isutools@797573799dead8997f899dfdcb842571b779fa2d \
+  github.com/ekusiadadus/isutools/adapters/echov4@797573799dead8997f899dfdcb842571b779fa2d
 GOTOOLCHAIN=auto go mod tidy
 gofmt -w main.go
 GOTOOLCHAIN=auto go test ./...
@@ -211,7 +211,7 @@ sudo systemctl restart isupipe-go
 
 ```bash
 GOBIN=/home/isucon/bin GOTOOLCHAIN=auto go install \
-  github.com/ekusiadadus/isutools/cmd/isutools-pprof@6003f82f6dd0a8076beaff8ac23df136f10b7f96
+  github.com/ekusiadadus/isutools/cmd/isutools-pprof@797573799dead8997f899dfdcb842571b779fa2d
 
 BASE='<make benchが出したsnapshot_base>'
 HASH='<make benchが出したsnapshot_sha256>'

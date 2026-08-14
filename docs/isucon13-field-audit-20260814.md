@@ -6,9 +6,10 @@ ISUCON13 Go初期実装にisutoolsの計測配線だけを入れ、現場指摘�
 
 ## 結論
 
-最終公式ベンチは終了code 0、最終check成功、`pass=true`、score `12,509`でした。
+PRの最終機能commitを導入した公式ベンチは終了code 0、最終check成功、`pass=true`、
+score `11,695`でした。
 isutools snapshotは`valid=true`、`partial=false`で、SQL 56種、HTTP 42種、nginx access log
-11,956行を収集しました。scoreは環境とrunで変動するため、性能改善の証拠にはしていません。
+11,616行を収集しました。scoreは環境とrunで変動するため、性能改善の証拠にはしていません。
 
 この追試で、既存実装だけでは満たせない4件を新たに発見し、issue化しました。
 
@@ -38,13 +39,13 @@ isutools snapshotは`valid=true`、`partial=false`で、SQL 56種、HTTP 42種�
 | 項目 | 値 |
 |---|---|
 | wsl-isucon revision | `876bd43a6f6f1048b8d341b2ab62d7afff01efd2` |
-| isutools revision | `6003f82f6dd0a8076beaff8ac23df136f10b7f96` |
-| app binary SHA-256 | `055015c58ce83b5c210f1b2001791398a80c80151a29b4541248d82da5a7919a` |
-| run ID | `run-faf6ae6946bed25f` |
-| snapshot base | `20260814-184354.414131215-000001_gen3_876bd43-dirty_score12509` |
-| snapshot JSON SHA-256 | `abc4a536596b05d70186f39d4088a668027c97009e3bcac4e191b79bd7a6d10b` |
-| snapshot HTML SHA-256 | `9bc3af2e1791037e9029114ba1bf526c8d5a5487442ce09b8c956a52f4acdb1e` |
-| official result SHA-256 | `5646f2bcc7423a12dbbdfc20ce485e7048ab03cdffcbac24b3b730fde44654ee` |
+| isutools revision | `797573799dead8997f899dfdcb842571b779fa2d` |
+| app binary SHA-256 | `f8d2695cd5d88a27df7bafa2ae4fdcfb2ed8365bf6fd51356b31a55d99ce114b` |
+| run ID | `run-dfbb52972b0302a9` |
+| snapshot base | `20260814-191416.260066145-000001_gen3_876bd43-dirty_score11695` |
+| snapshot JSON SHA-256 | `f4579e46302a06043b08153ed2d7e8d269253b01aae9929e60afaa092f316099` |
+| snapshot HTML SHA-256 | `0ffd750bc96f56192b135049c829c485b7601e2799bfbbc009814897d0464201` |
+| official result SHA-256 | `8d3c8875f03a68b1a794dfaf0011b4b1798ead9ce1736ca40263ea03e18c87ce` |
 | control-PC copy | `~/isutools-isucon13-results` |
 
 `make bench`は`reset -> 公式bench -> collect -> save -> stage`を一つの境界として実行し、
@@ -55,15 +56,20 @@ mtimeや「最新ファイル」から推測しません。公式`/tmp/result.js
 
 | 項目 | 値 |
 |---|---|
-| analysis ID | `fe2516f5ae949ce86067b2ce3d86236f942f725bd84d342c2ad92a019ddf6336` |
-| published artifact ID | `ceea141ca3c2b51f383e055a316f43f26bdc8d2f11897ac0cbeb6d2dad8a457c` |
-| CPU profile SHA-256 | `b69dd77440976ddfe27a743bd108f4f95ef11ec88e45745f958470221c661414` |
-| rendered profile HTML SHA-256 | `fd132e635f7744e827915cca138a9a5eaf9c97f7d2d481cbaacf27f015c29a69` |
-| analysis JSON SHA-256 | `9dca3c2c1d54120289245cda6e5f45ccba2e923acd31c1be25f377936aa39dae` |
+| analysis ID | `5a322f09566a5fdc4cb1bee12045dbfdcc202b1621c8e25e99dbebc3c2635f24` |
+| published artifact ID | `47b6bf63b41c0b2e9855052b62aa41711e4fb1c83ac1fd516daa52c570f22954` |
+| CPU profile SHA-256 | `dccdd2adc31470251bc3746bf344586fc94eeeedcce402d81b392ed50a5e4d5a` |
+| rendered profile HTML SHA-256 | `a0ba27467576df9c47c8e812d6f596c537765b45e3cfc4aac1f846541a75736c` |
+| analysis JSON SHA-256 | `2973aeb9c7bb5c74dae372497124296bb7f231ef774f8067fe4457f61995280e` |
 
-![ISUCON13 score 12509 saved report](./images/isutools-isucon13-wsl-score12509.png)
+新runのderived reportで`Flame view (interval / ready)`、`linux-cgroup-v2`、binary match
+`verified`、`コード位置: CPU artifactあり`を確認し、誤解を招く`解析待ち`は0件でした。
+旧runへ同じanalysisを再publishした場合は同一artifactを返して保存済みHTMLを書き換えず、新runで
+初めて新しい表示を生成します。
 
-[Flame viewを含む全ページ画像](./images/isutools-isucon13-wsl-flame-ready.png)も保存しています。
+![ISUCON13 score 11695 saved report](./images/isutools-isucon13-wsl-score11695.png)
+
+[Flame viewを含む全ページ画像](./images/isutools-isucon13-wsl-flame-final.png)も保存しています。
 画像は保存済み自己完結HTMLを制御PCのChrome headlessで描画したものです。管理APIへのSSH relay、
 `/json`応答、report hashは別々に確認しています。対話ブラウザ拡張はlocalhost navigationを
 `ERR_BLOCKED_BY_CLIENT`で遮断したため、この画像を「対話ブラウザで管理画面を開いた証拠」とは

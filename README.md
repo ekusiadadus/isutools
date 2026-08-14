@@ -44,7 +44,7 @@ ISUCON13例はWindows/WSL2実機で公式ベンチ、SCP保存、run CPU profile
 - [2026-08-14: ISUCON13 WSL2実機検証と成果物hash](./docs/isucon13-wsl-verification-20260814.md)
 - [2026-08-14: ISUCON13現場指摘の最終監査](./docs/isucon13-field-audit-20260814.md)
 
-![2026-08-14 ISUCON13 WSL2 saved report](docs/images/isutools-isucon13-wsl-score12509.png)
+![2026-08-14 ISUCON13 WSL2 saved report](docs/images/isutools-isucon13-wsl-score11695.png)
 
 ### 別PCからprivate-isuを操作するMakefile
 
