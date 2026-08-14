@@ -3,7 +3,7 @@
 Updated: 2026-08-14
 
 This guide is the operational contract for issues #19–#30 and the ISUCON13
-follow-up in #39. Every feature is
+follow-ups in #39–#40. Every feature is
 bounded, opt-in where it opens a listener or adds database work, and emits
 stable reason codes instead of configuration values, DSNs, cookies, or tokens.
 
@@ -23,12 +23,16 @@ not start admin or peer listeners, and makes counters/watch APIs no-ops.
 | HTTP | reason | operator action |
 |---|---|---|
 | 400 | `data-dir-unset` / `invalid-pass` | set `ISUTOOLS_DATA_DIR`; pass only `true` or `false` |
-| 409 | `run-not-active` / `mutation-busy` | take one reset→bench→save boundary; do not overlap mutations |
+| 409 | `run-not-active` / `run-already-saved` / `mutation-busy` | take one reset→bench→save boundary; do not replay a saved run or overlap mutations |
 | 413 | `snapshot-too-large` | inspect dropped/oversized sections; the 32 MiB cap is not bypassed |
 | 500 | `persist-failed` | verify the data directory, filesystem and free space |
 
 Successful publication reports `saved`. Underlying errors and request query
 values are excluded from both the response and the bounded audit record.
+A coordinated run publishes exactly one score/pass outcome. A later `/save`
+for the same run is rejected as `run-already-saved` without writing another
+artifact; `POST /reset` opens the next publication boundary. Legacy handlers
+without a run ID keep their historical explicit snapshot behavior.
 
 ## Access-log URI grouping and SQL comment policy
 
