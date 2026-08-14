@@ -8,15 +8,16 @@ nginx access log、run境界CPU profile、管理画面を追加する実例で�
 
 ```text
 wsl-isucon: 876bd43a6f6f1048b8d341b2ab62d7afff01efd2
-isutools:   4111f0c3935040f6e0546f44e55ed332ae51b7ce
+isutools:   6003f82f6dd0a8076beaff8ac23df136f10b7f96
 WSL:        Ubuntu 22.04.3 LTS / ISUCON13 Go初期実装
 ```
 
-2026-08-14の実機では固定SHAをGo module proxyから解決したbinaryで公式ベンチ`pass=true`、
-score `12,079`、SQL 56種、HTTP 41種、
-DB pool/access log/run CPU profileのhealth `ok`まで確認しました。スコアは環境・runごとに変動し、
-性能保証ではありません。run ID、artifact hash、再起動・OFF・port forwardの確認結果とUI画像は
-[実機検証記録](../../docs/isucon13-wsl-verification-20260814.md)に分離しています。
+2026-08-14の最終追試では固定SHAをGo module proxyから解決したbinaryで公式ベンチ`pass=true`、
+score `12,509`、SQL 56種、HTTP 42種、access log 11,956行、DB pool/access log/run CPU
+profileのhealth `ok`まで確認しました。スコアは環境・runごとに変動し、性能保証ではありません。
+run ID、artifact hash、URI丸め、二重save拒否、flame、OFF、port forwardの確認結果とUI画像は
+[現場指摘の最終監査](../../docs/isucon13-field-audit-20260814.md)に分離しています。初回導入の履歴は
+[実機検証記録](../../docs/isucon13-wsl-verification-20260814.md)に残しています。
 
 公式WSL版は本番と異なり、DNS port `1053`、`*.u.isucon.local`、自己署名証明書を使います。
 ベンチコマンドは`./bench run --dns-port 1053 --enable-ssl`です。
@@ -71,8 +72,8 @@ cd /home/isucon
 patch -p1 < /home/isucon/isutools-example/main.go.patch
 cd /home/isucon/webapp/go
 GOTOOLCHAIN=auto go get \
-  github.com/ekusiadadus/isutools@4111f0c3935040f6e0546f44e55ed332ae51b7ce \
-  github.com/ekusiadadus/isutools/adapters/echov4@4111f0c3935040f6e0546f44e55ed332ae51b7ce
+  github.com/ekusiadadus/isutools@6003f82f6dd0a8076beaff8ac23df136f10b7f96 \
+  github.com/ekusiadadus/isutools/adapters/echov4@6003f82f6dd0a8076beaff8ac23df136f10b7f96
 GOTOOLCHAIN=auto go mod tidy
 gofmt -w main.go
 GOTOOLCHAIN=auto go test ./...
@@ -202,6 +203,43 @@ sudo systemctl restart isupipe-go
 ```
 
 保存runにはopen/closeのCPU profileとmanifestが残ります。
+
+### run CPUを解析してflameをpublishする
+
+`make bench`が最後に出す`snapshot_base`と`snapshot_sha256`をそのまま使います。後から
+「最新ファイル」を推測してはいけません。解析は採点run終了後に行います。
+
+```bash
+GOBIN=/home/isucon/bin GOTOOLCHAIN=auto go install \
+  github.com/ekusiadadus/isutools/cmd/isutools-pprof@6003f82f6dd0a8076beaff8ac23df136f10b7f96
+
+BASE='<make benchが出したsnapshot_base>'
+HASH='<make benchが出したsnapshot_sha256>'
+BUNDLE="/home/isucon/isutools-analysis/$BASE"
+
+/home/isucon/bin/isutools-pprof preflight \
+  --admin http://127.0.0.1:19196 --block-runs 1
+/home/isucon/bin/isutools-pprof fetch \
+  --data-dir /home/isucon/isutools-data \
+  --snapshot-base "$BASE" --snapshot-sha256 "$HASH" --bundle-dir "$BUNDLE"
+
+CGROUP=/sys/fs/cgroup/isutools-pprof-manual
+sudo mkdir "$CGROUP"
+printf '+memory +pids\n' | sudo tee "$CGROUP/cgroup.subtree_control" >/dev/null
+sudo env ISUTOOLS_PPROF_CGROUP_ROOT="$CGROUP" \
+  /home/isucon/bin/isutools-pprof analyze \
+  --bundle-dir "$BUNDLE" --binary /home/isucon/webapp/go/isupipe \
+  --source-root /home/isucon/webapp/go --output "$BUNDLE/analysis.json" --timeout 5m
+sudo /home/isucon/bin/isutools-pprof publish \
+  --admin http://127.0.0.1:19196 --analysis "$BUNDLE/analysis.json" \
+  --expected-current none --timeout 5m
+sudo rmdir "$CGROUP"
+```
+
+Linuxではworkerがprofileを読む前にcgroup v2、512 MiB physical memory、swap 0、4 GiB
+address space、SIGSTOP、membershipのreadbackをすべて通す必要があります。`publish`後に同じrunを
+開くと、hash検証済みderived reportの`Flame view`が表示されます。`partial`でも診断理由が
+`source-path-redacted`だけならflame自体は`ready`です。
 
 ## 8. OFFとrollback
 

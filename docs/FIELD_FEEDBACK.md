@@ -3,7 +3,7 @@
 Updated: 2026-08-14
 
 This guide is the operational contract for issues #19–#30 and the ISUCON13
-follow-ups in #39–#40. Every feature is
+follow-ups in #39–#42. Every feature is
 bounded, opt-in where it opens a listener or adds database work, and emits
 stable reason codes instead of configuration values, DSNs, cookies, or tokens.
 

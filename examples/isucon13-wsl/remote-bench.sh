@@ -71,7 +71,10 @@ install -m 0640 "$bench_result" "$durable_result"
 curl -fsS -X POST "$admin_url/collect" >/dev/null
 save_response=$(curl -fsS -X POST \
   "$admin_url/save?score=$score&pass=$pass")
-saved_file=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["file"])' <<<"$save_response")
+read -r saved_file snapshot_base snapshot_sha256 < <(
+  python3 -c 'import json,sys; value=json.load(sys.stdin); print(value["file"], value["snapshot_base"], value["snapshot_sha256"])' \
+    <<<"$save_response"
+)
 
 mkdir -p "$stage_dir"
 find "$data_dir" -maxdepth 1 -type f \
@@ -82,4 +85,5 @@ sha256sum "$durable_result" "$data_dir/$saved_file"
 trap - EXIT INT TERM
 rm -f "$headers"
 printf 'benchmark_score=%s\nbenchmark_pass=%s\nbenchmark_language=%s\n' "$score" "$pass" "$language"
-printf 'saved_file=%s\nstage_dir=%s\n' "$saved_file" "$stage_dir"
+printf 'saved_file=%s\nsnapshot_base=%s\nsnapshot_sha256=%s\nstage_dir=%s\n' \
+  "$saved_file" "$snapshot_base" "$snapshot_sha256" "$stage_dir"

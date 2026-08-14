@@ -165,3 +165,22 @@ func TestReportPutsDecisionAndCodeEvidenceBeforeDenseTables(t *testing.T) {
 		}
 	}
 }
+
+func TestPublishedCPUArtifactDiagnosisStaysTrueAfterDerivedAnalysis(t *testing.T) {
+	manifest := &ProfileManifest{CPU: &CPUIntervalCapture{
+		Status: "published",
+		File:   "cpu_verified.pprof",
+	}}
+	level, title, evidence, action := codeEvidence(manifest)
+	if level != "ok" || title != "コード位置: CPU artifactあり" {
+		t.Fatalf("code evidence heading = %q/%q", level, title)
+	}
+	if strings.Contains(title+evidence+action, "解析待ち") {
+		t.Fatalf("published diagnosis becomes stale after derived analysis: %q / %q / %q", title, evidence, action)
+	}
+	for _, want := range []string{"artifactだけでは", "行解析結果", "isutools-pprof"} {
+		if !strings.Contains(evidence+action, want) {
+			t.Errorf("code evidence is missing %q: %q / %q", want, evidence, action)
+		}
+	}
+}

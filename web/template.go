@@ -244,9 +244,9 @@ func codeEvidence(manifest *ProfileManifest) (level, title, evidence, action str
 			fmt.Sprintf("CPU profileはstatus=%s / code=%sで、行解析に使えるartifactがありません。", cpu.Status, code),
 			"Profilesのcapture状態を直してから再計測します。" + requirement
 	}
-	return "ok", "コード位置: CPU artifactあり・解析待ち",
-		fmt.Sprintf("%s をline granularityで解析すれば、function / file / lineを表示できます。artifactがあるだけでは行番号は未検証です。", cpu.File),
-		"isutools-pprofを実行後、このrunを開き直して行解析結果を確認します。" + requirement
+	return "ok", "コード位置: CPU artifactあり",
+		fmt.Sprintf("%s を採取済みです。artifactだけでは行番号は未検証です。", cpu.File),
+		"このrunの「行解析結果」にverified analysisがあればfunction / file / lineを確認します。なければisutools-pprofを実行してから開き直します。" + requirement
 }
 
 func humanCount(value int64) string {
