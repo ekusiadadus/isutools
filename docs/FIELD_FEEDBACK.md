@@ -2,7 +2,8 @@
 
 Updated: 2026-08-14
 
-This guide is the operational contract for issues #19–#29. Every feature is
+This guide is the operational contract for issues #19–#30 and the ISUCON13
+follow-up in #39. Every feature is
 bounded, opt-in where it opens a listener or adds database work, and emits
 stable reason codes instead of configuration values, DSNs, cookies, or tokens.
 
@@ -48,6 +49,11 @@ SQL normalization always removes comments. The default
 `/* controller:chairs */` for grouping; `off` removes every comment without a
 tag prefix. Hints, arbitrary
 comments, control bytes, and oversized tags are never retained.
+
+After comment removal and literal masking, placeholder-only `IN` and `NOT IN`
+lists are canonicalized to one arity-independent `IN (?)` key. This includes
+`IN /* */ (?, ?, ?)`, MySQL `?`, PostgreSQL positional parameters, and literal
+lists. Subqueries and row constructors remain distinct.
 
 ## Echo and framework-neutral route templates
 

@@ -25,7 +25,7 @@ DB pool/access log/run CPU profileのhealth `ok`まで確認しました。ス�
 
 - `main.go.patch`: SQL、DB pool、HTTP、Echo v4 route templateの計測だけをGo実装へ追加
 - `nginx-isutools.conf`: isutoolsが解釈する専用LTSV access log
-- `isupipe-go.isutools.conf`: loopback管理portと永続化・CPU profile設定
+- `isupipe-go.isutools.conf`: loopback管理port、永続化・CPU profile、access-log URI丸め設定
 - `isupipe-go.manual-pprof.conf`: manual profile確認時だけ使う一時override
 - `isupipe-go.off.conf`: 環境変数だけで全計測を止める確認用override
 - `remote-bench.sh`: WSL内の`reset -> 公式bench -> collect -> save -> stage`
@@ -110,6 +110,16 @@ sudo systemctl restart nginx isupipe-go
 この例は既存の`19191`との衝突を避けて`127.0.0.1:19196`を使います。外部bindや
 `ISUTOOLS_ALLOW_UNAUTHENTICATED=1`は不要です。`ISUTOOLS_GIT_DIRTY=1`は、公式checkoutへ
 計測patchを加えた事実をartifactに残すため意図的に設定しています。
+
+`ISUTOOLS_ACCESS_LOG_PATH_RULES`は、nginx LTSVの`/api/user/<username>`と
+`/api/livestream/<id>`をEchoと同じ定数templateへ丸めます。ruleは上からfull-matchで評価されるため、
+livecomment reportなど長いpathを先に置いています。未一致pathは`keep`でそのまま残します。
+設定が読み込まれたことは次で確認できます（値そのものは長いので、credentialと同様に診断logへ
+出力しないでください）。
+
+```bash
+systemctl show isupipe-go -p Environment --value | grep -q 'ISUTOOLS_ACCESS_LOG_PATH_RULES='
+```
 
 ## 5. readinessを確認する
 

@@ -59,6 +59,7 @@ func ResolveCommentTagPolicy(getenv func(string) string) (CommentTagPolicy, stri
 var (
 	numberLiteral = regexp.MustCompile(`(?i)(?:\b\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?\b`)
 	hexLiteral    = regexp.MustCompile(`(?i)\b0x[0-9a-f]+\b|\b0b[01]+\b|\b[XB]\?`)
+	placeholderIN = regexp.MustCompile(`(?i)\bIN\s*\(\s*(?:\?|\$\?)(?:\s*,\s*(?:\?|\$\?))*\s*\)`)
 	safeTag       = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$`)
 )
 
@@ -86,6 +87,7 @@ func computeNormalizeWithPolicy(q string, policy CommentTagPolicy) string {
 	s = strings.Join(strings.Fields(s), " ")
 	s = hexLiteral.ReplaceAllString(s, "?")
 	s = numberLiteral.ReplaceAllString(s, "?")
+	s = placeholderIN.ReplaceAllString(s, "IN (?)")
 	if tag != "" {
 		s = "[" + tag + "] " + s
 	}
