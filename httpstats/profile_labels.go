@@ -48,7 +48,7 @@ func SafeProfileLabelWithRules(request *http.Request, rules []SafeProfileRouteRu
 	}
 	route := ProfileRouteUnmatched
 	if request != nil {
-		pattern := requestPatternPath(request.Pattern)
+		pattern := requestPatternPath(routePattern(request))
 		if safeProfileRoute(pattern) {
 			route = pattern
 		} else if request.URL != nil {

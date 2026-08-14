@@ -52,6 +52,7 @@ import (
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
+	"github.com/ekusiadadus/isutools/sessionlabel"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 	"github.com/ekusiadadus/isutools/web"
@@ -1681,6 +1682,19 @@ func HTTP(next http.Handler) http.Handler {
 	} else if labels != "" && labels != "0" {
 		collectorHealth.Set("profile-labels", health.StatusDegraded, fmt.Sprintf("unknown %s=%q; labels disabled", envCPUProfileLabels, labels))
 	}
+	flowLabels := sessionlabel.FromEnv(os.Getenv)
+	flowHealth := flowLabels.Health()
+	switch {
+	case flowHealth.Enabled && flowHealth.Reason == "scenario-invalid":
+		collectorHealth.Set("flow-labels", health.StatusDegraded, flowHealth.Reason)
+	case flowHealth.Enabled:
+		collectorHealth.Set("flow-labels", health.StatusOK, flowHealth.Reason)
+	case flowHealth.Reason == "auto-unconfigured" || flowHealth.Reason == "flow-labels-off" || flowHealth.Reason == "global-off":
+		collectorHealth.Set("flow-labels", health.StatusDisabled, flowHealth.Reason)
+	default:
+		collectorHealth.Set("flow-labels", health.StatusDegraded, flowHealth.Reason)
+	}
+	next = flowLabels.Middleware(next)
 	return httpstats.Middleware(next)
 }
 

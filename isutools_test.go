@@ -33,6 +33,7 @@ import (
 	"github.com/ekusiadadus/isutools/netstats"
 	"github.com/ekusiadadus/isutools/procstats"
 	"github.com/ekusiadadus/isutools/queryplan"
+	"github.com/ekusiadadus/isutools/sessionlabel"
 	"github.com/ekusiadadus/isutools/sqlrows"
 	"github.com/ekusiadadus/isutools/sqlstats"
 	"github.com/ekusiadadus/isutools/web"
@@ -1360,6 +1361,29 @@ func TestHTTPMiddlewareDisabled(t *testing.T) {
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 	if got := HTTP(next); fmt.Sprintf("%p", got) != fmt.Sprintf("%p", next) {
 		t.Error("ISUTOOLS=off must return the handler unwrapped so the request path is untouched")
+	}
+}
+
+func TestHTTPMiddlewareAddsFlowLabelsFromEnvironment(t *testing.T) {
+	t.Setenv(sessionlabel.EnvFlowLabels, "on")
+	t.Setenv(sessionlabel.EnvSourceCookie, "SESSIONID")
+	t.Setenv(sessionlabel.EnvHMACKey, strings.Repeat("f", sessionlabel.MinKeyBytes))
+	t.Setenv(sessionlabel.EnvScenario, "isucon13_official")
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(sessionlabel.HeaderName); got != "" {
+			t.Fatalf("application saw session label %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/flow", nil)
+	req.AddCookie(&http.Cookie{Name: "SESSIONID", Value: "raw-session-cookie"})
+	rec := httptest.NewRecorder()
+	HTTP(next).ServeHTTP(rec, req)
+	if got := rec.Header().Get(sessionlabel.HeaderName); got == "" || strings.Contains(got, "raw-session") {
+		t.Fatalf("session response label = %q", got)
+	}
+	if got := rec.Header().Get(sessionlabel.ScenarioHeaderName); got != "isucon13_official" {
+		t.Fatalf("scenario response label = %q", got)
 	}
 }
 

@@ -13,6 +13,10 @@ services:
       ISUTOOLS_DATA_DIR: /tmp
       ISUTOOLS_ACCESS_LOG: /nginx-logs/access.log
       ISUTOOLS_ROLE: app
+      ISUTOOLS_FLOW_LABELS: "on"
+      # This compose/nginx pair is a closed synthetic k6 environment. Do not
+      # enable trusted inbound labels on an Internet-facing edge.
+      ISUTOOLS_TRUST_INBOUND_FLOW_LABELS: "1"
     ports:
       - "127.0.0.1:19191:19191"
     volumes:
