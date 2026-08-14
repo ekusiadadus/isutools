@@ -6,6 +6,11 @@ This guide is the operational contract for issues #19–#29. Every feature is
 bounded, opt-in where it opens a listener or adds database work, and emits
 stable reason codes instead of configuration values, DSNs, cookies, or tokens.
 
+The merged implementation was exercised on the existing Windows/WSL2
+private-isu host on 2026-08-14. The exact revisions, commands, durable hashes,
+screenshots, copied-file locations, and evidence limits are recorded in
+[the field verification report](./private-isu-field-verification-20260814.md).
+
 ## Safe global shutdown and `/save` diagnosis
 
 `ISUTOOLS=off` is resolved once per process. It returns the raw SQL driver,

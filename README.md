@@ -60,13 +60,17 @@ make pprof PPROF_SECONDS=30
 `/pprof/profile`を使うため、managed run CPU modeがprofileを所有している間は409で停止します。
 publicな`0.0.0.0:19191`へ迂回せず、SSH/Tunnel自体の障害は先に復旧してください。
 
-2026-08-13にはWindows/WSL2上の既存private-isuへSSH接続し、`make check`、実際の
-`make bench`、durable snapshotのSCP取得、`make pprof`、loopback SSH転送まで再確認
-しました。score 0 / pass trueのため性能結果ではなく、操作・収集・保存経路の実機確認です。
+2026-08-14にはWindows/WSL2上の既存private-isuへSSH接続し、マージ済みSHAで
+`make check`と実際の`make bench`、durable snapshotのSCP取得、run境界CPU profileの
+hard-isolated解析・flame表示、必須/任意peerを含むmulti-host hub、loopback SSH転送まで
+再確認しました。score 0 / pass trueのため性能結果ではなく、操作・収集・保存経路の実機確認です。
 
-- [実行コマンド、run ID、hashを含む確認記録](./docs/private-isu-ssh-verification-20260813.md)
+- [2026-08-14: マージSHA、run ID、hash、保存形式、制約を含む最終確認](./docs/private-isu-field-verification-20260814.md)
+- [2026-08-13: 初回SSH確認記録](./docs/private-isu-ssh-verification-20260813.md)
 
-![2026-08-13 private-isu SSH verification report](docs/images/private-isu-ssh-verification-20260813.png)
+![2026-08-14 private-isu pprof verification](docs/images/private-isu-pprof-field-verification-20260814.png)
+
+![2026-08-14 private-isu multi-host verification](docs/images/private-isu-multihost-field-verification-20260814.png)
 
 ## 最初に分かること
 

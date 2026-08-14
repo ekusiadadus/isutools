@@ -1,6 +1,7 @@
 # Implementation and verification status
 
-Updated: 2026-08-14 (Asia/Tokyo) — unreleased field-feedback implementation on top of **v1.4.0**
+Updated: 2026-08-14 (Asia/Tokyo) — field-feedback implementation merged to
+`main` at `0f71797ab9ca968967b0a610ce98c8871bbd1624`, on top of **v1.4.0**
 
 `v1.0.0` tag = `faa7ca8`. `v1.1.0` tag = `f4e7c3c` (merge of PR #1),
 `v1.2.0` tag = `833515e`, `v1.3.0` tag = `26aa2bb` (merge of PR #14),
@@ -45,13 +46,16 @@ Current-tree verification:
 | scripts | shellcheck, `bash -n`, ABBA contract | PASS |
 | minimum Go | Go 1.24.13, darwin/arm64 toolchain | root all-package test PASS; Echo v4/v5 are independent modules because current upstream releases require Go 1.25 |
 | hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
-| GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, test, MySQL integration | PASS on PR #18 before release |
+| GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, race/coverage, MySQL integration | PASS on PR #33 and follow-up PR #34 before merge |
+| remote private-isu | Windows/WSL2 over SSH, merged SHA | readiness, real benchmark, durable save/SCP, run CPU capture, verified-binary flame publication, required/optional peer hub PASS; [full record](./private-isu-field-verification-20260814.md) |
 
 The complete private-isu ABBA release gate remains unverified. The issue #19
 process-wide profiler race now has bounded stop→start handoff and an explicit
 `skipped/cpu-busy` outcome. Plan 10 now has embedded/agent peers, strict wire
-DTOs, hub barriers, leases, budgets, SSH-only endpoints and sealed JSON output;
-physical multi-host topology coverage is still an operational verification item.
+DTOs, concurrent hub barriers, leases, budgets, SSH-only endpoints, configured
+peer names, send-to-ack uncertainty, and sealed JSON output. Two standalone
+peers were field-verified on one WSL2 host; physical multi-host clock/topology
+coverage remains an operational verification item.
 
 ## Implemented and released
 
