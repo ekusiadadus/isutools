@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+
+	writercap "github.com/ekusiadadus/isutools/internal/httpwriter"
 )
 
 // responseWriter captures status and byte counts. The middleware must hand the
@@ -81,6 +83,10 @@ type readFromFeature struct {
 	rf io.ReaderFrom
 }
 
+type closeNotifyFeature struct{ c writercap.CloseNotifier }
+
+func (c closeNotifyFeature) CloseNotify() <-chan bool { return c.c.CloseNotify() }
+
 func (r readFromFeature) ReadFrom(src io.Reader) (int64, error) {
 	r.w.ensureStatus()
 	n, err := r.rf.ReadFrom(src)
@@ -89,121 +95,21 @@ func (r readFromFeature) ReadFrom(src io.Reader) (int64, error) {
 }
 
 func preserveOptionalInterfaces(w *responseWriter) http.ResponseWriter {
-	f, hasF := w.ResponseWriter.(http.Flusher)
-	h, hasH := w.ResponseWriter.(http.Hijacker)
-	p, hasP := w.ResponseWriter.(http.Pusher)
-	rf, hasR := w.ResponseWriter.(io.ReaderFrom)
-	mask := 0
-	if hasF {
-		mask |= 1
+	features := writercap.Features{}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		features.Flusher = flushFeature{w: w, f: f}
 	}
-	if hasH {
-		mask |= 2
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		features.Hijacker = hijackFeature{h: w, u: h}
 	}
-	if hasP {
-		mask |= 4
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		features.Pusher = pushFeature{p: p}
 	}
-	if hasR {
-		mask |= 8
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		features.ReaderFrom = readFromFeature{w: w, rf: rf}
 	}
-	ff := flushFeature{w: w, f: f}
-	hf := hijackFeature{h: w, u: h}
-	pf := pushFeature{p: p}
-	rff := readFromFeature{w: w, rf: rf}
-	switch mask {
-	case 0:
-		return w
-	case 1:
-		return struct {
-			*responseWriter
-			flushFeature
-		}{w, ff}
-	case 2:
-		return struct {
-			*responseWriter
-			hijackFeature
-		}{w, hf}
-	case 3:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-		}{w, ff, hf}
-	case 4:
-		return struct {
-			*responseWriter
-			pushFeature
-		}{w, pf}
-	case 5:
-		return struct {
-			*responseWriter
-			flushFeature
-			pushFeature
-		}{w, ff, pf}
-	case 6:
-		return struct {
-			*responseWriter
-			hijackFeature
-			pushFeature
-		}{w, hf, pf}
-	case 7:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-			pushFeature
-		}{w, ff, hf, pf}
-	case 8:
-		return struct {
-			*responseWriter
-			readFromFeature
-		}{w, rff}
-	case 9:
-		return struct {
-			*responseWriter
-			flushFeature
-			readFromFeature
-		}{w, ff, rff}
-	case 10:
-		return struct {
-			*responseWriter
-			hijackFeature
-			readFromFeature
-		}{w, hf, rff}
-	case 11:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-			readFromFeature
-		}{w, ff, hf, rff}
-	case 12:
-		return struct {
-			*responseWriter
-			pushFeature
-			readFromFeature
-		}{w, pf, rff}
-	case 13:
-		return struct {
-			*responseWriter
-			flushFeature
-			pushFeature
-			readFromFeature
-		}{w, ff, pf, rff}
-	case 14:
-		return struct {
-			*responseWriter
-			hijackFeature
-			pushFeature
-			readFromFeature
-		}{w, hf, pf, rff}
-	default:
-		return struct {
-			*responseWriter
-			flushFeature
-			hijackFeature
-			pushFeature
-			readFromFeature
-		}{w, ff, hf, pf, rff}
+	if c, ok := w.ResponseWriter.(writercap.CloseNotifier); ok {
+		features.CloseNotifier = closeNotifyFeature{c: c}
 	}
+	return writercap.Preserve(w, w, features)
 }

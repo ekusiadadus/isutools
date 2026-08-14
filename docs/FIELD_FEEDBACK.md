@@ -49,7 +49,7 @@ SQL normalization always removes comments. The default
 tag prefix. Hints, arbitrary
 comments, control bytes, and oversized tags are never retained.
 
-## Echo and framework-neutral route templates
+## Go router and framework-neutral route templates
 
 The generic adapter is `httpstats.SetRoutePattern(*http.Request, template)`.
 It accepts only a trusted registered template and never falls back to the raw
@@ -68,25 +68,37 @@ echov4.Install(e)
 Echo v5 uses the same call from `adapters/echov5`. Named parameters, groups,
 wildcards, 404s, handler errors and panics are covered by adapter tests.
 
-## Trusted session labels for nginx
-
-The client-supplied `X-Isutools-Session` is never trusted. Generate a fixed
-URL-safe HMAC pseudonym inside the application and return it as an upstream
-response header:
+Gin and chi v5 have the same install shape:
 
 ```go
-adapter := sessionlabel.FromEnv(os.Getenv)
-handler := adapter.Middleware(applicationHandler)
+ginadapter.Install(engine)
+chiv5.Install(router)
 ```
+
+Use `ginadapter.Scenario("checkout")`, `chiv5.Scenario("checkout")`, or the
+matching Echo adapter helper on individual routes. `ISUTOOLS_SCENARIO` is the
+lower-effort choice when every request in a benchmark process shares one label.
+
+## Trusted session labels for nginx
+
+Client-supplied flow headers are never trusted. `isutools.HTTP` automatically
+installs the flow-label middleware and returns a fixed URL-safe HMAC pseudonym
+as an upstream response header:
 
 ```bash
 export ISUTOOLS_SESSION_COOKIE=session
 export ISUTOOLS_SESSION_HMAC_KEY='at-least-32-random-bytes-kept-out-of-git'
+export ISUTOOLS_SCENARIO=official_benchmark
 ```
 
 nginx records `$upstream_http_x_isutools_session`, hides the upstream header
 from the public response, and clears the inbound spoofable header. Invalid
 cookie/key configuration fails closed and reports only a bounded reason.
+Set `ISUTOOLS_FLOW_LABELS=off` for an immediate request-path opt-out. A closed
+synthetic test edge may instead map public labels to distinct
+`X-Isutools-Trusted-*` headers and opt in with
+`ISUTOOLS_TRUST_INBOUND_FLOW_LABELS=1`; never enable that mode for arbitrary
+Internet traffic.
 
 ## CPU handoff and flame view
 

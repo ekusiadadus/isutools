@@ -8,6 +8,10 @@
 //   curl -X POST $ADMIN/reset && k6 run ... && curl -X POST "$ADMIN/save?score=-"
 // The dashboard then shows the server-side view (SQL/HTTP/flows) of exactly
 // this scenario, and the User Flow section shows the simulated journeys.
+// The bundled private-isu nginx config maps these public synthetic labels to
+// distinct internal trusted headers. The app accepts them only when the closed
+// benchmark compose enables ISUTOOLS_TRUST_INBOUND_FLOW_LABELS=1. Do not use
+// that opt-in on an Internet-facing edge.
 import http from "k6/http";
 import { check, sleep } from "k6";
 

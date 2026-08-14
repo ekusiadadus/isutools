@@ -4,6 +4,7 @@ package echov4
 import (
 	"github.com/ekusiadadus/isutools"
 	"github.com/ekusiadadus/isutools/httpstats"
+	"github.com/ekusiadadus/isutools/sessionlabel"
 	"github.com/labstack/echo/v4"
 )
 
@@ -19,6 +20,17 @@ func Install(e *echo.Echo) {
 	}
 	e.Pre(NotFoundMiddlewareEnabled(true))
 	e.Use(MiddlewareEnabled(true))
+}
+
+// Scenario assigns one explicit non-secret story label to an Echo route or
+// group. isutools.HTTP performs the trusted response-header emission.
+func Scenario(label string) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			sessionlabel.SetScenario(c.Request(), label)
+			return next(c)
+		}
+	}
 }
 
 // NotFoundMiddlewareEnabled sets a safe default before Echo routing. Matched

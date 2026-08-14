@@ -10,7 +10,7 @@
 
 ```text
 private-isu: 0dc3be8b5b32d8519e0e841721da3ddf2c6a1542
-isutools:    v1.4.0
+isutools:    このrepository checkout（`git rev-parse HEAD`を検証記録へ残す）
 ```
 
 ## 1. 必要なものを確認する
@@ -41,13 +41,14 @@ make init
 
 ## 3. Go実装へisutoolsをimportする
 
-`webapp/golang/app.go`のimportへ1行追加します。
+`webapp/golang/app.go`のimportへ2行追加します。
 
 ```go
 import (
 	// 既存のimportはそのまま
 
 	"github.com/ekusiadadus/isutools"
+	chiv5 "github.com/ekusiadadus/isutools/adapters/chiv5"
 )
 ```
 
@@ -57,10 +58,12 @@ import (
 "github.com/bradfitz/gomemcache/memcache"
 gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
 "github.com/ekusiadadus/isutools"
+chiv5 "github.com/ekusiadadus/isutools/adapters/chiv5"
 "github.com/go-chi/chi/v5"
 ```
 
-理由: 次の2ステップでSQLドライバーとHTTPハンドラーをisutoolsへ渡すためです。
+理由: 次のステップでSQLドライバー、HTTPハンドラー、chiの登録route templateを
+isutoolsへ渡すためです。
 
 ## 4. SQLを計測対象にする
 
@@ -81,6 +84,15 @@ db, err = sqlx.Open(isutools.SQLDriverName("mysql"), dsn)
 
 ## 5. HTTPを計測対象にする
 
+routerを作る行の直後へroute template adapterを追加します。
+
+```go
+r := chi.NewRouter()
+chiv5.Install(r)
+```
+
+これにより`/posts/{id}`のような登録patternが集計キーになり、生のIDはHTTP集計へ入りません。
+
 同じファイル末尾の次の行を探します。
 
 ```go
@@ -94,25 +106,30 @@ log.Fatal(http.ListenAndServe(":8080", isutools.HTTP(r)))
 ```
 
 理由: 既存routerの外側へ計測middlewareを置き、HTTP pathごとの回数と時間を収集するためです。
+`isutools.HTTP`はflow-label middlewareも環境変数から自動で配線します。
 アプリが待ち受けるportは`8080`のままです。isutoolsの管理画面は別の`19191`で起動します。
 
 ## 6. dependencyを追加する
 
 ```bash
+export ISUTOOLS_DIR=/absolute/path/to/isutools
 cd webapp/golang
-go get github.com/ekusiadadus/isutools@v1.4.0
+go mod edit -replace github.com/ekusiadadus/isutools="$ISUTOOLS_DIR"
+go mod edit -replace github.com/ekusiadadus/isutools/adapters/chiv5="$ISUTOOLS_DIR/adapters/chiv5"
+go mod edit -require github.com/ekusiadadus/isutools/adapters/chiv5@v0.0.0
 go mod tidy
 gofmt -w app.go
 go test ./...
 cd ../..
 ```
 
-理由: versionを固定すると、後日同じ手順を実行しても別versionへ勝手に変わりません。
-`gofmt`で手編集したimportを整え、起動前に`go test`を通して編集の誤りも検出します。
+理由: 手元で検証したcheckoutを`replace`で固定し、未公開の別revisionへ勝手に変わらないようにします。
+検証記録には`git -C "$ISUTOOLS_DIR" rev-parse HEAD`も残してください。`gofmt`で手編集した
+importを整え、起動前に`go test`を通して編集の誤りも検出します。
 
 ## 7. Composeとnginxの設定を置く
 
-このisutools repositoryの場所を指定し、2つの設定ファイルをコピーします。
+このisutools repositoryの場所を指定し、3つの設定ファイルをコピーします。
 
 ```bash
 export ISUTOOLS_DIR=/absolute/path/to/isutools
@@ -120,18 +137,36 @@ export ISUTOOLS_DIR=/absolute/path/to/isutools
 cp "$ISUTOOLS_DIR/examples/private-isu/compose.isutools.yml" webapp/
 cp "$ISUTOOLS_DIR/examples/private-isu/nginx-isutools.conf" \
   webapp/etc/nginx/conf.d/isutools.conf
+cp "$ISUTOOLS_DIR/examples/private-isu/nginx-isutools-flow-headers.inc" \
+  webapp/etc/nginx/conf.d/isutools-flow-headers.inc
+```
+
+固定revisionの`webapp/etc/nginx/conf.d/default.conf`では`location /`が独自の
+`proxy_set_header Host`を持つため、親scopeの`proxy_set_header`を継承しません。
+同じlocation内の`proxy_pass`直前へ次を追加します。
+
+```nginx
+include /etc/nginx/conf.d/isutools-flow-headers.inc;
+proxy_pass http://app:8080;
 ```
 
 それぞれの理由は次のとおりです。
 
 - `compose.isutools.yml`: Go実装を選び、管理port`19191`をloopbackだけへ公開します。
 - `nginx-isutools.conf`: nginxのrequest timeとupstream response timeを専用ログへ出します。
+- `nginx-isutools-flow-headers.inc`: proxying location内でsynthetic labelを内部名へ写します。
+- flow labels: この閉じたk6例だけはpublicなsynthetic labelを別名の内部headerへ写し、
+  appの`ISUTOOLS_TRUST_INBOUND_FLOW_LABELS=1`で受理します。Internet-facing環境では使いません。
 - 専用volume: nginxが書いたログをisutoolsのapp containerからread-onlyで読みます。
 - data volume: Docker DesktopのLinux filesystemへ計測結果を安全に保存します。
 
 管理portをcontainer内では`:19191`で待ち受けるため、
 `ISUTOOLS_ALLOW_UNAUTHENTICATED=1`を明示しています。ホスト側は
 `127.0.0.1:19191`だけへbindするため、LANやInternetには公開しません。
+
+User Flow / Scenario Storiesは[k6例](../k6-private-isu.js)のiteration単位の疑似sessionと
+明示scenarioから生成されます。nginxはappが検証して返したupstream response headerだけを
+`sess:` / `scenario:`へ記録し、それらのresponse headerはclientへ返しません。
 
 ## 8. アプリを起動する
 

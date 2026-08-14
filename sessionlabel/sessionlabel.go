@@ -4,6 +4,7 @@ package sessionlabel
 
 import (
 	"bufio"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -12,18 +13,31 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
+
+	writercap "github.com/ekusiadadus/isutools/internal/httpwriter"
 )
 
 const (
-	HeaderName      = "X-Isutools-Session"
-	EnvSourceCookie = "ISUTOOLS_SESSION_COOKIE"
-	EnvHMACKey      = "ISUTOOLS_SESSION_HMAC_KEY"
-	MinKeyBytes     = 32
-	LabelBytes      = 18
-	MaxSourceBytes  = 4096
+	HeaderName                = "X-Isutools-Session"
+	ScenarioHeaderName        = "X-Isutools-Scenario"
+	TrustedSessionHeaderName  = "X-Isutools-Trusted-Session"
+	TrustedScenarioHeaderName = "X-Isutools-Trusted-Scenario"
+	EnvGlobalMode             = "ISUTOOLS"
+	EnvFlowLabels             = "ISUTOOLS_FLOW_LABELS"
+	EnvSourceCookie           = "ISUTOOLS_SESSION_COOKIE"
+	EnvHMACKey                = "ISUTOOLS_SESSION_HMAC_KEY"
+	EnvScenario               = "ISUTOOLS_SCENARIO"
+	EnvTrustInbound           = "ISUTOOLS_TRUST_INBOUND_FLOW_LABELS"
+	MinKeyBytes               = 32
+	LabelBytes                = 18
+	MaxSourceBytes            = 4096
+	MaxScenarioBytes          = 64
+	MaxTrustedSessionBytes    = 128
 )
 
 var cookieNamePattern = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+.^_` + "`" + `|~-]{1,128}$`)
+var flowLabelPattern = regexp.MustCompile(`^[A-Za-z0-9._~-]+$`)
 
 // Health is bounded configuration state. It never includes a cookie, key, or
 // raw environment value.
@@ -34,9 +48,13 @@ type Health struct {
 
 // Adapter is immutable and safe for concurrent requests.
 type Adapter struct {
-	cookie string
-	key    []byte
-	health Health
+	cookie         string
+	key            []byte
+	staticScenario string
+	trustInbound   bool
+	sessionEnabled bool
+	bypass         bool
+	health         Health
 }
 
 // New validates the source cookie and HMAC key. Invalid configuration is a
@@ -54,6 +72,7 @@ func New(cookieName string, key []byte) *Adapter {
 	default:
 		a.cookie = cookieName
 		a.key = append([]byte(nil), key...)
+		a.sessionEnabled = true
 		a.health = Health{Enabled: true, Reason: "enabled"}
 	}
 	return a
@@ -64,7 +83,42 @@ func FromEnv(getenv func(string) string) *Adapter {
 	if getenv == nil {
 		return New("", nil)
 	}
-	return New(getenv(EnvSourceCookie), []byte(getenv(EnvHMACKey)))
+	if disabledValue(getenv(EnvGlobalMode)) {
+		return &Adapter{bypass: true, health: Health{Reason: "global-off"}}
+	}
+	mode := strings.ToLower(strings.TrimSpace(getenv(EnvFlowLabels)))
+	if disabledValue(mode) {
+		return &Adapter{bypass: true, health: Health{Reason: "flow-labels-off"}}
+	}
+	cookie := getenv(EnvSourceCookie)
+	key := getenv(EnvHMACKey)
+	scenario := strings.TrimSpace(getenv(EnvScenario))
+	trust := enabledValue(getenv(EnvTrustInbound))
+	if (mode == "" || mode == "auto") && cookie == "" && key == "" && scenario == "" && !trust {
+		return &Adapter{bypass: true, health: Health{Reason: "auto-unconfigured"}}
+	}
+	a := New(cookie, []byte(key))
+	if mode != "" && mode != "auto" && !enabledValue(mode) {
+		a.cookie = ""
+		a.key = nil
+		a.sessionEnabled = false
+		a.staticScenario = ""
+		a.trustInbound = false
+		a.health = Health{Reason: "mode-invalid"}
+		return a
+	}
+	if scenario != "" {
+		if validScenario(scenario) {
+			a.staticScenario = scenario
+		} else {
+			a.health.Reason = "scenario-invalid"
+		}
+	}
+	a.trustInbound = trust
+	if trust && !a.sessionEnabled {
+		a.health = Health{Enabled: true, Reason: "trusted-inbound"}
+	}
+	return a
 }
 
 func (a *Adapter) Health() Health {
@@ -76,7 +130,7 @@ func (a *Adapter) Health() Health {
 
 // Label returns a fixed-length URL-safe pseudonym. False means fail closed.
 func (a *Adapter) Label(source string) (string, bool) {
-	if a == nil || !a.health.Enabled || source == "" || len(source) > MaxSourceBytes {
+	if a == nil || !a.sessionEnabled || source == "" || len(source) > MaxSourceBytes {
 		return "", false
 	}
 	mac := hmac.New(sha256.New, a.key)
@@ -92,20 +146,120 @@ func (a *Adapter) Middleware(next http.Handler) http.Handler {
 	if next == nil {
 		next = http.NotFoundHandler()
 	}
+	if a != nil && a.bypass {
+		return next
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		trustedSession := r.Header.Get(TrustedSessionHeaderName)
+		trustedScenario := r.Header.Get(TrustedScenarioHeaderName)
 		r.Header.Del(HeaderName)
+		r.Header.Del(ScenarioHeaderName)
+		r.Header.Del(TrustedSessionHeaderName)
+		r.Header.Del(TrustedScenarioHeaderName)
 		label := ""
-		if a != nil && a.health.Enabled {
+		if a != nil && a.sessionEnabled {
 			if cookie, err := r.Cookie(a.cookie); err == nil {
 				if trusted, ok := a.Label(cookie.Value); ok {
 					label = trusted
 				}
 			}
 		}
-		writer := &trustedWriter{ResponseWriter: w, label: label}
+		state := &scenarioState{}
+		if a != nil {
+			state.label = a.staticScenario
+			if a.trustInbound {
+				if label == "" && validTrustedSession(trustedSession) {
+					label = trustedSession
+				}
+				if validScenario(trustedScenario) {
+					state.label = trustedScenario
+				}
+			}
+		}
+		r = r.WithContext(context.WithValue(r.Context(), scenarioContextKey{}, state))
+		writer := &trustedWriter{ResponseWriter: w, label: label, scenario: state}
 		defer writer.commit()
-		next.ServeHTTP(writer, r)
+		next.ServeHTTP(preserveOptionalInterfaces(writer), r)
 	})
+}
+
+// SetScenario assigns a bounded, non-secret scenario to the current request.
+// It succeeds only when the request is inside Adapter.Middleware. Invalid
+// labels clear any static fallback so a bad value cannot be misclassified.
+func SetScenario(r *http.Request, scenario string) bool {
+	if r == nil {
+		return false
+	}
+	state, ok := r.Context().Value(scenarioContextKey{}).(*scenarioState)
+	if !ok || state == nil {
+		return false
+	}
+	if !validScenario(scenario) {
+		state.set("")
+		return false
+	}
+	state.set(scenario)
+	return true
+}
+
+// Scenario returns framework-neutral middleware for assigning one explicit
+// scenario to a route or route group.
+func Scenario(scenario string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if next == nil {
+			next = http.NotFoundHandler()
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			SetScenario(r, scenario)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+type scenarioContextKey struct{}
+
+type scenarioState struct {
+	mu    sync.RWMutex
+	label string
+}
+
+func (s *scenarioState) set(label string) {
+	s.mu.Lock()
+	s.label = label
+	s.mu.Unlock()
+}
+
+func (s *scenarioState) get() string {
+	s.mu.RLock()
+	label := s.label
+	s.mu.RUnlock()
+	return label
+}
+
+func validScenario(value string) bool {
+	return value != "" && len(value) <= MaxScenarioBytes && flowLabelPattern.MatchString(value)
+}
+
+func validTrustedSession(value string) bool {
+	return value != "" && len(value) <= MaxTrustedSessionBytes && flowLabelPattern.MatchString(value)
+}
+
+func disabledValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "off", "0", "false", "no", "disabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func enabledValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "on", "1", "true", "yes", "enabled":
+		return true
+	default:
+		return false
+	}
 }
 
 // trustedWriter applies the trusted value at the commit boundary, after the
@@ -113,8 +267,9 @@ func (a *Adapter) Middleware(next http.Handler) http.Handler {
 // ResponseController operations available to streaming handlers.
 type trustedWriter struct {
 	http.ResponseWriter
-	label string
-	wrote bool
+	label    string
+	scenario *scenarioState
+	wrote    bool
 }
 
 func (w *trustedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -124,13 +279,28 @@ func (w *trustedWriter) commit() {
 		return
 	}
 	w.wrote = true
+	w.apply()
+}
+
+func (w *trustedWriter) apply() {
 	w.Header().Del(HeaderName)
+	w.Header().Del(ScenarioHeaderName)
 	if w.label != "" {
 		w.Header().Set(HeaderName, w.label)
+	}
+	if w.scenario != nil {
+		if scenario := w.scenario.get(); scenario != "" {
+			w.Header().Set(ScenarioHeaderName, scenario)
+		}
 	}
 }
 
 func (w *trustedWriter) WriteHeader(status int) {
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		w.apply()
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
 	w.commit()
 	w.ResponseWriter.WriteHeader(status)
 }
@@ -142,32 +312,64 @@ func (w *trustedWriter) Write(body []byte) (int, error) {
 	return w.ResponseWriter.Write(body)
 }
 
-func (w *trustedWriter) ReadFrom(reader io.Reader) (int64, error) {
-	if !w.wrote {
-		w.WriteHeader(http.StatusOK)
-	}
-	if target, ok := w.ResponseWriter.(io.ReaderFrom); ok {
-		return target.ReadFrom(reader)
-	}
-	return io.Copy(struct{ io.Writer }{w.ResponseWriter}, reader)
+type flushFeature struct {
+	w *trustedWriter
+	f http.Flusher
 }
 
-func (w *trustedWriter) Flush() {
-	if !w.wrote {
-		w.WriteHeader(http.StatusOK)
-	}
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
+func (f flushFeature) Flush() {
+	f.w.commit()
+	f.f.Flush()
 }
 
-func (w *trustedWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	w.commit()
-	return http.NewResponseController(w.ResponseWriter).Hijack()
+type hijackFeature struct {
+	w *trustedWriter
+	h http.Hijacker
 }
 
-func (w *trustedWriter) Push(target string, options *http.PushOptions) error {
-	pusher, ok := w.ResponseWriter.(http.Pusher)
-	if !ok {
-		return http.ErrNotSupported
+func (h hijackFeature) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.w.commit()
+	return h.h.Hijack()
+}
+
+type pushFeature struct{ p http.Pusher }
+
+func (p pushFeature) Push(target string, options *http.PushOptions) error {
+	return p.p.Push(target, options)
+}
+
+type readFromFeature struct {
+	w  *trustedWriter
+	rf io.ReaderFrom
+}
+
+type closeNotifyFeature struct{ c writercap.CloseNotifier }
+
+func (c closeNotifyFeature) CloseNotify() <-chan bool { return c.c.CloseNotify() }
+
+func (r readFromFeature) ReadFrom(reader io.Reader) (int64, error) {
+	r.w.commit()
+	return r.rf.ReadFrom(reader)
+}
+
+// preserveOptionalInterfaces exposes exactly the capabilities of the real
+// writer. Framework feature detection must not be changed by instrumentation.
+func preserveOptionalInterfaces(w *trustedWriter) http.ResponseWriter {
+	features := writercap.Features{}
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		features.Flusher = flushFeature{w: w, f: f}
 	}
-	return pusher.Push(target, options)
+	if h, ok := w.ResponseWriter.(http.Hijacker); ok {
+		features.Hijacker = hijackFeature{w: w, h: h}
+	}
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		features.Pusher = pushFeature{p: p}
+	}
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		features.ReaderFrom = readFromFeature{w: w, rf: rf}
+	}
+	if c, ok := w.ResponseWriter.(writercap.CloseNotifier); ok {
+		features.CloseNotifier = closeNotifyFeature{c: c}
+	}
+	return writercap.Preserve(w, w, features)
 }

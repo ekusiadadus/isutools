@@ -169,7 +169,8 @@ ADRから同時に削除した。
   (`/image/123.jpg` → `/image/*.jpg`)。`WithPathRules([]Rule)` で上書き可能
 - 集計キーには `r.URL.Path` を使い、query stringは保存しない
 - ResponseWriter wrapper はstatus/bytesを記録しつつ、`Unwrap`、`Flusher`、
-  `Hijacker`、`io.ReaderFrom` 等の元writerの能力を壊さない。アプリHandlerのpanicは再panicする
+  `Hijacker`、`Pusher`、`io.ReaderFrom`、Ginが依存するlegacy `CloseNotify`等について、
+  元writerが持つ能力だけを壊さず透過する。アプリHandlerのpanicは再panicする
 - HTTP/2: net/http 標準(TLS)/ h2c どちらも同一ミドルウェアで計測可能
 - HTTP/3/QUIC: middleware 自体は `r.Proto` を記録できるが、quic-go を使った実 listener
   統合テストは v1.0.0 の保証範囲外。検証なしに互換性を宣言しない
@@ -191,7 +192,8 @@ p95/avg に巨大な外れ値として混入する)。そのため httpstats は
   直接読み書きは接続を壊すため、汎用ラッパーは成立しない)。Phase 1 は
   接続数・アクティブゲージ・持続時間・**wire バイト数**(Hijack 後の `net.Conn` を
   Close 追跡付きで包んで計測)までとする
-- ResponseWriter ラッパーは `Hijacker` / `Flusher` / `ReaderFrom` / `Unwrap` を
+- ResponseWriter ラッパーは `Hijacker` / `Flusher` / `Pusher` / `ReaderFrom` /
+  `CloseNotify` / `Unwrap` を
   必ず透過する(消すと WebSocket/SSE 自体が壊れる)
 - SSEは`Content-Type: text/event-stream`確定時からHandler終了/Context cancelまでを
   activeとして扱い、接続時間は通常HTTPレイテンシへ混ぜない
@@ -238,9 +240,13 @@ log_format isutools ltsv escape=json
   "\tcache:$upstream_cache_status"    # proxy_cache の HIT/MISS/BYPASS
   "\tctype:$sent_http_content_type"
   "\tproto:$server_protocol"
-  "\tsess:$http_x_isutools_session"   # 疑似session ID。生Cookieは禁止
-  "\tscenario:$http_x_isutools_scenario"; # 非秘密のstoryラベル
+  "\tsess:$upstream_http_x_isutools_session"   # appが返すHMAC疑似session。生Cookieは禁止
+  "\tscenario:$upstream_http_x_isutools_scenario"; # appが返す非秘密storyラベル
 ```
+
+nginxは同名のpublic request headerと`X-Isutools-Trusted-*`をupstreamへ渡す前に削除し、
+上記response headerもclientへは隠す。`isutools.HTTP`が環境変数からHMAC session/scenario
+middlewareを自動構成するため、通常構成でclient headerを直接ログへ写してはならない。
 
 #### 5.4.2 集計軸
 
@@ -670,9 +676,12 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 
 - **Context**: GA4風flowを見たいが、生Cookie/token/user IDの保存やURL意味の自動推測は
   privacy・誤分類・アプリ依存を招く
-- **Decision**: callerが非秘密`scenario`と疑似`sess`を付け、観測した`METHOD URI`列を
-  boundedに集約する。最大10,000 session、共有page辞書10,000、32 step、表示上位20 storyとする
-- **Consequences**: 数行のproxy/k6設定で複数ユーザーストーリーを比較できる。必須step、
+- **Decision**: `isutools.HTTP`がsession CookieをHMAC疑似IDへ変換し、環境変数またはrouter helperの
+  非秘密`scenario`とともにupstream responseとしてproxyへ渡す。public flow headerは削除する。
+  閉じたk6環境だけは別名`X-Isutools-Trusted-*`へのedge mappingと明示opt-inを許す。
+  観測した`METHOD URI`列は最大10,000 session、共有page辞書10,000、32 step、表示上位20 storyに
+  bounded集約する。flow label全体は`ISUTOOLS_FLOW_LABELS=off`でrequest pathから外れる
+- **Consequences**: 環境変数と数行のrouter/proxy設定で複数ユーザーストーリーを比較できる。必須step、
   conversion、drop-offを持つfunnel定義は将来の明示DSLに分離する
 - **Status**: Implemented in post-v1 working tree
 

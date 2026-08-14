@@ -18,6 +18,10 @@ DB pool/access log/run CPU profileのhealth `ok`まで確認しました。ス�
 性能保証ではありません。run ID、artifact hash、再起動・OFF・port forwardの確認結果とUI画像は
 [実機検証記録](../../docs/isucon13-wsl-verification-20260814.md)に分離しています。
 
+User Flow / Scenario Storiesの疑似session・scenario labelは、同じWSL実機でON/OFF、
+header spoof防止、公式ベンチ、同一binary ABBAまで確認しています。結果と未通過の性能gateは
+[flow labels実機検証記録](../../docs/isucon13-wsl-flow-verification-20260814.md)に分離しています。
+
 公式WSL版は本番と異なり、DNS port `1053`、`*.u.isucon.local`、自己署名証明書を使います。
 ベンチコマンドは`./bench run --dns-port 1053 --enable-ssl`です。
 
@@ -27,6 +31,9 @@ DB pool/access log/run CPU profileのhealth `ok`まで確認しました。ス�
 - `nginx-isutools.conf`: isutoolsが解釈する専用LTSV access log
 - `isupipe-go.isutools.conf`: loopback管理portと永続化・CPU profile設定
 - `isupipe-go.manual-pprof.conf`: manual profile確認時だけ使う一時override
+- `isupipe-go.flow-on.conf`: HMAC疑似sessionと明示scenarioを有効化する独立drop-in
+- `isupipe-go.flow-off.conf`: User Flow / Scenario Storiesだけを即時停止する確認用override
+- `flow-abba-restart.sh` / `flow-abba-bench.py`: 同一binaryでflow labelだけを比較するABBA helper
 - `isupipe-go.off.conf`: 環境変数だけで全計測を止める確認用override
 - `remote-bench.sh`: WSL内の`reset -> 公式bench -> collect -> save -> stage`
 - `Makefile`: 制御PCの`make bench`、SCP、確認、tunnel
@@ -102,6 +109,16 @@ sudo install -d -o root -g root -m 0755 \
 sudo install -o root -g root -m 0644 \
   /home/isucon/isutools-example/isupipe-go.isutools.conf \
   /etc/systemd/system/isupipe-go.service.d/isutools.conf
+sudo install -o root -g root -m 0644 \
+  /home/isucon/isutools-example/isupipe-go.flow-on.conf \
+  /etc/systemd/system/isupipe-go.service.d/flow-labels.conf
+sudo install -d -o root -g root -m 0750 /etc/isutools
+if ! sudo test -e /etc/isutools/flow-label.env; then
+  flow_key=$(openssl rand -hex 32)
+  printf 'ISUTOOLS_SESSION_HMAC_KEY=%s\n' "$flow_key" | \
+    sudo install -o root -g root -m 0600 /dev/stdin /etc/isutools/flow-label.env
+  unset flow_key
+fi
 sudo nginx -t
 sudo systemctl daemon-reload
 sudo systemctl restart nginx isupipe-go
@@ -110,6 +127,9 @@ sudo systemctl restart nginx isupipe-go
 この例は既存の`19191`との衝突を避けて`127.0.0.1:19196`を使います。外部bindや
 `ISUTOOLS_ALLOW_UNAUTHENTICATED=1`は不要です。`ISUTOOLS_GIT_DIRTY=1`は、公式checkoutへ
 計測patchを加えた事実をartifactに残すため意図的に設定しています。
+`isutools.HTTP`は`SESSIONID`をHMAC疑似IDへ変換し、`isucon13_official` scenarioとともに
+nginxへ返します。nginxはupstream responseだけをログへ書き、public headerを削除します。
+HMAC keyはroot所有0600の別ファイルへ置き、設定表示・git・結果artifactへ出しません。
 
 ## 5. readinessを確認する
 
@@ -122,6 +142,43 @@ mysqladmin ping -h 127.0.0.1 -uisucon -pisucon --silent
 ```
 
 管理JSONだけの成功をベンチ成功とは扱いません。次の公式ベンチまで通して初めて実動確認です。
+
+flow labelだけを切り替えるsmoke testは次のとおりです。
+
+```bash
+# OFF: sess/scenarioが空になる
+sudo install -o root -g root -m 0644 \
+  /home/isucon/isutools-example/isupipe-go.flow-off.conf \
+  /etc/systemd/system/isupipe-go.service.d/zz-flow-off.conf
+sudo systemctl daemon-reload && sudo systemctl restart isupipe-go
+
+# ONへ戻す
+sudo rm /etc/systemd/system/isupipe-go.service.d/zz-flow-off.conf
+sudo systemctl daemon-reload && sudo systemctl restart isupipe-go
+```
+
+各状態で`reset -> 同一SESSIONID cookieによる複数request -> collect`を行い、OFFでは
+`accesslog.flows` / `stories`が無く、ONでは同じ疑似sessionの遷移とscenario storyが出ることを
+確認します。環境変数や鍵の表示ではなく、保存JSONの集計結果を証拠にします。
+
+request-path overheadを確認する場合は、同一binaryのままflow labelだけを
+off→on→on→offで3ブロック比較します。固定`/api/tag` workloadのrequests/sec、p95、error rateを
+記録し、終了後は必ずONへ戻します。
+
+```bash
+cd /home/isucon/isutools-example
+export ISUTOOLS_DIR=/absolute/path/to/isutools
+RESTART='./flow-abba-restart.sh' \
+WARMUP='FLOW_BENCH_REQUESTS=50 ./flow-abba-bench.py' \
+BENCH='./flow-abba-bench.py' \
+FINGERPRINT='sha256sum /home/isucon/webapp/go/isupipe | cut -d" " -f1' \
+ABBA_BLOCKS=3 \
+ABBA_OUTPUT=/home/isucon/isutools-data/flow-label-abba.tsv \
+"$ISUTOOLS_DIR/examples/abba.sh"
+ISUTOOLS_EXAMPLE_DIR=$PWD ./flow-abba-restart.sh
+```
+
+このmicro比較はmiddleware overheadの診断であり、公式ベンチscoreの代替ではありません。
 
 ## 6. 制御PCからmake benchする
 
@@ -198,6 +255,9 @@ sudo systemctl restart isupipe-go
 計測を一時的に完全停止する場合は`isupipe-go.off.conf`をsystemd drop-inへ配置し、daemon
 reloadとrestartを行います。`SQLDriverName`は元driver名、HTTP/Echo middlewareはno-opになり、
 管理portも起動しません。
+
+User Flow / Scenario Storiesだけを止め、SQL/HTTP等は継続する場合は
+`isupipe-go.flow-off.conf`を同様に`zz-flow-off.conf`として配置します。
 
 完全に戻す場合は、手順2のbackupから`main.go`、`go.mod`、`go.sum`、`isupipe`を戻し、追加した
 2設定を削除して再起動します。結果directoryは証跡なので、不要と確認するまで削除しません。
