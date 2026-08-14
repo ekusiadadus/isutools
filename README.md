@@ -409,6 +409,10 @@ exact `snapshot_base`と`snapshot_sha256`を必須とし、`publish`はoperator�
 短時間のinitialize/resetでもCPU profiler ownershipはbounded handoffされる。100ms以内に
 前ownerが解放されなければ新runへ`skipped/cpu-busy`を明示し、無言の欠落や二重Startは起こさない。
 initialize retryには引き続き同じnonceの`ResetNowWithNonce`を使う。
+`cpu-busy`はCPU使用率が高いという意味ではなく、同じGoプロセスで別のCPU profile採取が
+process-wide profilerを所有している状態を表す。別の採取が終わるのを待ち、`POST /reset`の
+`X-Isutools-CPU-Profile-State: capturing`を確認してから、ベンチ、`POST /save`、
+`isutools-pprof`解析の順で再計測する。
 
 ### EXPLAIN(既定 off)
 
