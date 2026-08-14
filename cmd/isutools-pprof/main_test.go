@@ -88,7 +88,8 @@ func TestFetchAnalyzeObservedProfileUsesVerifiedWorkerAndBinaryIdentity(t *testi
 	labelScope.Seal()
 	labelDictionary := labelScope.Dictionary("run-2", 2)
 	snapshot := struct {
-		Snapshot web.Snapshot `json:"snapshot"`
+		web.Snapshot
+		Prev *web.Snapshot `json:"prev,omitempty"`
 	}{Snapshot: web.Snapshot{Meta: web.Meta{
 		SchemaVersion: 3, Run: &web.RunInfo{RunID: "run-2", Epoch: 2, Validity: "valid"},
 		Profiles: &web.ProfileManifest{
@@ -188,7 +189,8 @@ func TestDataDirFetchCumulativeAnalysisHardFailureAndTamperDetection(t *testing.
 	openBody, closeBody := []byte("open profile"), []byte("close profile")
 	executable := buildIdentityFixture
 	snapshot := struct {
-		Snapshot web.Snapshot `json:"snapshot"`
+		web.Snapshot
+		Prev *web.Snapshot `json:"prev,omitempty"`
 	}{Snapshot: web.Snapshot{Meta: web.Meta{
 		SchemaVersion: 3, Run: &web.RunInfo{RunID: "run-4", Epoch: 4, Validity: "valid"},
 		Profiles: &web.ProfileManifest{
@@ -462,7 +464,8 @@ func TestSourcePathsAreRelativeOrRedactedWithoutLeakingHostPaths(t *testing.T) {
 func TestFetchThenAnalyzeMissingExpectedProfileWithoutReadingWorker(t *testing.T) {
 	base := "20260806-120000_gen1_deadbeef"
 	snapshot := struct {
-		Snapshot web.Snapshot `json:"snapshot"`
+		web.Snapshot
+		Prev *web.Snapshot `json:"prev,omitempty"`
 	}{Snapshot: web.Snapshot{Meta: web.Meta{
 		SchemaVersion: 3,
 		Run:           &web.RunInfo{RunID: "run-1", Epoch: 1, Validity: "valid"},
