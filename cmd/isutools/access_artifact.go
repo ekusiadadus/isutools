@@ -11,8 +11,34 @@ import (
 	"github.com/ekusiadadus/isutools/internal/safefs"
 )
 
+func accessLogCoverage(enabled bool, startDevice, startInode, startOffset uint64, startClock string, endDevice, endInode, endOffset uint64, endClock string) (analysisartifact.Coverage, error) {
+	coverage := analysisartifact.Coverage{Complete: false, Clock: "proxy-log", Reason: "run-boundary-unavailable"}
+	if !enabled {
+		return coverage, nil
+	}
+	started, startErr := time.Parse(time.RFC3339Nano, startClock)
+	ended, endErr := time.Parse(time.RFC3339Nano, endClock)
+	if startErr != nil || endErr != nil || startInode == 0 || endInode == 0 {
+		return coverage, errors.New("accessinspect: invalid coverage")
+	}
+	coverage = analysisartifact.Coverage{
+		Complete: true, Clock: "proxy-log", StartedAt: started, EndedAt: ended,
+		StartDevice: startDevice, StartInode: startInode, StartOffset: startOffset,
+		EndDevice: endDevice, EndInode: endInode, EndOffset: endOffset,
+	}
+	switch {
+	case startDevice != endDevice || startInode != endInode:
+		coverage.Complete, coverage.Reason = false, "log-rotated"
+	case endOffset < startOffset:
+		coverage.Complete, coverage.Reason = false, "log-truncated"
+	case ended.Before(started):
+		coverage.Complete, coverage.Reason = false, "proxy-clock-backwards"
+	}
+	return coverage, nil
+}
+
 func publishAccesslogArtifact(dataDir, namespace, expected, runID, snapshotBase, snapshotSHA string, snapshotSchema int,
-	inputHash []byte, inputBytes uint64, output []byte, report accessinspect.Report, outputFormat string, maxInput, maxRecords int64, maxKeys int,
+	inputHash []byte, inputBytes uint64, output []byte, report accessinspect.Report, coverage analysisartifact.Coverage, outputFormat string, maxInput, maxRecords int64, maxKeys int,
 ) (string, error) {
 	if namespace == "" {
 		namespace = runID
@@ -38,13 +64,17 @@ func publishAccesslogArtifact(dataDir, namespace, expected, runID, snapshotBase,
 	if err != nil {
 		return "", errors.New("accessinspect: output-publication-failed")
 	}
+	if coverage.Complete && (coverage.EndOffset < coverage.StartOffset || coverage.EndOffset-coverage.StartOffset != inputBytes) {
+		coverage.Complete, coverage.Reason = false, "input-span-mismatch"
+	}
 	status := analysisartifact.StatusReady
-	coverage := analysisartifact.Coverage{Complete: report.Health.Malformed == 0 && report.Health.Partial == 0, Clock: "proxy-log"}
 	diagnostics := []analysisartifact.Diagnostic{}
-	if !coverage.Complete {
+	if !coverage.Complete || report.Health.Malformed != 0 || report.Health.Partial != 0 {
 		status = analysisartifact.StatusPartial
-		coverage.Reason = "malformed-or-partial-input"
-		diagnostics = append(diagnostics, analysisartifact.Diagnostic{Level: analysisartifact.DiagnosticWarn, Code: "accesslog-partial", Message: "one or more input lines were malformed or incomplete"})
+		if coverage.Reason == "" {
+			coverage.Reason = "malformed-or-partial-input"
+		}
+		diagnostics = append(diagnostics, analysisartifact.Diagnostic{Level: analysisartifact.DiagnosticWarn, Code: "accesslog-partial", Message: "the access-log interval or one or more input lines are incomplete"})
 	}
 	extensionBody, _ := json.Marshal(map[string]any{
 		"lines": report.Health.Lines, "parsed": report.Health.Parsed, "selected": report.Health.Filtered,

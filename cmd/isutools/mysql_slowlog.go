@@ -197,10 +197,14 @@ func publishSlowlogArtifact(dataDir, namespace, expected, runID, snapshotBase, s
 	manifest := analysisartifact.Manifest{
 		Schema: analysisartifact.SchemaV1, Kind: analysisartifact.KindMySQLSlowLog, GeneratedAt: time.Now().UTC(),
 		Analyzer: analysisartifact.Analyzer{Name: "isutools-slowlog", Version: version}, Status: status,
-		Run:         &binding,
-		Inputs:      []analysisartifact.FileRef{{Role: "mysql-slowlog", Name: "mysql-slow.log", SHA256: hex.EncodeToString(inputHash[:]), Bytes: uint64(len(input)), MediaType: "text/plain", Visibility: analysisartifact.VisibilityRestricted}},
-		Outputs:     outputs,
-		Coverage:    analysisartifact.Coverage{Complete: report.Coverage.Complete, Clock: "mysql-slowlog", StartedAt: report.Coverage.DBStartedAt, EndedAt: report.Coverage.DBEndedAt, StartOffset: report.Coverage.StartOffset, EndOffset: report.Coverage.EndOffset, Reason: report.Coverage.Reason},
+		Run:     &binding,
+		Inputs:  []analysisartifact.FileRef{{Role: "mysql-slowlog", Name: "mysql-slow.log", SHA256: hex.EncodeToString(inputHash[:]), Bytes: uint64(len(input)), MediaType: "text/plain", Visibility: analysisartifact.VisibilityRestricted}},
+		Outputs: outputs,
+		Coverage: analysisartifact.Coverage{
+			Complete: report.Coverage.Complete, Clock: "mysql-slowlog", StartedAt: report.Coverage.DBStartedAt, EndedAt: report.Coverage.DBEndedAt,
+			StartDevice: report.Coverage.Identity.Device, StartInode: report.Coverage.Identity.Inode, StartOffset: report.Coverage.StartOffset,
+			EndDevice: report.Coverage.Identity.Device, EndInode: report.Coverage.Identity.Inode, EndOffset: report.Coverage.EndOffset, Reason: report.Coverage.Reason,
+		},
 		Budget:      analysisartifact.ResourceBudget{TimeoutMS: uint64(ptqdTimeout / time.Millisecond), MaxInputBytes: uint64(maxInput), MaxOutputBytes: uint64(ptqdMaxOutput), MaxMemoryBytes: ptqdMaxMemory},
 		Diagnostics: diagnostics, Extensions: map[string]json.RawMessage{"mysql-slowlog-v1": extension},
 	}

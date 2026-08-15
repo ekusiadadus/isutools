@@ -56,7 +56,11 @@
         "clock": {"type": "string", "maxLength": 64},
         "started_at": {"type": "string", "format": "date-time"},
         "ended_at": {"type": "string", "format": "date-time"},
+        "start_device": {"type": "integer", "minimum": 0},
+        "start_inode": {"type": "integer", "minimum": 0},
         "start_offset": {"type": "integer", "minimum": 0},
+        "end_device": {"type": "integer", "minimum": 0},
+        "end_inode": {"type": "integer", "minimum": 0},
         "end_offset": {"type": "integer", "minimum": 0},
         "approximation_ns": {"type": "integer", "minimum": 0},
         "reason": {"type": "string", "maxLength": 128}

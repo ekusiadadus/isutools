@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -162,6 +163,8 @@ func TestRunInspectAccesslogPublishesOnlyAgainstExactSnapshot(t *testing.T) {
 	args := []string{
 		"inspect", "accesslog", "--format", "isutools-json-v1", "--output", "json", "--data-dir", directory,
 		"--run-id", "run-access", "--snapshot-base", "snapshot-access", "--snapshot-sha256", testHash(snapshot), "--snapshot-schema", "3",
+		"--coverage", "--start-device", "1", "--start-inode", "2", "--start-offset", "100", "--start-clock", "2026-08-15T12:00:00+09:00",
+		"--end-device", "1", "--end-inode", "2", "--end-offset", fmt.Sprint(100 + len(accessFixture)), "--end-clock", "2026-08-15T12:01:00+09:00",
 	}
 	var stdout, stderr bytes.Buffer
 	if code := run(context.Background(), args, strings.NewReader(accessFixture), &stdout, &stderr); code != 0 || !strings.Contains(stderr.String(), "artifact=") {
@@ -172,6 +175,17 @@ func TestRunInspectAccesslogPublishesOnlyAgainstExactSnapshot(t *testing.T) {
 	stderr.Reset()
 	if code := run(context.Background(), args, strings.NewReader(accessFixture), &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "snapshot sha256 mismatch") {
 		t.Fatalf("mismatch code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestAccessLogCoverageFailsClosedOnMissingAndMismatchedBoundary(t *testing.T) {
+	missing, err := accessLogCoverage(false, 0, 0, 0, "", 0, 0, 0, "")
+	if err != nil || missing.Complete || missing.Reason != "run-boundary-unavailable" {
+		t.Fatalf("missing=%+v err=%v", missing, err)
+	}
+	rotated, err := accessLogCoverage(true, 1, 2, 100, "2026-08-15T12:00:00+09:00", 1, 3, 200, "2026-08-15T12:01:00+09:00")
+	if err != nil || rotated.Complete || rotated.Reason != "log-rotated" {
+		t.Fatalf("rotated=%+v err=%v", rotated, err)
 	}
 }
 

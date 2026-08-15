@@ -72,6 +72,15 @@ func runAccesslog(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		maxLine        = flags.Int("max-line-bytes", accessinspect.DefaultMaxLineBytes, "line byte limit")
 		maxRecords     = flags.Int64("max-records", accessinspect.DefaultMaxRecords, "parsed record limit")
 		maxKeys        = flags.Int("max-keys", accessinspect.DefaultMaxKeys, "aggregation key limit")
+		coverageSet    = flags.Bool("coverage", false, "require explicit run boundary coverage metadata")
+		startDevice    = flags.Uint64("start-device", 0, "capture-start log device")
+		startInode     = flags.Uint64("start-inode", 0, "capture-start log inode")
+		startOffset    = flags.Uint64("start-offset", 0, "capture-start byte offset")
+		startClock     = flags.String("start-clock", "", "capture-start proxy clock (RFC3339Nano)")
+		endDevice      = flags.Uint64("end-device", 0, "capture-end log device")
+		endInode       = flags.Uint64("end-inode", 0, "capture-end log inode")
+		endOffset      = flags.Uint64("end-offset", 0, "capture-end byte offset")
+		endClock       = flags.String("end-clock", "", "capture-end proxy clock (RFC3339Nano)")
 		dataDir        = flags.String("data-dir", "", "artifact and snapshot data directory")
 		namespace      = flags.String("namespace", "", "artifact namespace; defaults to run id")
 		expected       = flags.String("expected-current", "none", "expected current artifact id")
@@ -119,6 +128,11 @@ func runAccesslog(ctx context.Context, args []string, stdin io.Reader, stdout, s
 		_, _ = fmt.Fprintln(stderr, "isutools: invalid-columns")
 		return 2
 	}
+	coverage, err := accessLogCoverage(*coverageSet, *startDevice, *startInode, *startOffset, *startClock, *endDevice, *endInode, *endOffset, *endClock)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "accessinspect: invalid-coverage")
+		return 2
+	}
 	input := stdin
 	var closer io.Closer
 	if *filePath != "" && *filePath != "-" {
@@ -152,7 +166,7 @@ func runAccesslog(ctx context.Context, args []string, stdin io.Reader, stdout, s
 	}
 	if *dataDir != "" {
 		artifactID, publishErr := publishAccesslogArtifact(*dataDir, *namespace, *expected, *runID, *snapshotBase, *snapshotSHA, *snapshotSchema,
-			hasher.Sum(nil), counter.n, rendered.Bytes(), report, *outputName, *maxInput, *maxRecords, *maxKeys)
+			hasher.Sum(nil), counter.n, rendered.Bytes(), report, coverage, *outputName, *maxInput, *maxRecords, *maxKeys)
 		if publishErr != nil {
 			_, _ = fmt.Fprintln(stderr, publishErr)
 			return 1

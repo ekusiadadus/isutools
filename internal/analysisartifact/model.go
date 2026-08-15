@@ -101,7 +101,11 @@ type Coverage struct {
 	Clock           string    `json:"clock,omitempty"`
 	StartedAt       time.Time `json:"started_at,omitzero"`
 	EndedAt         time.Time `json:"ended_at,omitzero"`
+	StartDevice     uint64    `json:"start_device,omitempty"`
+	StartInode      uint64    `json:"start_inode,omitempty"`
 	StartOffset     uint64    `json:"start_offset,omitempty"`
+	EndDevice       uint64    `json:"end_device,omitempty"`
+	EndInode        uint64    `json:"end_inode,omitempty"`
 	EndOffset       uint64    `json:"end_offset,omitempty"`
 	ApproximationNS uint64    `json:"approximation_ns,omitempty"`
 	Reason          string    `json:"reason,omitempty"`

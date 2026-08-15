@@ -32,9 +32,17 @@ runへattachする場合は保存済みsnapshotと同じDataDirを渡す。
 
 ```bash
 isutools inspect accesslog --file run.proxy.log --output json \
+  --coverage \
+  --start-device DEV --start-inode INODE --start-offset START \
+  --start-clock 2026-08-15T12:00:00+09:00 \
+  --end-device DEV --end-inode INODE --end-offset END \
+  --end-clock 2026-08-15T12:01:00+09:00 \
   --data-dir /var/lib/isutools --run-id RUN_ID \
   --snapshot-base SNAPSHOT_BASE --snapshot-sha256 SNAPSHOT_SHA --snapshot-schema 3
 ```
+
+`END - START`と入力file bytesが一致しない場合、またはdevice/inode/clockが連続しない場合は
+attach自体は監査可能な`partial`として残るが、完全なrun区間とは表示しない。
 
 ## MySQL slow log: event外れ値を足す
 

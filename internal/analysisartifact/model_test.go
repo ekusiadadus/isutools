@@ -40,7 +40,7 @@ func validManifest(t *testing.T) Manifest {
 			Role: "summary", Name: "summary.json", SHA256: strings.Repeat("d", 64), Bytes: 321, MediaType: "application/json", Visibility: VisibilityPortable,
 		}},
 		Budget:   ResourceBudget{TimeoutMS: 30000, MaxInputBytes: 64 << 20, MaxOutputBytes: 4 << 20, MaxMemoryBytes: 256 << 20},
-		Coverage: Coverage{Complete: true, Clock: "proxy-log", StartOffset: 100, EndOffset: 1334},
+		Coverage: Coverage{Complete: true, Clock: "proxy-log", StartDevice: 1, StartInode: 2, StartOffset: 100, EndDevice: 1, EndInode: 2, EndOffset: 1334},
 	}
 	withID, err := SetArtifactID(m)
 	if err != nil {

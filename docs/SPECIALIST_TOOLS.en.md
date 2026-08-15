@@ -17,6 +17,8 @@ isutools-pprof recipes --bundle-dir ./bundle --binary ./matching-server \
 
 Cumulative open/close profiles use `-base`; only independent-run comparisons use `-diff_base`, and normalization is explicit. A trace recipe uses only `go tool trace`. A binary mismatch, incomplete pair, missing source, or incomplete trace is never marked ready.
 
+When attaching an access log to a run, provide its start/end device, inode, offset, and proxy clock. isutools also requires `end_offset - start_offset` to equal the input file size; absent or inconsistent coverage is published as `partial`, never as an exact run interval.
+
 All new runtime capture is default off. Enable one diagnostic at a time with `ISUTOOLS_ALLOCS_PROFILE`, `ISUTOOLS_GOROUTINE_PROFILE`, `ISUTOOLS_THREADCREATE_PROFILE`, supported `ISUTOOLS_GOROUTINELEAK_PROFILE`, or `ISUTOOLS_TRACE_SECONDS=1..30`. Go's diagnostics guidance warns that diagnostic facilities can interfere, so do not promote a diagnostic run into a score-adoption run.
 
 For MySQL, explicitly enable the slow log outside the application and record start/end device, inode, offset, and DB clock. The portable result contains hashes and aggregates, not SQL literals; pt-query-digest text remains restricted.
