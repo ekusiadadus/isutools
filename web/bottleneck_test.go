@@ -158,6 +158,8 @@ func TestReportPutsDecisionAndCodeEvidenceBeforeDenseTables(t *testing.T) {
 	}
 	for _, want := range []string{
 		`id="diagnosis"`, `data-target="http"`, `data-target="sql"`, `data-target="profiles"`,
+		`href="#profiles" data-target="isutools-profile-lines"`, `data-expand=".isutools-flame" data-expand-ready="true"`,
+		"CPU pprofフレームグラフ", "まだpublishされていないレポート",
 		"CPU profileがありません", "ソースコードの行番号を断定できません",
 	} {
 		if !strings.Contains(body, want) {

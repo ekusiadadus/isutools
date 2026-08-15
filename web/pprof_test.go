@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -375,7 +376,7 @@ func TestProfilePairMetadataRecordsTheResidual(t *testing.T) {
 	if pair.OpenGate != openGatePostStartReturn {
 		t.Errorf("open gate = %q, want %q", pair.OpenGate, openGatePostStartReturn)
 	}
-	if !strings.Contains(pair.DiffCommand, "-diff_base") ||
+	if !strings.Contains(pair.DiffCommand, "-base") || strings.Contains(pair.DiffCommand, "-diff_base") ||
 		!strings.Contains(pair.DiffCommand, pair.OpenFile) ||
 		!strings.Contains(pair.DiffCommand, pair.CloseFile) {
 		t.Errorf("diff command = %q, want it to difference both halves", pair.DiffCommand)
@@ -633,6 +634,28 @@ func TestProfileRetentionTreatsFixedCPUAndSidecarAsOneCompleteGroup(t *testing.T
 	}
 	if files := globNames(t, dir, newer+"*"); len(files) != 2 {
 		t.Fatalf("new fixed CPU group = %v, want profile and sidecar", files)
+	}
+}
+
+func TestProfileRetentionTreatsTraceAndSidecarAsOneCompleteGroup(t *testing.T) {
+	dir := t.TempDir()
+	oldPrefix := "trace_000000000001aaaaaaaaaaaaaaaaaaaa"
+	newPrefix := "trace_000000000002bbbbbbbbbbbbbbbbbbbb"
+	for _, name := range []string{oldPrefix + ".out", oldPrefix + ".meta.json", newPrefix + ".out", newPrefix + ".meta.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruneProfileArtifacts(dir, 1, 1<<30, "", nil)
+	for _, name := range []string{oldPrefix + ".out", oldPrefix + ".meta.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("old trace retained: %s err=%v", name, err)
+		}
+	}
+	for _, name := range []string{newPrefix + ".out", newPrefix + ".meta.json"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("new trace removed: %s err=%v", name, err)
+		}
 	}
 }
 

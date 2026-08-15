@@ -823,7 +823,7 @@ func TestShortPanicText(t *testing.T) {
 
 func TestNewMeasurementWhenOffRegistersNothing(t *testing.T) {
 	m := newTestMeasurement(t, map[string]string{"ISUTOOLS": "off"})
-	if m.ctrl != nil || m.proc != nil || m.timeline != nil || m.boundary != nil || m.cpu != nil {
+	if m.ctrl != nil || m.proc != nil || m.timeline != nil || m.boundary != nil || m.cpu != nil || m.trace != nil || m.traceBridge != nil || m.traceRoot != nil {
 		t.Fatalf("ISUTOOLS=off constructed runtime state: %+v", m)
 	}
 }

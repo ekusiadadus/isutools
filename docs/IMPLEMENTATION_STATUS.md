@@ -45,6 +45,29 @@ edge support, or a release. The exact classifications and source links are in
 `docs/isucon-compatibility.md`; the repeatable native checks are in
 `integration/test-proxy-configs.sh`.
 
+## Unreleased specialist-tool workflow
+
+Issues #46–#54 add an evidence-bounded bridge to capabilities that remain stronger in ALP, pt-query-digest,
+standard pprof/trace, and the Go compiler:
+
+- `isutools inspect accesslog`: file/stdin, bounded filters, exact configurable percentiles, request/upstream/residual/body/status metrics, deterministic table/JSON/Markdown/TSV/CSV, and optional run-bound artifact publication
+- `isutools analyze mysql-slowlog`: event distributions without portable SQL literals, explicit device/inode/offset/DB-clock coverage, and a pinned post-run pt-query-digest sidecar with fixed argv/environment/time/output limits
+- opt-in allocs, goroutine, threadcreate, supported goroutineleak, and a 1–30 second execution trace with a shared process-wide profiler owner
+- pprof bundle v2 and `recipes`: binary-hash-gated focus/tagfocus/source/disassembly, correct cumulative `-base`, independent `-diff_base`, and trace-only handoff; v1 bundles remain readable
+- `isutools-pgo prepare`, `build`, and `verify-build`: CPU-profile validation, exact snapshot/profile/binary/source/toolchain provenance, source non-mutation, no-overwrite private staging, measured build time/size, rollback, and a predeclared ABBA ledger
+- `ExternalAnalysisArtifact v1`: checked-in schema/fixture, content-addressed output, explicit CAS, unknown-schema display, portable/restricted visibility, exact snapshot binding, and one verified Web/JSON index
+
+Local unit/integration/race/vet/fuzz checks and the remote ISUCON13 workflow passed. The exact access-log
+artifact covered 464,411 requests; slow-log/PTQD produced a ready portable/restricted pair; allocs, CPU,
+goroutine, threadcreate, and trace artifacts were opened with standard Go tools; unsupported Go 1.24
+goroutineleak remained explicit. A predeclared PGO ABBA scored off `[443553, 432917]` versus PGO
+`[437791, 437677]`; the -0.114% median change missed the +2% adoption threshold and was rolled back.
+Feature operation is not a score-improvement claim. See the
+[`ISUCON13 field record`](./isucon13-specialist-tools-verification-20260815.en.md),
+[`SPECIALIST_TOOLS.md`](./SPECIALIST_TOOLS.md),
+[`SECURITY_EXTERNAL_ANALYSIS.md`](./SECURITY_EXTERNAL_ANALYSIS.md), and
+[`ADR 0001`](./adr/0001-external-analysis-artifacts.md).
+
 ## v1.4.0 release implementation
 
 PR #18 after v1.3.0 delivers these additional changes:
@@ -84,6 +107,7 @@ Current-tree verification:
 | hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
 | GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, race/coverage, MySQL integration | PASS on PR #33 and follow-up PR #34 before merge |
 | remote private-isu | Windows/WSL2 over SSH, merged SHA | readiness, real benchmark, durable save/SCP, run CPU capture, verified-binary flame publication, required/optional peer hub PASS; [full record](./private-isu-field-verification-20260814.md) |
+| fresh private-isu specialist workflow | pinned `0dc3be8`, isolated Compose project/volumes, Docker 27.0.3 amd64 | schema readiness, three correctness-passing score-0 integration runs, 781-record access inspection, exact 2,032-event slow-log attachment with pt-query-digest 3.7.1-4, matching-binary standard pprof, secret scan PASS; [full record](./isucon13-specialist-tools-verification-20260815.md#5-fresh-private-isu-独立volumeで再構築) |
 
 The complete private-isu ABBA release gate remains unverified. The issue #19
 process-wide profiler race now has bounded stop→start handoff and an explicit
@@ -162,7 +186,7 @@ that parses the variable actually does, not what the plans proposed.
 | `queryplan` | EXPLAIN of the run's top digests using MySQL's own `QUERY_SAMPLE_TEXT`; runs once per run inside `runctl.EnrichBudget` (2s), never on a dashboard GET; `SessionBudget` 300ms / `SampleBudget` 100ms / `PerDigestBudget` 250ms | `ISUTOOLS_EXPLAIN` (**off** — opt-in), `ISUTOOLS_EXPLAIN_TOP` (10, capped at 200), `ISUTOOLS_EXPLAIN_DSN` / `ISUTOOLS_EXPLAIN_DRIVER` (`mysql`) | MySQL 8.0.17+ only; older MySQL and MariaDB report `CodeUnsupported` |
 | `advisor` | `nginx-upstream-uds`, `nginx-listen-backlog`, `go-pgo` — opportunities rather than defects, so they emit `StatusInfo`/`StatusSkip` and never warn — plus `plan-full-scan` / `plan-filesort` / `plan-temporary`, which do warn, fed from the query-plan section | existing conf/env inputs | any |
 | `web` | five new measurement sections — `SQL 行効率`, `Query Plans`, `DB Pool`, `Host`, `Network` — plus a `Profiles` section for the runtime profile pairs | — | any |
-| `isutools` | `ResetNow` / `ResetNowWithNonce` / `ResetNowOpts` / `SerializeInitialize`; runtime profile pairs (mutex / block / heap) captured at both boundaries with `go tool pprof -diff_base` commands and a measured residual | `ISUTOOLS_MUTEX_FRACTION`, `ISUTOOLS_BLOCK_RATE_NS`, `ISUTOOLS_HEAP_PROFILE` (all **off**) | any |
+| `isutools` | `ResetNow` / `ResetNowWithNonce` / `ResetNowOpts` / `SerializeInitialize`; cumulative runtime profile pairs captured at both boundaries with `go tool pprof -base` commands and a measured residual | runtime-profile environment variables (all **off**) | any |
 
 Two properties of the registry are load-bearing enough to state separately,
 because the row-efficiency numbers are only trustworthy if they hold:

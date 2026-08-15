@@ -524,7 +524,7 @@ func TestReportProfilesAlwaysDeclareTheApproximation(t *testing.T) {
 			OpenGate:  openGatePostStartReturn,
 			RunSpanNs: 59_676_000_000, HeadLossNs: 41_000_000,
 			TailExcessNs: 2_118_000_000, ApproxErrorNs: 2_159_000_000,
-			DiffCommand: "go tool pprof -diff_base open.pprof close.pprof",
+			DiffCommand: "go tool pprof -base open.pprof close.pprof",
 		}},
 	}
 	body := renderReport(t, snap)
@@ -534,7 +534,7 @@ func TestReportProfilesAlwaysDeclareTheApproximation(t *testing.T) {
 		"finish freeze 後の",
 		"run 単位のプロファイルではありません",
 		"欠落 41ms・余剰 2.118s",
-		"go tool pprof -diff_base",
+		"go tool pprof -base",
 		// A capture that never happened is reported with its code rather than
 		// left out, and a lagging pair is badged.
 		profileCodeLeaseExceeded,

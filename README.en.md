@@ -12,7 +12,7 @@ isutools is a Go measurement toolkit for answering three questions: what to fix 
 actually helped, and whether the run is complete enough to compare. It provides a live dashboard and a
 self-contained HTML report.
 
-![isutools report saved from ISUCON13](docs/images/isutools-isucon13-wsl-score12079.png)
+![Latest isutools report saved from ISUCON13](docs/images/isutools-isucon13-specialist-20260815.png)
 
 ## Install in three minutes
 
@@ -54,10 +54,12 @@ See the [integration guide](./docs/INTEGRATION.md) for DB-pool, EXPLAIN, nginx, 
 | User Flow | The top 20 page transitions actually taken by one pseudonymous session |
 | Scenario Stories | Observed request sequences and counts for each explicit scenario |
 | Profiles / Host | Whether time is spent executing CPU work or waiting on DB, I/O, or connections |
+| Offline / specialist tools | Safely bind old logs, slow-query outliers, pprof/trace, and PGO to the same run |
 | Collector Health | Whether missing, truncated, or invalid evidence makes a run unsafe to compare |
 
 JSON, the live dashboard, and self-contained HTML all come from the same run. The report presents
 candidates and evidence instead of declaring a cause. Score and correctness remain the acceptance gates.
+Published pprof analysis is available from a saved run's `current UI`; immutable historical HTML is never rewritten.
 
 ## User Flow and Scenario Stories
 
@@ -138,6 +140,14 @@ This proves the measurement path; it is not a performance-improvement claim. The
 establish the strict two-percent overhead gate, so the failure is retained in the
 [field verification record](./docs/isucon13-wsl-flow-verification-20260814.md).
 
+On 2026-08-15 we also reran access-log inspection, slow log/pt-query-digest, runtime profiles/trace,
+pprof, and PGO on the same host. PGO failed its predeclared A-B-B-A adoption threshold and was rolled
+back; the [specialist-tool field record](./docs/isucon13-specialist-tools-verification-20260815.en.md)
+keeps workflow success separate from performance adoption.
+A separate-volume private-isu environment was also rebuilt from the pinned upstream revision. Its
+`pass=true, score=0` integration runs yielded 781 access-log records, 2,032 slow-query events, and a
+matching-binary pprof handoff. Score zero proves integration only, not performance.
+
 ## Coverage
 
 | Area | Support |
@@ -145,7 +155,7 @@ establish the strict two-percent overhead gate, so the failure is retained in th
 | Database / KV | MySQL / MariaDB / PostgreSQL / SQLite through `database/sql`; Redis command collector |
 | HTTP | Go `net/http`, Gorilla mux, Martini, Goji v2, Echo v3/v4/v5, httprouter, Gin, and chi v5 |
 | Proxy logs | nginx/OpenResty, Apache/OpenLiteSpeed, H2O, Envoy, Caddy, HAProxy, Traefik, lighttpd, Varnish, ATS, IIS, and Squid |
-| Runtime | CPU, mutex, block, and heap pprof |
+| Runtime | CPU, mutex, block, heap, allocs, goroutine, threadcreate, supported goroutineleak, and trace |
 | Host | Linux procfs / sysfs / cgroup v2, network, and DB pool |
 | Output | Live dashboard, JSON, self-contained HTML, run diff, and multi-host hub |
 
@@ -161,16 +171,20 @@ establish the strict two-percent overhead gate, so the failure is retained in th
 | `ISUTOOLS_FLOW_LABELS` | Set User Flow / Scenario Stories to `on`, `off`, or `auto` |
 | `ISUTOOLS_FLOW_SOURCE` | Flow source; default `auto`, or `middleware`, `proxy`, `off` |
 | `ISUTOOLS_PPROF_SECONDS` | Benchmark-scoped CPU-profile duration |
+| `ISUTOOLS_TRACE_SECONDS` | Short 1–30 second execution trace; default off and exclusive with managed profiles |
 | `ISUTOOLS_TIMELINE` | Opt in to a bounded run timeline |
 
 Detailed settings, APIs, endpoints, EXPLAIN grants, and multi-host procedures live in the focused documents:
 
 - [Integration guide](./docs/INTEGRATION.md)
+- [ALP / pt-query-digest / pprof / PGO playbook](./docs/SPECIALIST_TOOLS.en.md)
+- [External-analysis threat model and limits](./docs/SECURITY_EXTERNAL_ANALYSIS.md)
 - [Design and security boundaries](./DESIGN.md)
 - [Implementation status](./docs/IMPLEMENTATION_STATUS.md)
 - [Field feedback and operational notes](./docs/FIELD_FEEDBACK.md)
 - [private-isu example](./examples/private-isu/README.md)
 - [ISUCON13 WSL2 example](./examples/isucon13-wsl/README.md)
+- [ISUCON13 / fresh private-isu specialist-tool field verification](./docs/isucon13-specialist-tools-verification-20260815.en.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 
 ## Development

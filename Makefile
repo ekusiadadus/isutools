@@ -33,7 +33,7 @@ help:
 	  'make pprof         capture a manual CPU profile and copy it locally' \
 	  'make tunnel        forward localhost:$(LOCAL_PORT) (Ctrl-C to stop)' \
 	  'make dashboard     open http://127.0.0.1:$(LOCAL_PORT)/ on this Mac' \
-	  'make build-tools   build isutools agent, hub, pprof, and trajectory CLIs'
+	  'make build-tools   build isutools, PGO, pprof, agent, hub, and trajectory CLIs'
 
 require-config:
 	@test -n '$(REMOTE_HOST)' || { printf 'REMOTE_HOST is required; copy .isutools.mk.example to .isutools.mk\n' >&2; exit 2; }
@@ -133,6 +133,8 @@ dashboard:
 
 build-tools:
 	@mkdir -p bin
+	go build -o bin/isutools ./cmd/isutools
+	go build -o bin/isutools-pgo ./cmd/isutools-pgo
 	go build -o bin/isutools-agent ./cmd/isutools-agent
 	go build -o bin/isutools-hub ./cmd/isutools-hub
 	go build -o bin/isutools-pprof ./cmd/isutools-pprof

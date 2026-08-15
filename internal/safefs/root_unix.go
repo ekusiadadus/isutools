@@ -268,12 +268,15 @@ func validateName(name string) error {
 }
 
 func requireRegular(file *os.File) error {
-	info, err := file.Stat()
-	if err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return fmt.Errorf("safefs: fstat: %w", err)
 	}
-	if !info.Mode().IsRegular() {
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
 		return ErrNotRegular
+	}
+	if stat.Nlink != 1 {
+		return ErrAmbiguousLink
 	}
 	return nil
 }

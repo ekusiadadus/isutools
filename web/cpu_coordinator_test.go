@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/ekusiadadus/isutools/internal/profileowner"
 )
 
 type recordingCPUCoordinator struct {
@@ -132,6 +134,21 @@ func TestManualCPUProfileConflictsOnlyWithManagedRunMode(t *testing.T) {
 	NewHandler(Provider{CPUProfiles: &recordingCPUCoordinator{}, CPUProfileMode: "run"}).ServeHTTP(rec, req)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+}
+
+func TestManualCPUAndTraceReturnStableConflictWhenProfilerOwned(t *testing.T) {
+	if !profileowner.Default.Acquire("test-owner") {
+		t.Fatal("global profiler owner was unexpectedly busy")
+	}
+	defer profileowner.Default.Release("test-owner")
+	handler := NewHandler(Provider{})
+	for _, path := range []string{"/pprof/profile?seconds=1", "/pprof/trace?seconds=1"} {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusConflict || recorder.Body.String() != "profiler-busy\n" {
+			t.Fatalf("%s status=%d body=%q", path, recorder.Code, recorder.Body.String())
+		}
 	}
 }
 

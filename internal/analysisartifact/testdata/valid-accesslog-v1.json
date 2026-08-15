@@ -1,0 +1,40 @@
+{
+  "schema": "isutools.external-analysis/v1",
+  "artifact_id": "e712c2b2682bfee80e9ea6900b1a1403f30e4ce381e44a15351566732d86efdf",
+  "kind": "accesslog",
+  "generated_at": "2026-08-15T00:00:00Z",
+  "analyzer": {
+    "name": "isutools-accessinspect",
+    "version": "v1.7.0"
+  },
+  "status": "ready",
+  "run": {
+    "run_id": "run-fixture",
+    "snapshot_base": "snapshot-fixture",
+    "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "snapshot_schema_version": 3
+  },
+  "inputs": [
+    {
+      "role": "proxy-access-log",
+      "name": "proxy-access.log",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bytes": 128,
+      "media_type": "text/plain",
+      "visibility": "restricted"
+    }
+  ],
+  "outputs": [
+    {
+      "role": "normalized-report",
+      "name": "analysis-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.json",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "bytes": 256,
+      "media_type": "application/json",
+      "visibility": "portable"
+    }
+  ],
+  "coverage": {"complete": true, "clock": "proxy-log"},
+  "budget": {"max_input_bytes": 1024, "max_output_bytes": 2048},
+  "extensions": {"accessinspect-v1": {"keys": 1}}
+}

@@ -31,6 +31,7 @@ import (
 	"github.com/ekusiadadus/isutools/hoststats"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
+	"github.com/ekusiadadus/isutools/internal/analysisartifact"
 	"github.com/ekusiadadus/isutools/internal/health"
 	"github.com/ekusiadadus/isutools/internal/safefs"
 	"github.com/ekusiadadus/isutools/internal/sysinfo"
@@ -248,6 +249,9 @@ type Provider struct {
 	CPUProfiles CPUCaptureCoordinator
 	// CPUProfileMode is "run", "fixed", or empty/off.
 	CPUProfileMode string
+	// TraceCapture is the optional, run-aligned execution trace owner. It is
+	// nil by default and must not be configured with another managed profiler.
+	TraceCapture TraceCaptureCoordinator
 	// StartRun opens a measurement run at the reset boundary and names it in
 	// the reset response. Nil keeps the legacy behaviour, in which a reset
 	// only rotates the collector generations and no run id exists.
@@ -292,7 +296,8 @@ type Provider struct {
 	// Timeline resolves the bounded, run/epoch-aligned phase analysis. Nil is
 	// the default-off compatibility path.
 	Timeline func(runID string, epoch uint64) *timeline.Section
-	// RuntimeProfiles lists the runtime profiles ("mutex", "block", "heap")
+	// RuntimeProfiles lists the runtime profiles ("mutex", "block", "heap",
+	// "allocs", "goroutine", "threadcreate", or "goroutineleak")
 	// captured at a run boundary, in capture order. Empty — the default —
 	// captures nothing. The rates themselves are process-wide runtime
 	// settings owned by the caller; this package only writes what it is told
@@ -806,6 +811,7 @@ func (h *handler) routes() http.Handler {
 	mux.HandleFunc("/pprof/", h.pprof)
 	mux.HandleFunc("/snapshot.html", h.static)
 	mux.HandleFunc("/json", h.json)
+	mux.HandleFunc("/external-analysis", h.externalAnalysis)
 	mux.HandleFunc("/reset", h.reset)
 	mux.HandleFunc("/collect", h.collect)
 	mux.HandleFunc("/finish", h.finish)
@@ -1341,6 +1347,7 @@ func (h *handler) index(w http.ResponseWriter) {
 		Runs:         h.listRuns(),
 		Profiles:     h.listProfiles(),
 		Trajectories: h.listTrajectories(),
+		External:     h.listExternalAnalysis(),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := indexTmpl.Execute(w, data); err != nil {
@@ -1373,6 +1380,41 @@ type indexPage struct {
 	Runs         []runEntry
 	Profiles     []string
 	Trajectories []string
+	External     []analysisartifact.Summary
+}
+
+func (h *handler) listExternalAnalysis() []analysisartifact.Summary {
+	root, err := h.openDataRoot()
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	return analysisartifact.NewStore(root).ListCurrent(256)
+}
+
+func (h *handler) externalAnalysis(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(struct {
+		Schema    string                     `json:"schema"`
+		Artifacts []analysisartifact.Summary `json:"artifacts"`
+	}{Schema: "isutools.external-analysis-index/v1", Artifacts: h.listExternalAnalysis()}); err != nil {
+		http.Error(w, "isutools: encode failed", http.StatusInternalServerError)
+	}
+}
+
+func (h *handler) portableAnalysisOutput(name string) bool {
+	for _, summary := range h.listExternalAnalysis() {
+		for _, output := range summary.Outputs {
+			if output.Name == name && output.Visibility == analysisartifact.VisibilityPortable {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (h *handler) listRuns() []runEntry {
@@ -1511,6 +1553,7 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	var (
 		run               RunFinish
 		cpuTicket         CPUStopTicket
+		traceTicket       TraceStopTicket
 		completeAttempted bool
 	)
 	if h.p.FinishRun != nil {
@@ -1532,10 +1575,12 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 			}
 			run = recovered
 			cpuTicket = h.requestCPUStop(run.RunID, run.Epoch, run.State, run.Validity, run.RecoveryReason, cpuFinishBoundary(run))
+			traceTicket = h.requestTraceStop(run.RunID, run.Epoch, run.RecoveryReason, cpuFinishBoundary(run), true)
 			h.abortRunProfiles(run.RunID)
 		} else {
 			run = accepted
 			cpuTicket = h.requestCPUStop(run.RunID, run.Epoch, "finishing", run.Validity, "finish-accepted", cpuFinishBoundary(run))
+			traceTicket = h.requestTraceStop(run.RunID, run.Epoch, "finish-accepted", cpuFinishBoundary(run), false)
 			h.captureCloseProfiles(run)
 		}
 	}
@@ -1556,6 +1601,14 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		}
 		cpuTicket = h.requestCPUStop(run.RunID, run.Epoch, state, run.Validity, reason, cpuFinishBoundary(run))
 	}
+	if traceTicket.CaptureID == "" {
+		reason := "finish-accepted"
+		abort := false
+		if run.Recovered {
+			reason, abort = run.RecoveryReason, true
+		}
+		traceTicket = h.requestTraceStop(run.RunID, run.Epoch, reason, cpuFinishBoundary(run), abort)
+	}
 	// Legacy/custom providers may expose CompleteRun without FinishRun. Their
 	// capture is necessarily late, but still produces a complete, explicit pair.
 	if run.Recovered {
@@ -1566,6 +1619,7 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	// Only save waits for the CPU publication budget. Finish/abort merely
 	// request the asynchronous stop so their lifecycle latency stays bounded.
 	h.awaitCPUStop(cpuTicket)
+	h.awaitTraceStop(traceTicket)
 	if run.RunID != "" {
 		h.runEnded.Store(true)
 		w.Header().Set(runIDHeader, run.RunID)
@@ -1766,10 +1820,16 @@ func (h *handler) files(w http.ResponseWriter, r *http.Request) {
 	if name != filepath.Base(name) || name == "" ||
 		strings.Contains(name, ".profile.") ||
 		(!strings.HasSuffix(name, ".html") && !strings.HasSuffix(name, ".json") &&
-			!strings.HasSuffix(name, ".pprof")) {
+			!strings.HasSuffix(name, ".pprof") && !strings.HasSuffix(name, ".out") && !strings.HasSuffix(name, ".txt") &&
+			!strings.HasSuffix(name, ".md") && !strings.HasSuffix(name, ".csv") && !strings.HasSuffix(name, ".tsv")) {
 		http.Error(w, "invalid file name", http.StatusBadRequest)
 		return
 	}
+	if strings.HasPrefix(name, "analysis-") && !h.portableAnalysisOutput(name) {
+		http.Error(w, "restricted analysis artifact", http.StatusForbidden)
+		return
+	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	h.serveDataFile(w, r, name)
 }
 
@@ -1913,11 +1973,18 @@ func (h *handler) reset(w http.ResponseWriter, r *http.Request) {
 	// CPU starts after cumulative profiles so their serialization is not
 	// charged to the run-aligned CPU interval.
 	cpuStart := h.startCPUProfiles(r.Context(), run, generation)
+	traceStart := h.startTrace(run)
 	if cpuStart.State != "" {
 		w.Header().Set(cpuStartStateHeader, cpuStart.State)
 	}
 	if cpuStart.Code != "" {
 		w.Header().Set(cpuStartCodeHeader, cpuStart.Code)
+	}
+	if traceStart.State != "" {
+		w.Header().Set("X-Isutools-Trace-State", traceStart.State)
+	}
+	if traceStart.Code != "" {
+		w.Header().Set("X-Isutools-Trace-Code", traceStart.Code)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -2048,6 +2115,7 @@ func (h *handler) finish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.requestCPUStop(run.RunID, run.Epoch, "finishing", run.Validity, "finish-accepted", cpuFinishBoundary(run))
+	h.requestTraceStop(run.RunID, run.Epoch, "finish-accepted", cpuFinishBoundary(run), false)
 	// The closing half of the run's profile pair, taken on this line and not
 	// one later. FinishRun returns the accepted boundary without waiting for
 	// the drain, the collect or the snapshot build, so a capture taken after
@@ -2095,6 +2163,7 @@ func (h *handler) abort(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.requestCPUStop(run.RunID, run.Epoch, "aborting", "invalid", run.Reason, run.AbortedAt)
+	h.requestTraceStop(run.RunID, run.Epoch, run.Reason, run.AbortedAt, true)
 	h.abortRunProfiles(run.RunID)
 	if h.p.Health != nil {
 		h.p.Health.Set("runctl", health.StatusOK, "")

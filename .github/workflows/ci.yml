@@ -47,6 +47,8 @@ jobs:
           go-version: "stable"
       - name: vet
         run: go vet ./...
+      - name: build all operator CLIs
+        run: make build-tools
       - name: test (race)
         run: go test -race -coverprofile=cover.out ./...
       - name: Echo v5 adapter
@@ -106,7 +108,12 @@ jobs:
       # gate. The real overhead gate is the on/off benchmark comparison on
       # the target host before tagging a release (DESIGN.md §7).
       - name: benchmarks (informational)
-        run: go test -run '^$' -bench . -benchmem ./internal/agg/
+        run: go test -run '^$' -bench . -benchmem ./internal/agg/ ./internal/accessinspect/
+      - name: parser fuzz smoke
+        run: |
+          go test ./internal/accessinspect -run '^$' -fuzz '^FuzzInspectBounded$' -fuzztime=3s
+          go test ./internal/slowlog -run '^$' -fuzz '^FuzzParseBounded$' -fuzztime=3s
+          go test ./internal/analysisartifact -run '^$' -fuzz '^FuzzInspectAndDecodeBounded$' -fuzztime=3s
 
   mysql-integration:
     runs-on: ubuntu-latest
@@ -135,6 +142,8 @@ jobs:
         env:
           ISUTOOLS_INTEGRATION_MYSQL_DSN: root:root@tcp(127.0.0.1:3306)/?parseTime=true
         run: go test -tags=integration -count=1 ./integration/trajectorysql -run '^TestISUCON14TrajectoryExportExecutesOnMySQL8$'
+      - name: MySQL 8.4 real slow-log parser
+        run: bash integration/test-mysql-slowlog.sh
 
   sql-compat-integration:
     runs-on: ubuntu-latest

@@ -20,6 +20,7 @@ var (
 	ErrExists                = errors.New("safefs: immutable target exists")
 	ErrTooLarge              = errors.New("safefs: file exceeds read limit")
 	ErrNotRegular            = errors.New("safefs: target is not a regular file")
+	ErrAmbiguousLink         = errors.New("safefs: target has multiple hard links")
 	ErrUnsupportedFilesystem = errors.New("safefs: filesystem lacks approved publication semantics")
 	ErrLocked                = errors.New("safefs: data directory is already owned by another process")
 	ErrDurabilityUnknown     = errors.New("safefs: artifact visible but crash durability is unknown")

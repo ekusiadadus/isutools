@@ -432,6 +432,88 @@ func TestFetchedArtifactIdentityRejectsMalformedAndConflictingEvidence(t *testin
 	}
 }
 
+func TestTraceOnlyBundleAndHandoffRecipesAreHashBound(t *testing.T) {
+	traceName := "trace_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.out"
+	sidecarName := "trace_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.meta.json"
+	traceBody := []byte("go trace fixture")
+	sidecarBody := []byte("{\"state\":\"published\"}\n")
+	manifest := &web.ProfileManifest{
+		RunID: "run-trace", Epoch: 7, Executable: &buildIdentityFixture,
+		Trace: &web.TraceIntervalCapture{
+			RunID: "run-trace", Epoch: 7, CaptureID: strings.Repeat("a", 32), ExpectedFile: traceName,
+			File: traceName, SHA256: hashBytes(traceBody), Bytes: int64(len(traceBody)), Sidecar: sidecarName,
+			SidecarSHA256: hashBytes(sidecarBody), Status: "published", Complete: true,
+		},
+	}
+	bundle, files, err := bundleFromManifest("20260815-120000_gen7_deadbeef", strings.Repeat("b", 64), 3, manifest)
+	if err != nil || bundle.Trace == nil || len(bundle.Attempts) != 0 || len(files) != 2 {
+		t.Fatalf("bundle=%#v files=%#v err=%v", bundle, files, err)
+	}
+
+	directory := t.TempDir()
+	root, err := safefs.Open(directory, safefs.Options{RequireStrongVisibility: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	snapshotBody := []byte("{}")
+	bundle.SnapshotSHA256 = hashBytes(snapshotBody)
+	for name, body := range map[string][]byte{
+		bundle.SnapshotFile: snapshotBody,
+		traceName:           traceBody,
+		sidecarName:         sidecarBody,
+	} {
+		if err := publishBundleFile(root, name, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := publishBundleManifest(root, &bundle); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := runRecipes([]string{"--bundle-dir", directory, "--output", "shell"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if got := stdout.String(); !strings.Contains(got, "'go' 'tool' 'trace' '"+traceName+"'") || strings.Contains(got, "pprof") {
+		t.Fatalf("trace recipe=%q", got)
+	}
+	if err := os.WriteFile(directory+"/"+traceName, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	if err := runRecipes([]string{"--bundle-dir", directory}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "trace hash mismatch") {
+		t.Fatalf("tampered trace err=%v", err)
+	}
+}
+
+func TestRecipeValidationFailsClosedOnCorruptOrUnsupportedProfile(t *testing.T) {
+	directory := t.TempDir()
+	root, err := safefs.Open(directory, safefs.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := publishBundleFile(root, "cpu.pprof", []byte("corrupt")); err != nil {
+		t.Fatal(err)
+	}
+	attempt := bundleAttempt{Kind: "cpu", Mode: profilemodel.ProfileModeInterval, Observed: []profilemodel.ObservedProfileInput{{File: "cpu.pprof"}}}
+	previous := launchAnalysisWorker
+	t.Cleanup(func() { launchAnalysisWorker = previous })
+	launchAnalysisWorker = func(context.Context, string, pprofanalyze.WorkerJob, pprofanalyze.WorkerOptions) (pprofanalyze.WorkerResult, error) {
+		return pprofanalyze.WorkerResult{ErrorCode: profilemodel.DiagnosticProfileInvalid}, nil
+	}
+	if types, ready := validateRecipeAttempt(root, attempt, time.Second); ready || len(types) != 0 {
+		t.Fatalf("corrupt profile types=%v ready=%v", types, ready)
+	}
+	launchAnalysisWorker = func(context.Context, string, pprofanalyze.WorkerJob, pprofanalyze.WorkerOptions) (pprofanalyze.WorkerResult, error) {
+		return pprofanalyze.WorkerResult{Summaries: []profilemodel.ProfileSummary{{SampleType: "alloc_space", Unit: "bytes"}, {SampleType: "alloc_objects", Unit: "count"}}}, nil
+	}
+	types, ready := validateRecipeAttempt(root, attempt, time.Second)
+	if !ready || len(types) != 2 || types[0].Type != "alloc_objects" || types[1].Unit != "bytes" {
+		t.Fatalf("types=%v ready=%v", types, ready)
+	}
+}
+
 func TestSourcePathsAreRelativeOrRedactedWithoutLeakingHostPaths(t *testing.T) {
 	t.Parallel()
 	summaries := []profilemodel.ProfileSummary{{Reports: []profilemodel.ProfileReport{{

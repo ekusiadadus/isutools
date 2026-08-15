@@ -394,6 +394,9 @@ type StartResult struct {
 	// embedding measurement after the run boundary opens. The controller does
 	// not interpret it.
 	CPUProfileStart *ProfileStartEvidence
+	// TraceStart is optional transport-neutral evidence for a run-aligned
+	// execution trace start attempt.
+	TraceStart *ProfileStartEvidence
 }
 
 // ProfileStartEvidence makes an optional profiler start attempt visible to
@@ -412,6 +415,10 @@ func (r StartResult) clone() StartResult {
 	if r.CPUProfileStart != nil {
 		copy := *r.CPUProfileStart
 		out.CPUProfileStart = &copy
+	}
+	if r.TraceStart != nil {
+		copy := *r.TraceStart
+		out.TraceStart = &copy
 	}
 	return out
 }

@@ -203,10 +203,13 @@ func TestSnapshotHTMLIsSelfContainedAndSortable(t *testing.T) {
 	if !strings.Contains(body, "<script>") {
 		t.Error("snapshot.html must embed the sort script")
 	}
-	for _, forbidden := range []string{"http://", "https://", "src=", "href="} {
+	for _, forbidden := range []string{"http://", "https://", "src="} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("snapshot.html must be self-contained, found %q", forbidden)
 		}
+	}
+	if !strings.Contains(body, `href="#profiles"`) {
+		t.Error("snapshot.html must keep internal navigation usable without JavaScript")
 	}
 	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
 		t.Errorf("snapshot.html should download as a file, Content-Disposition = %q", cd)
@@ -1708,7 +1711,7 @@ func TestFinishCapturesTheClosingHalfAndSaveRecordsThePair(t *testing.T) {
 	if pair.ApproxErrorNs != pair.HeadLossNs+pair.TailExcessNs {
 		t.Errorf("pair residual = %+v, want head + tail", pair)
 	}
-	if !strings.Contains(pair.DiffCommand, "-diff_base") {
+	if !strings.Contains(pair.DiffCommand, "-base") || strings.Contains(pair.DiffCommand, "-diff_base") {
 		t.Errorf("diff command = %q", pair.DiffCommand)
 	}
 	// The Runs detail view is the saved HTML; the pair has to be visible there
