@@ -11,7 +11,7 @@
 「次にどこを直すか」「変更後に本当に改善したか」「そのrunを比較してよいか」を、
 1つのダッシュボードと自己完結HTMLで判断するGo向け計測ツールです。
 
-![ISUCON13で保存したisutoolsレポート](docs/images/isutools-isucon13-wsl-score12079.png)
+![ISUCON13で保存した最新isutoolsレポート](docs/images/isutools-isucon13-specialist-20260815.png)
 
 ## 3分で導入
 
@@ -139,6 +139,10 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 厳格な性能gateを通過できなかったため、その結果も含めて
 [実機検証記録](./docs/isucon13-wsl-flow-verification-20260814.md)に残しています。
 
+2026-08-15にはaccess log、slow log / pt-query-digest、runtime profile / trace、pprof、PGOを
+同じ実機で通し直しました。PGOはA-B-B-Aで改善せずrollbackしたため、機能成立と性能採用を分けた
+[specialist-tool実測記録](./docs/isucon13-specialist-tools-verification-20260815.md)として公開しています。
+
 ## 対応範囲
 
 | 領域 | 対応 |
@@ -183,6 +187,7 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 - [現場フィードバックと運用上の注意](./docs/FIELD_FEEDBACK.md)
 - [private-isu例](./examples/private-isu/README.md)
 - [ISUCON13 WSL2例](./examples/isucon13-wsl/README.md)
+- [ISUCON13 specialist tools実測](./docs/isucon13-specialist-tools-verification-20260815.md)
 - [2026-08-14 ISUCON13現場指摘の最終監査](./docs/isucon13-field-audit-20260814.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 

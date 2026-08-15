@@ -21,7 +21,7 @@ When attaching an access log to a run, provide its start/end device, inode, offs
 
 All new runtime capture is default off. Enable one diagnostic at a time with `ISUTOOLS_ALLOCS_PROFILE`, `ISUTOOLS_GOROUTINE_PROFILE`, `ISUTOOLS_THREADCREATE_PROFILE`, supported `ISUTOOLS_GOROUTINELEAK_PROFILE`, or `ISUTOOLS_TRACE_SECONDS=1..30`. Go's diagnostics guidance warns that diagnostic facilities can interfere, so do not promote a diagnostic run into a score-adoption run.
 
-For MySQL, explicitly enable the slow log outside the application and record start/end device, inode, offset, and DB clock. The portable result contains hashes and aggregates, not SQL literals; pt-query-digest text remains restricted.
+For MySQL, explicitly enable the slow log outside the application and record start/end device, inode, offset, and DB clock. The input byte count must equal the offset span or coverage becomes `partial`. The portable result contains hashes and aggregates, not SQL literals; pt-query-digest text remains restricted. Large intentional multi-line statements may raise `--max-query-bytes` from its 1 MiB default, but never beyond the 8 MiB hard cap; `--max-line-bytes` is bounded separately.
 
 PGO is experimental and opt-in:
 
@@ -36,4 +36,4 @@ isutools-pgo build --candidate-dir ./pgo-candidate --source-dir ./clean-source -
 
 The candidate never modifies the source tree or overwrites an existing directory. `build` compiles only the same clean revision with fixed argv and records each PGO/off binary hash, size, build time, and Go/PGO build info in a private manifest. Predeclare an ABBA comparison and retain every pass flag, raw score, snapshot SHA, and binary SHA. General Go PGO improvements are not an ISUCON performance guarantee.
 
-See the [Japanese playbook](./SPECIALIST_TOOLS.md) for complete attach and coverage commands, and the [threat model](./SECURITY_EXTERNAL_ANALYSIS.md) for limits and visibility rules.
+See the [Japanese playbook](./SPECIALIST_TOOLS.md) for complete attach and coverage commands, the [ISUCON13 field verification](./isucon13-specialist-tools-verification-20260815.en.md) for raw pass/score and rollback evidence, and the [threat model](./SECURITY_EXTERNAL_ANALYSIS.md) for limits and visibility rules.

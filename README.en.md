@@ -12,7 +12,7 @@ isutools is a Go measurement toolkit for answering three questions: what to fix 
 actually helped, and whether the run is complete enough to compare. It provides a live dashboard and a
 self-contained HTML report.
 
-![isutools report saved from ISUCON13](docs/images/isutools-isucon13-wsl-score12079.png)
+![Latest isutools report saved from ISUCON13](docs/images/isutools-isucon13-specialist-20260815.png)
 
 ## Install in three minutes
 
@@ -140,6 +140,11 @@ This proves the measurement path; it is not a performance-improvement claim. The
 establish the strict two-percent overhead gate, so the failure is retained in the
 [field verification record](./docs/isucon13-wsl-flow-verification-20260814.md).
 
+On 2026-08-15 we also reran access-log inspection, slow log/pt-query-digest, runtime profiles/trace,
+pprof, and PGO on the same host. PGO failed its predeclared A-B-B-A adoption threshold and was rolled
+back; the [specialist-tool field record](./docs/isucon13-specialist-tools-verification-20260815.en.md)
+keeps workflow success separate from performance adoption.
+
 ## Coverage
 
 | Area | Support |
@@ -176,6 +181,7 @@ Detailed settings, APIs, endpoints, EXPLAIN grants, and multi-host procedures li
 - [Field feedback and operational notes](./docs/FIELD_FEEDBACK.md)
 - [private-isu example](./examples/private-isu/README.md)
 - [ISUCON13 WSL2 example](./examples/isucon13-wsl/README.md)
+- [ISUCON13 specialist-tool field verification](./docs/isucon13-specialist-tools-verification-20260815.en.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 
 ## Development

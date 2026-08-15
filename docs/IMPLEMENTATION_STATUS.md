@@ -57,8 +57,13 @@ standard pprof/trace, and the Go compiler:
 - `isutools-pgo prepare`, `build`, and `verify-build`: CPU-profile validation, exact snapshot/profile/binary/source/toolchain provenance, source non-mutation, no-overwrite private staging, measured build time/size, rollback, and a predeclared ABBA ledger
 - `ExternalAnalysisArtifact v1`: checked-in schema/fixture, content-addressed output, explicit CAS, unknown-schema display, portable/restricted visibility, exact snapshot binding, and one verified Web/JSON index
 
-Local unit/integration/race/vet/fuzz smoke and remote ISUCON13 results are recorded separately below once run;
-feature operation alone is not a score-improvement claim. See
+Local unit/integration/race/vet/fuzz checks and the remote ISUCON13 workflow passed. The exact access-log
+artifact covered 464,411 requests; slow-log/PTQD produced a ready portable/restricted pair; allocs, CPU,
+goroutine, threadcreate, and trace artifacts were opened with standard Go tools; unsupported Go 1.24
+goroutineleak remained explicit. A predeclared PGO ABBA scored off `[443553, 432917]` versus PGO
+`[437791, 437677]`; the -0.114% median change missed the +2% adoption threshold and was rolled back.
+Feature operation is not a score-improvement claim. See the
+[`ISUCON13 field record`](./isucon13-specialist-tools-verification-20260815.en.md),
 [`SPECIALIST_TOOLS.md`](./SPECIALIST_TOOLS.md),
 [`SECURITY_EXTERNAL_ANALYSIS.md`](./SECURITY_EXTERNAL_ANALYSIS.md), and
 [`ADR 0001`](./adr/0001-external-analysis-artifacts.md).
