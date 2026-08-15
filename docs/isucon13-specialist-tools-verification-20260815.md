@@ -16,7 +16,7 @@ runtime profile / trace、標準 pprof handoff、PGO candidate workflow を、
 
 | 対象 | 値 |
 |---|---|
-| isutools branch / final SHA | `agent/complete-specialist-tools` / `11f3110088a647b6eb857c0f2b6033fec167016a` |
+| isutools branch / validated code SHA | `agent/complete-specialist-tools` / `11f3110088a647b6eb857c0f2b6033fec167016a` |
 | ISUCON13 app source | clean `5461a09381e3188bc4e2de40ea34d1f97aed3bcc` |
 | Go / host | Go `1.24.0`; AMD Ryzen 9 3900X; 24 logical CPUs; 19.5 GiB |
 | app PGO-off binary | `25e885ef4a48a6c762f95739ae82363c8e72de4c2da6a34dfdb72a6ede14e806` |
@@ -130,6 +130,47 @@ off中央値438,235、PGO中央値437,734、差は-0.114%。+2%を満たさな�
 off SHAへrollbackしました。ledger SHAは
 `bf89d5b1cd90f46013c3019a94666c1a8609c3b5b54bac3ea1393fc1b6c69f70`です。
 
+## 5. fresh private-isu: 独立volumeで再構築
+
+同じWindows hostのUbuntu WSL2へprivate-isu `0dc3be8b5b32d8519e0e841721da3ddf2c6a1542`と
+PR head `0dbd6929000aea079723ed315f9d1def5a879075`を新規cloneしました。既存private-isuは停止せず、
+Compose project `isutools-specialist-fresh`、専用named volumes、loopback port
+`38080/39191/33306`で分離しました。Dockerは`27.0.3` / amd64、MySQLは`9.7.2`です。
+
+`mysqladmin ping`後もdump投入途中では`users` tableが無いことを実測したため、最初の失敗runは
+保存せずabortしました。検証用volumeだけを作り直し、`comments/posts/users`のschema readinessと
+35,503-byteのトップページを確認してから再実行しました。
+
+| run | 専用計測 | pass / score | run / snapshot SHA |
+|---|---|---|---|
+| baseline | 通常計測 | `true / 0` | `run-63060cc2f4864931` / `c3e3e48a...fbb3e4` |
+| CPU diagnostic | run CPUのみ | `true / 0` | `run-dac4864f87c969b1` / `ddc11eb1...29004` |
+| slow-log diagnostic | slow logのみ、CPU off | `true / 0` | `run-9d085737046fa02b` / `4444257e...551d6` |
+
+score 0は初期private-isuのtimeoutを含む統合結果であり、性能成果ではありません。一方、各runは
+correctnessの`pass=true`、snapshot durability `durable`、独立した計測設定を保持しています。
+
+- access log: 109,569 bytes、781/781 parsed、malformed/partial `0`、SHA
+  `368a744a73a6999903be3a57e7fd2529c40685208de9f0fc65f33e24b71b2bd1`。
+  `/`は62回・累計546.421秒、p50 9.987秒、p99 10.036秒で、timeoutの支配を即座に確認できました。
+- slow log: source device/inode `2144/33721189`、offset `180..548975`、548,795 bytes、
+  input SHA `1e49428e7b9132bce9c4bbddf3372513c725f8744e68e0ef8877f3bbf2e84c39`。
+  2,032 events / 16 classes / partial `0`をexact coverageとしてattachしました。artifact
+  `eff7bc803007944e7044e7a84e8ac898738c88009294445f647f0b4b93cde6b0`は`ready`、
+  pt-query-digest `3.7.1-4` textはrestrictedです。最多classは995回、平均417.018 ms、
+  rows examined平均100,003で、N+1型の全表走査候補をSQL literalなしで示しました。
+- pprof: bundle `5e7ce9b349ad726cdc5d4a0cfc7b5e96e309ef5d4883030412b8cfb9f9127aff`、
+  CPU SHA `edd5e2fc8f47fdb786c2a1a77248b65a76a6e3729972df0342a601806ad1e1aa`、
+  binary SHA `efdf86ff483036f6f3352b05921476ae45bcbc4a5db76c2f8eedad623113ee23`。
+  Go 1.26 containerで標準`go tool pprof -top`を実行し、`main.makePosts`累計1.74秒などを確認しました。
+- PGO: dirty sourceを`source-must-be-a-clean-git-checkout`、cleanな一時sourceでもsnapshot側の
+  revision/toolchain provenanceが一致しないため`source-or-toolchain-provenance-mismatch`で拒否しました。
+  private-isuでは候補を捏造せず、正のcandidate/build/ABBA証拠は上記ISUCON13だけに限定します。
+
+portable access/slow-log/bundle manifestへCookie、Authorization、DSN、password、raw SQLが無いことを
+再scanしました。終了時はCPU profileをoff、MySQLを`slow_query_log=0` / `long_query_time=10`へ戻し、
+fresh containersはloopback限定で稼働しています。
+
 ## Evidence matrix
 
 | Layer | 結果 |
@@ -137,12 +178,12 @@ off SHAへrollbackしました。ledger SHAは
 | Unit / race / lint | root全package、race、vet、golangci-lint、adapter raceを分離実行してPASS |
 | Fuzz / negative | artifact/access/slowlog fuzz、secret、oversize、filter、path、symlink/hardlink、mismatchをPASS |
 | Local integration | MySQL 8.4 slow-log integration、schema/artifact round tripをPASS |
-| Remote functional | ISUCON13 official reset→benchmark→collect→save→post-run analysisをPASS |
+| Remote functional | ISUCON13 official workflowと、独立fresh private-isuの3 diagnostic workflowをPASS |
 | Overhead | 各feature単独runは全てpass、事前5%低下gateに抵触なし |
 | Performance | PGO A-B-B-Aは+2%条件を満たさずreject/rollback |
 | Publication | portable 200 / restricted 403、content SHA一致、secret scan PASS |
 
-既存のprivate-isu検証は[2026-08-14の別記録](./private-isu-field-verification-20260814.md)であり、
-今回のISUCON13数値へ混ぜていません。機能の使い分けと再実行手順は
+2026-08-14の既存private-isu検証は[別記録](./private-isu-field-verification-20260814.md)のまま保持し、
+今回のfresh private-isuやISUCON13数値へ混ぜていません。機能の使い分けと再実行手順は
 [specialist-tool playbook](./SPECIALIST_TOOLS.md)、上限と脅威モデルは
 [SECURITY_EXTERNAL_ANALYSIS.md](./SECURITY_EXTERNAL_ANALYSIS.md)を参照してください。

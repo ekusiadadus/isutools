@@ -142,6 +142,9 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 2026-08-15にはaccess log、slow log / pt-query-digest、runtime profile / trace、pprof、PGOを
 同じ実機で通し直しました。PGOはA-B-B-Aで改善せずrollbackしたため、機能成立と性能採用を分けた
 [specialist-tool実測記録](./docs/isucon13-specialist-tools-verification-20260815.md)として公開しています。
+さらに固定revisionからfresh private-isuを別volumeで構築し、`pass=true, score=0`の統合run、
+781件のaccess log、2,032件のslow-query event、matching binaryによるpprofまで再確認しました。
+score 0は性能成果ではなく、初期構成の機能成立だけを示します。
 
 ## 対応範囲
 
@@ -187,7 +190,7 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 - [現場フィードバックと運用上の注意](./docs/FIELD_FEEDBACK.md)
 - [private-isu例](./examples/private-isu/README.md)
 - [ISUCON13 WSL2例](./examples/isucon13-wsl/README.md)
-- [ISUCON13 specialist tools実測](./docs/isucon13-specialist-tools-verification-20260815.md)
+- [ISUCON13 / fresh private-isu specialist tools実測](./docs/isucon13-specialist-tools-verification-20260815.md)
 - [2026-08-14 ISUCON13現場指摘の最終監査](./docs/isucon13-field-audit-20260814.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 

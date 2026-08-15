@@ -144,6 +144,9 @@ On 2026-08-15 we also reran access-log inspection, slow log/pt-query-digest, run
 pprof, and PGO on the same host. PGO failed its predeclared A-B-B-A adoption threshold and was rolled
 back; the [specialist-tool field record](./docs/isucon13-specialist-tools-verification-20260815.en.md)
 keeps workflow success separate from performance adoption.
+A separate-volume private-isu environment was also rebuilt from the pinned upstream revision. Its
+`pass=true, score=0` integration runs yielded 781 access-log records, 2,032 slow-query events, and a
+matching-binary pprof handoff. Score zero proves integration only, not performance.
 
 ## Coverage
 
@@ -181,7 +184,7 @@ Detailed settings, APIs, endpoints, EXPLAIN grants, and multi-host procedures li
 - [Field feedback and operational notes](./docs/FIELD_FEEDBACK.md)
 - [private-isu example](./examples/private-isu/README.md)
 - [ISUCON13 WSL2 example](./examples/isucon13-wsl/README.md)
-- [ISUCON13 specialist-tool field verification](./docs/isucon13-specialist-tools-verification-20260815.en.md)
+- [ISUCON13 / fresh private-isu specialist-tool field verification](./docs/isucon13-specialist-tools-verification-20260815.en.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 
 ## Development

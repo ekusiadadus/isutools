@@ -61,6 +61,30 @@ The off median was 438,235 and the PGO median was 437,734, a -0.114% change. The
 +2% adoption threshold was not met, so PGO was rejected and the exact off binary was restored.
 This negative result is retained separately from the successful workflow validation.
 
+## Fresh private-isu replay
+
+A second WSL2 guest was rebuilt from private-isu `0dc3be8` and PR head `0dbd692` in the isolated
+Compose project `isutools-specialist-fresh`, with separate named volumes and loopback ports. A process-level
+`mysqladmin ping` became ready before the `users` table existed, so the incomplete run was aborted and the
+validation-only volume was recreated. The final gate required all three application tables and a non-empty page.
+
+Three independent runs passed correctness at score zero: baseline `run-63060cc2f4864931`, CPU diagnostic
+`run-dac4864f87c969b1`, and slow-log diagnostic `run-9d085737046fa02b`. Score zero is integration evidence,
+not a performance result.
+
+- The offline inspector parsed all 781 access records from 109,569 bytes with no malformed or partial line.
+- Exact slow-log coverage held 548,795 bytes, 2,032 events, and 16 classes with no partial event. Artifact
+  `eff7bc803007944e7044e7a84e8ac898738c88009294445f647f0b4b93cde6b0` was ready; the normalized summary
+  stayed portable and the pt-query-digest 3.7.1-4 report stayed restricted.
+- Bundle `5e7ce9b3...f9127aff` matched binary SHA `efdf86ff...13ee23`; standard Go 1.26
+  `go tool pprof -top` decoded the 105.7-second CPU profile.
+- PGO preparation first rejected the dirty integration tree, then rejected a clean temporary tree because
+  snapshot source/toolchain provenance did not match. No private-isu candidate was presented as valid; the
+  positive candidate/build and negative A-B-B-A adoption decision remain the ISUCON13 evidence above.
+
+Portable outputs passed a fresh secret scan. CPU profiling and MySQL slow logging were restored to off,
+with `long_query_time=10`; the isolated containers remain loopback-only.
+
 See the [full Japanese evidence record](./isucon13-specialist-tools-verification-20260815.md),
 [specialist-tool playbook](./SPECIALIST_TOOLS.en.md), and
 [threat model](./SECURITY_EXTERNAL_ANALYSIS.md).

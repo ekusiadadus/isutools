@@ -107,6 +107,7 @@ Current-tree verification:
 | hard worker | privileged cgroup v2, Go 1.24.13 Linux/arm64 | birth membership, SIGSTOP gate, hard memory/swap/pids/RLIMIT/pidfd checks, synthetic profile, real `runtime/pprof` CPU profile, OOM kill, parent survival, and subsequent analysis all PASS |
 | GitHub Actions | Go 1.24 compatibility, Linux cgroup worker, race/coverage, MySQL integration | PASS on PR #33 and follow-up PR #34 before merge |
 | remote private-isu | Windows/WSL2 over SSH, merged SHA | readiness, real benchmark, durable save/SCP, run CPU capture, verified-binary flame publication, required/optional peer hub PASS; [full record](./private-isu-field-verification-20260814.md) |
+| fresh private-isu specialist workflow | pinned `0dc3be8`, isolated Compose project/volumes, Docker 27.0.3 amd64 | schema readiness, three correctness-passing score-0 integration runs, 781-record access inspection, exact 2,032-event slow-log attachment with pt-query-digest 3.7.1-4, matching-binary standard pprof, secret scan PASS; [full record](./isucon13-specialist-tools-verification-20260815.md#5-fresh-private-isu-独立volumeで再構築) |
 
 The complete private-isu ABBA release gate remains unverified. The issue #19
 process-wide profiler race now has bounded stop→start handoff and an explicit
