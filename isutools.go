@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	runtimepprof "runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,9 +104,13 @@ const (
 // runtime setting that this package refuses to turn on behind the operator's
 // back.
 const (
-	envMutexFraction = "ISUTOOLS_MUTEX_FRACTION"
-	envBlockRateNS   = "ISUTOOLS_BLOCK_RATE_NS"
-	envHeapProfile   = "ISUTOOLS_HEAP_PROFILE"
+	envMutexFraction        = "ISUTOOLS_MUTEX_FRACTION"
+	envBlockRateNS          = "ISUTOOLS_BLOCK_RATE_NS"
+	envHeapProfile          = "ISUTOOLS_HEAP_PROFILE"
+	envAllocsProfile        = "ISUTOOLS_ALLOCS_PROFILE"
+	envGoroutineProfile     = "ISUTOOLS_GOROUTINE_PROFILE"
+	envThreadcreateProfile  = "ISUTOOLS_THREADCREATE_PROFILE"
+	envGoroutineLeakProfile = "ISUTOOLS_GOROUTINELEAK_PROFILE"
 )
 
 // EXPLAIN capture configuration. The master flag itself lives in the
@@ -192,6 +197,9 @@ type measurement struct {
 	cpuRoot     *safefs.Root
 	cpuMode     string
 	cpuDuration time.Duration
+	trace       traceCoordinator
+	traceBridge *traceWebBridge
+	traceRoot   *safefs.Root
 	recovery    *runRecoveryLedger
 	timeline    *timelineRuntime
 	executable  *buildinfo.ExecutableIdentity
@@ -309,6 +317,8 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		cpuMode   string
 	)
 	cpu, cpuBridge, cpuRoot, cpuMode = newRunCPUCoordinator(getenv)
+	profiles := resolveProfileSettings(getenv).apply(collectorHealth)
+	traceOwner, traceBridge, traceRoot := newRunTraceCoordinator(getenv, cpuMode, profiles)
 	recovery := newRunRecoveryLedger()
 	timelineRuntime := newTimelineRuntime(getenv)
 	observers := joinedRunObservers{}
@@ -321,6 +331,9 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 	}
 	if cpu != nil {
 		observers = append(observers, cpuRunObserver{owner: cpu})
+	}
+	if traceOwner != nil {
+		observers = append(observers, traceRunObserver{owner: traceOwner})
 	}
 	opts.LifecycleObserver = observers
 	// The enrich hook has to be decided before the Controller exists, because
@@ -352,6 +365,13 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 			timelineRuntime.close()
 			timelineRuntime = nil
 		}
+		if traceOwner != nil {
+			traceOwner.Close()
+		}
+		if traceRoot != nil {
+			_ = traceRoot.Close()
+		}
+		traceOwner, traceBridge, traceRoot = nil, nil, nil
 	}
 	m := &measurement{
 		ctrl:        ctrl,
@@ -360,6 +380,9 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 		cpuRoot:     cpuRoot,
 		cpuMode:     cpuMode,
 		cpuDuration: pprofDuration(getenv),
+		trace:       traceOwner,
+		traceBridge: traceBridge,
+		traceRoot:   traceRoot,
 		recovery:    recovery,
 		timeline:    timelineRuntime,
 		proc:        newProcCollector(),
@@ -388,8 +411,8 @@ func newMeasurementWith(getenv func(string) string, opts runctl.Options, gens ge
 			collector.SetEventObserver(m.timeline.collector)
 		}
 	}
-	m.profiles = resolveProfileSettings(getenv).apply(collectorHealth)
-	if cpu != nil || len(m.profiles) != 0 || getenv(envProfileAnalysis) == "1" {
+	m.profiles = profiles
+	if cpu != nil || traceOwner != nil || len(m.profiles) != 0 || getenv(envProfileAnalysis) == "1" {
 		identity, err := buildinfo.CaptureExecutable()
 		m.executable = &identity
 		if err != nil {
@@ -693,11 +716,15 @@ func featureEnabled(getenv func(string) string, key string) bool {
 // rate the application set for itself completely alone, while an explicit
 // zero is an operator asking for the profile to be off.
 type profileSettings struct {
-	mutexSet bool
-	mutex    int
-	blockSet bool
-	block    int
-	heap     bool
+	mutexSet      bool
+	mutex         int
+	blockSet      bool
+	block         int
+	heap          bool
+	allocs        bool
+	goroutine     bool
+	threadcreate  bool
+	goroutineleak bool
 	// invalid lists variables whose value could not be parsed. They are
 	// reported as degraded health and otherwise ignored (fail-open).
 	invalid []string
@@ -722,8 +749,22 @@ func resolveProfileSettings(getenv func(string) string) profileSettings {
 	s.mutex, s.mutexSet = parse(envMutexFraction)
 	s.block, s.blockSet = parse(envBlockRateNS)
 	switch strings.ToLower(strings.TrimSpace(getenv(envHeapProfile))) {
-	case "1", "true", "on", "yes":
+	case "1", "true", "on", "yes", "enabled":
 		s.heap = true
+	}
+	for key, target := range map[string]*bool{
+		envAllocsProfile: &s.allocs, envGoroutineProfile: &s.goroutine,
+		envThreadcreateProfile: &s.threadcreate, envGoroutineLeakProfile: &s.goroutineleak,
+	} {
+		raw := strings.TrimSpace(getenv(key))
+		switch strings.ToLower(raw) {
+		case "":
+		case "1", "true", "on", "yes", "enabled":
+			*target = true
+		case "0", "false", "off", "no", "disabled":
+		default:
+			s.invalid = append(s.invalid, key+"="+raw)
+		}
 	}
 	return s
 }
@@ -758,6 +799,21 @@ func (s profileSettings) apply(reg *health.Registry) []string {
 	if s.heap {
 		kinds = append(kinds, "heap")
 	}
+	for _, configured := range []struct {
+		kind    string
+		enabled bool
+	}{
+		{"allocs", s.allocs}, {"goroutine", s.goroutine}, {"threadcreate", s.threadcreate}, {"goroutineleak", s.goroutineleak},
+	} {
+		if !configured.enabled {
+			continue
+		}
+		if runtimepprof.Lookup(configured.kind) == nil {
+			s.invalid = append(s.invalid, configured.kind+"=unsupported")
+			continue
+		}
+		kinds = append(kinds, configured.kind)
+	}
 	if reg != nil {
 		reg.Set(healthProfiles, s.status(kinds), s.message(effectiveMutex, kinds))
 	}
@@ -784,6 +840,10 @@ func (s profileSettings) message(effectiveMutex int, kinds []string) string {
 		"mutex=" + rateText(effectiveMutex > 0, effectiveMutex),
 		"block=" + rateText(s.blockSet && s.block > 0, s.block),
 		"heap=" + rateText(s.heap, 1),
+		"allocs=" + rateText(s.allocs, 1),
+		"goroutine=" + rateText(s.goroutine, 1),
+		"threadcreate=" + rateText(s.threadcreate, 1),
+		"goroutineleak=" + rateText(s.goroutineleak, 1),
 	}
 	if len(kinds) == 0 {
 		parts = append(parts, "no runtime profile is captured")
@@ -1035,6 +1095,12 @@ func (m *measurement) resetNow(ctx context.Context, o runctl.StartRunOptions) (S
 		})
 		result.CPUProfileStart = &runctl.ProfileStartEvidence{CaptureID: cpuStart.CaptureID, State: cpuStart.State, Code: cpuStart.Code}
 		noteCPUStartHealth(cpuStart)
+	}
+	if m.traceBridge != nil {
+		traceStart := m.traceBridge.StartRun(web.TraceStartRequest{
+			RunID: result.RunID, Epoch: uint64(result.Epoch), State: string(result.State), Validity: string(result.Validity), BoundaryAt: cpuStartBoundary(result),
+		})
+		result.TraceStart = &runctl.ProfileStartEvidence{CaptureID: traceStart.CaptureID, State: traceStart.State, Code: traceStart.Code}
 	}
 	return result, nil
 }
@@ -1834,6 +1900,7 @@ func Handler() http.Handler {
 		RunSnapshot:     core.latestRunSnapshot,
 		Timeline:        core.timelineSection,
 		RuntimeProfiles: core.profiles,
+		TraceCapture:    core.traceBridge,
 	}
 	if source := provider.FlowSource; source == "auto" || source == "middleware" {
 		provider.Flow = flowstats.Default

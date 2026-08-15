@@ -75,6 +75,18 @@ a { color: #0b57d0; }
 </ul>
 {{else}}<p class="empty">no profiles yet (set ISUTOOLS_PPROF_SECONDS; captured automatically after POST /reset). Live profiling: <a href="pprof/">pprof/</a></p>{{end}}
 
+<h2>External analysis <span class="meta">(verified current artifacts; restricted raw inputs are never linked)</span></h2>
+{{if .External}}
+<table>
+<thead><tr><th>run</th><th>kind</th><th>status</th><th>analyzer</th><th>portable output</th></tr></thead>
+<tbody>{{range .External}}<tr>
+<td class="l">{{.Namespace}}</td><td class="l">{{.Kind}}</td><td class="l">{{.Status}}{{if .Code}} ({{.Code}}){{end}}</td>
+<td class="l">{{.Analyzer.Name}} {{.Analyzer.Version}}</td><td class="l">{{range .Outputs}}<a href="files/{{.Name}}">{{.Role}}</a> {{else}}-{{end}}</td>
+</tr>{{end}}</tbody>
+</table>
+<p class="meta"><a href="external-analysis">machine-readable verified index</a></p>
+{{else}}<p class="empty">no verified external analysis artifacts yet</p>{{end}}
+
 <h2>Trajectories <span class="meta">(post-benchmark agent / job animation)</span></h2>
 {{if .Trajectories}}
 <ul class="files">
@@ -955,7 +967,7 @@ td.flag { color: #b45309; font-weight: bold; }
 .decision h3 { font-size: .9rem; margin: 0 0 .4rem; }
 .decision p { font-size: .82rem; line-height: 1.45; margin: .25rem 0; }
 .jump { font-size: .82rem; line-height: 1.8; }
-.jump-link { appearance: none; border: 0; padding: 0; background: none; color: #0b57d0; font: inherit; text-decoration: underline; cursor: pointer; }
+.jump-link { color: #0b57d0; font: inherit; text-decoration: underline; cursor: pointer; }
 .search-key { display: block; margin-top: .2rem; padding: .25rem .4rem; background: #f3f4f6; border-radius: .2rem; overflow-wrap: anywhere; }
 details { font-size: .8rem; margin: .4rem 0; }
 summary { cursor: pointer; color: #666; }
@@ -977,23 +989,24 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <article class="decision {{$diagnosis.PrimaryLevel}}">
 <h3>{{$diagnosis.Primary}}</h3>
 <p><strong>根拠:</strong> {{$diagnosis.PrimaryEvidence}}</p>
-<p><strong>次:</strong> {{$diagnosis.PrimaryAction}} <button type="button" class="jump-link" data-target="{{$diagnosis.PrimaryAnchor}}">詳細を見る</button></p>
+<p><strong>次:</strong> {{$diagnosis.PrimaryAction}} <a class="jump-link" href="#{{$diagnosis.PrimaryAnchor}}" data-target="{{$diagnosis.PrimaryAnchor}}">詳細を見る</a></p>
 </article>
 <article class="decision {{$diagnosis.AmplifierLevel}}">
 <h3>{{$diagnosis.Amplifier}}</h3>
 <p>{{$diagnosis.AmplifierEvidence}}</p>
 {{if $diagnosis.HTTPSearchKey}}<p><strong>route検索キー:</strong><code class="search-key">{{$diagnosis.HTTPSearchKey}}</code></p>{{end}}
 {{if $diagnosis.SQLSearchKey}}<p><strong>SQL検索キー:</strong><code class="search-key">{{$diagnosis.SQLSearchKey}}</code></p>{{end}}
-<p><button type="button" class="jump-link" data-target="http">HTTP</button> &middot; <button type="button" class="jump-link" data-target="sql">SQL</button></p>
+<p><a class="jump-link" href="#http" data-target="http">HTTP</a> &middot; <a class="jump-link" href="#sql" data-target="sql">SQL</a></p>
 </article>
 <article class="decision {{$diagnosis.CodeLevel}}">
 <h3>{{$diagnosis.CodeTitle}}</h3>
 <p>{{$diagnosis.CodeEvidence}}</p>
 <p><strong>次:</strong> {{$diagnosis.CodeAction}}</p>
-<p><button type="button" class="jump-link" data-target="profiles">Profiles</button> &middot; <button type="button" class="jump-link" data-target="isutools-profile-analysis">行解析結果</button></p>
+<p><a class="jump-link" href="#profiles" data-target="profiles">Profiles</a> &middot; <a class="jump-link" href="#profiles" data-target="isutools-profile-lines" title="解析が未公開の場合はProfilesへ移動します">行解析結果</a> &middot; <a class="jump-link" href="#profiles" data-target="isutools-profile-analysis" data-expand=".isutools-flame" data-expand-ready="true" title="解析が未公開の場合はProfilesへ移動します">CPU pprofフレームグラフ</a></p>
+<p class="meta">行解析またはフレームグラフがまだpublishされていないレポートでは、採取状態を確認できるProfilesへ移動します。</p>
 </article>
 </div>
-<p class="jump">根拠へ移動: <button type="button" class="jump-link" data-target="bottleneck-overview">全signal</button> &middot; <button type="button" class="jump-link" data-target="collector-health">計測の欠損</button> &middot; <button type="button" class="jump-link" data-target="run-timeline">時系列</button> &middot; <button type="button" class="jump-link" data-target="db-pool">DB Pool</button> &middot; <button type="button" class="jump-link" data-target="sql">SQL</button> &middot; <button type="button" class="jump-link" data-target="http">HTTP</button> &middot; <button type="button" class="jump-link" data-target="profiles">Profiles</button></p>
+<p class="jump">根拠へ移動: <a class="jump-link" href="#bottleneck-overview" data-target="bottleneck-overview">全signal</a> &middot; <a class="jump-link" href="#collector-health" data-target="collector-health">計測の欠損</a> &middot; <a class="jump-link" href="#run-timeline" data-target="run-timeline">時系列</a> &middot; <a class="jump-link" href="#db-pool" data-target="db-pool">DB Pool</a> &middot; <a class="jump-link" href="#sql" data-target="sql">SQL</a> &middot; <a class="jump-link" href="#http" data-target="http">HTTP</a> &middot; <a class="jump-link" href="#profiles" data-target="profiles">Profiles</a></p>
 
 <span id="bottleneck-overview"></span><h2>Bottleneck Overview <span class="meta">(原因の断定ではなく、根拠一覧)</span></h2>
 <p class="meta">累計 demand と capacity / failure signal を同じ区間で比較します。各行の根拠は下の詳細セクションに残っています。</p>
@@ -1406,7 +1419,12 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 {{end}}
 
 {{with .Snapshot.Meta.Profiles}}
-<span id="profiles"></span><h2>Profiles <span class="meta">(run の両端で採った mutex / block / heap。差分だけが run を近似します)</span></h2>
+<span id="profiles"></span><h2>Profiles <span class="meta">(累積 profile は open/close 差分、goroutine 系は close snapshot、trace は短時間の diagnostic interval)</span></h2>
+{{with .Trace}}
+<h3>Execution trace</h3>
+<p class="meta">status {{.Status}}{{if .Code}} / {{.Code}}{{end}} · capture {{ns .CaptureSpanNs}} · requested {{ns .RequestedSpanNs}} · complete {{.Complete}}</p>
+{{if .File}}<p><a href="/files/{{.File}}">restricted raw trace</a> · {{.Bytes}} bytes · <code>{{.SHA256}}</code></p><pre class="cmd">go tool trace {{.File}}</pre>{{else}}<p class="empty">ready な trace artifact はありません。</p>{{end}}
+{{end}}
 {{if .Pairs}}
 {{range .Pairs}}
 <p class="meta">{{if .Lagging}}<span class="warn">⚠ 採取遅延</span> &middot; {{end}}{{.Kind}} &middot; {{.ResidualText}}{{if .OpenGate}} &middot; open gate {{.OpenGate}}{{end}}</p>
@@ -1429,10 +1447,26 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 {{end}}
 
 {{if .Sortable}}<script>
-document.querySelectorAll(".jump-link").forEach(function (button) {
-  button.addEventListener("click", function () {
-    var target = document.getElementById(button.dataset.target);
-    if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+document.querySelectorAll(".jump-link").forEach(function (link) {
+  link.addEventListener("click", function (event) {
+    var target = document.getElementById(link.dataset.target);
+    if (!target) return;
+    event.preventDefault();
+    var expand = link.dataset.expand;
+    if (expand) {
+      var details;
+      if (link.dataset.expandReady === "true") {
+        var graph = target.querySelector(expand + ' svg[aria-label="bounded flame graph"]');
+        details = graph ? graph.closest("details") : null;
+      } else {
+        details = target.matches(expand) ? target : target.querySelector(expand);
+      }
+      if (details) {
+        if (details.tagName === "DETAILS") details.open = true;
+        target = details;
+      }
+    }
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
   });
 });
 document.querySelectorAll("th").forEach(function (th) {

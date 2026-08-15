@@ -37,7 +37,7 @@ const profileAnalysisTemplateText = `<section id="isutools-profile-analysis">
 <p>status: {{.Status}} · analysis: <code>{{.AnalysisID}}</code></p>
 <p>snapshot: <code>{{.SnapshotSHA256}}</code> · binary: {{.Binary.Match}} · worker: {{.Analyzer.Isolation.Mode}} / {{.Analyzer.Isolation.Bootstrap}}</p>
 {{$lines := profileLineHotspots .}}
-<h3>次に見るソース行</h3>
+<h3 id="isutools-profile-lines">次に見るソース行</h3>
 {{if eq .Binary.Match "verified"}}<p><strong>binary一致を検証済み:</strong> 以下のfile:lineはcapture時の実行binaryと一致する解析入力から得ています。</p>{{else}}<p><strong>未検証:</strong> binary一致が{{.Binary.Match}}のため、以下に行が表示されても修正候補であり、capture時binaryのhot lineとは断定できません。</p>{{end}}
 {{if $lines}}<table><thead><tr><th>kind</th><th>sample</th><th>metric</th><th>file:line</th><th>function</th><th>value</th><th>%</th></tr></thead><tbody>{{range $lines}}<tr><td>{{.Kind}}</td><td>{{.SampleType}}</td><td>{{.Metric}}</td><td>{{.Location}}</td><td>{{.Node.Function}}</td><td>{{.Node.Value}}</td><td>{{.Percent}}</td></tr>{{end}}</tbody></table>
 <p>flatはその行自身で消費した値、cumulativeはその行から先の呼び出しを含む値です。まず大きいcumulativeから呼び出し経路を絞り、flatで実作業の行を確認します。</p>

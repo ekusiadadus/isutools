@@ -53,10 +53,13 @@ DB pool、EXPLAIN、nginx、pprofまで含む手順は[導入ガイド](./docs/I
 | User Flow | 同じ疑似sessionが実際に通ったページ遷移の上位20 |
 | Scenario Stories | 明示scenarioごとの実測request列、session数、request数 |
 | Profiles / Host | CPU実行なのか、DB・I/O・connection待ちなのか |
+| Offline / Specialist tools | 過去log、slow query外れ値、pprof/trace/PGOを同じrunへ安全に接続 |
 | Collector Health | 欠損・打ち切り・設定不備があり、そのrunを比較すべきでないか |
 
 JSON、live dashboard、自己完結HTMLは同じrunから生成されます。推測で原因を断定せず、
 候補と根拠を並べ、scoreとcorrectnessを最後の採用条件にします。
+pprof解析をpublishしたrunでは、Runsの`current UI`からコード位置カードの`行解析結果`と
+`CPU pprofフレームグラフ`へ直接移動できます。未解析時はProfilesへフォールバックします。
 
 ## User Flow / Scenario Stories
 
@@ -143,7 +146,7 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 | Database / KV | MySQL / MariaDB / PostgreSQL / SQLite (`database/sql`)、Redis command collector |
 | HTTP | Go `net/http`、Gorilla mux、Martini、Goji v2、Echo v3/v4/v5、httprouter、Gin、chi v5 |
 | Proxy log | nginx/OpenResty、Apache/OpenLiteSpeed、H2O、Envoy、Caddy、HAProxy、Traefik、lighttpd、Varnish、ATS、IIS、Squid |
-| Runtime | CPU、mutex、block、heap pprof |
+| Runtime | CPU、mutex、block、heap、allocs、goroutine、threadcreate、対応時goroutineleak、trace |
 | Host | Linux procfs / sysfs / cgroup v2、network、DB pool |
 | Output | Live dashboard、JSON、自己完結HTML、run間diff、multi-host hub |
 
@@ -159,6 +162,8 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 | `ISUTOOLS_FLOW_LABELS` | User Flow / Scenario Storiesを`on` / `off` / `auto` |
 | `ISUTOOLS_FLOW_SOURCE` | flow集計元。既定`auto`、`middleware` / `proxy` / `off` |
 | `ISUTOOLS_PPROF_SECONDS` | benchmark区間のCPU profile秒数 |
+| `ISUTOOLS_TRACE_SECONDS` | 1〜30秒の短いexecution trace。既定off、managed profileと排他 |
+| `ISUTOOLS_TIMELINE` | boundedなrun時系列をopt-in |
 
 ### CPU profileがないとき（`cpu-busy`）
 
@@ -167,11 +172,12 @@ User Flowでは、reaction取得から投稿への遷移647回など、単独end
 別の採取が終わるのを待ち、`POST /reset`の応答で
 `X-Isutools-CPU-Profile-State: capturing`を確認してから、ベンチ、`POST /save`、
 `isutools-pprof`解析の順で1回だけ再計測してください。
-| `ISUTOOLS_TIMELINE` | boundedなrun時系列をopt-in |
 
 全設定、API、endpoint、EXPLAIN権限、複数台構成はREADMEへ重複させず、次へ集約しています。
 
 - [導入ガイド](./docs/INTEGRATION.md)
+- [ALP / pt-query-digest / pprof / PGOプレイブック](./docs/SPECIALIST_TOOLS.md)
+- [外部解析の脅威モデルと上限](./docs/SECURITY_EXTERNAL_ANALYSIS.md)
 - [設計とセキュリティ境界](./DESIGN.md)
 - [実装状況](./docs/IMPLEMENTATION_STATUS.md)
 - [現場フィードバックと運用上の注意](./docs/FIELD_FEEDBACK.md)

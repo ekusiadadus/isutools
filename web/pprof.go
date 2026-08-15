@@ -22,6 +22,7 @@ import (
 
 	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/internal/health"
+	"github.com/ekusiadadus/isutools/internal/profileowner"
 	"github.com/ekusiadadus/isutools/internal/safefs"
 )
 
@@ -32,8 +33,18 @@ func pprofHandler(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/pprof/")
 	switch name {
 	case "profile":
+		if !profileowner.Default.Acquire("manual-cpu") {
+			http.Error(w, "profiler-busy", http.StatusConflict)
+			return
+		}
+		defer profileowner.Default.Release("manual-cpu")
 		netpprof.Profile(w, r)
 	case "trace":
+		if !profileowner.Default.Acquire("manual-trace") {
+			http.Error(w, "profiler-busy", http.StatusConflict)
+			return
+		}
+		defer profileowner.Default.Release("manual-trace")
 		netpprof.Trace(w, r)
 	case "symbol":
 		netpprof.Symbol(w, r)
@@ -86,12 +97,18 @@ func (h *handler) captureCPUProfile(generation int64) bool {
 		log.Print("isutools: CPU capture already running; skipping")
 		return false
 	}
+	if !profileowner.Default.Acquire("fixed-cpu") {
+		cpuCaptureActive.Store(false)
+		log.Print("isutools: runtime profiler already running; skipping CPU capture")
+		return false
+	}
 	name := fmt.Sprintf("%s_gen%d_cpu.pprof",
 		time.Now().In(reportTZ).Format("20060102-150405"), generation)
 	base := strings.TrimSuffix(name, profileArtifactExt)
 	h.pruneProfiles(base)
 	root, err := safefs.Open(h.p.DataDir, safefs.Options{RequireStrongVisibility: true, Exclusive: false})
 	if err != nil {
+		profileowner.Default.Release("fixed-cpu")
 		cpuCaptureActive.Store(false)
 		log.Printf("isutools: CPU profile data root failed: %v", err)
 		return false
@@ -109,6 +126,7 @@ func (h *handler) captureCPUProfile(generation int64) bool {
 	}
 	f, err := root.CreateExclusive(tmp, 0o600)
 	if err != nil {
+		profileowner.Default.Release("fixed-cpu")
 		record.Code = "artifact-create-failed"
 		finishRecord()
 		_ = root.Close()
@@ -119,6 +137,7 @@ func (h *handler) captureCPUProfile(generation int64) bool {
 	hasher := sha256.New()
 	writer := &boundedRuntimeProfileWriter{writer: io.MultiWriter(f, hasher), max: runtimeProfileMaxBytes}
 	if err := rpprof.StartCPUProfile(writer); err != nil {
+		profileowner.Default.Release("fixed-cpu")
 		_ = f.Close()
 		_ = root.Remove(tmp)
 		record.Code = "start-failed"
@@ -131,6 +150,7 @@ func (h *handler) captureCPUProfile(generation int64) bool {
 	record.StartCompletedAt = time.Now()
 	go func() {
 		defer cpuCaptureActive.Store(false)
+		defer profileowner.Default.Release("fixed-cpu")
 		defer func() { _ = root.Close() }()
 		time.Sleep(h.p.PprofDuration)
 		record.StopRequestedAt = time.Now()
@@ -442,6 +462,7 @@ type ProfileManifest struct {
 	// CPU is the separately owned interval profile. Unlike Captures/Pairs it
 	// has one run-aligned input rather than cumulative open/close halves.
 	CPU                *CPUIntervalCapture           `json:"cpu,omitempty"`
+	Trace              *TraceIntervalCapture         `json:"trace,omitempty"`
 	CPULabelDictionary *CPULabelDictionary           `json:"cpu_label_dictionary,omitempty"`
 	Executable         *buildinfo.ExecutableIdentity `json:"executable,omitempty"`
 }
@@ -551,6 +572,7 @@ type profileCaptureSpec struct {
 	// the closing capture takes it from the ledger rather than from the clock.
 	stamp    time.Time
 	validity string
+	kinds    []string
 	openGate string
 	ref      profileRef
 }
@@ -579,6 +601,7 @@ type profileRun struct {
 	stamp      time.Time
 	generation int64
 	validity   string
+	kinds      []string
 	openRef    profileRef
 	closeRef   profileRef
 	captures   []ProfileCapture
@@ -630,6 +653,7 @@ func (l *profileLedger) open(dir string, spec profileCaptureSpec) *profileRun {
 		stamp:      stamp,
 		generation: spec.generation,
 		validity:   spec.validity,
+		kinds:      append([]string(nil), spec.kinds...),
 		taken:      make(map[ProfilePoint]bool),
 		published:  make(map[ProfilePoint][]string),
 	}
@@ -699,12 +723,21 @@ func (l *profileLedger) invalidPrefixes(dir string) map[string]bool {
 	return prefixes
 }
 
-// pairable reports whether the run published an opening half, which is the
-// only thing a closing half can be differenced against.
+// pairable reports whether a close has evidence to produce. Cumulative kinds
+// need an opening artifact; interval kinds intentionally exist only at close.
 func (r *profileRun) pairable() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.published[ProfilePointOpen]) > 0
+	return len(r.published[ProfilePointOpen]) > 0 || r.hasIntervalKindLocked()
+}
+
+func (r *profileRun) hasIntervalKindLocked() bool {
+	for _, kind := range r.kinds {
+		if runtimeProfileMode(kind) == profileModeInterval {
+			return true
+		}
+	}
+	return false
 }
 
 // needsOrphaning reports whether the run published an opening half, never
@@ -760,6 +793,9 @@ func (r *profileRun) settle(point ProfilePoint, captures []ProfileCapture) []str
 		if capture.Code == profileCodeAborted {
 			final = true
 		}
+	}
+	if point == ProfilePointOpen && r.hasIntervalKindLocked() {
+		final = true
 	}
 	r.captures = append(r.captures, captures...)
 	if len(written) == 0 && !final {
@@ -924,6 +960,14 @@ func (h *handler) profileManifestFor(runID string, epoch uint64) *ProfileManifes
 			manifest.CPULabelDictionary = dictionary
 		}
 	}
+	if h.p.TraceCapture != nil && epoch != 0 {
+		if trace := h.p.TraceCapture.Manifest(runID, epoch); trace != nil {
+			if manifest == nil {
+				manifest = &ProfileManifest{RunID: runID, Epoch: epoch}
+			}
+			manifest.Trace = trace
+		}
+	}
 	if manifest != nil && h.p.Executable != nil {
 		copy := *h.p.Executable
 		copy.Settings = append([]buildinfo.BuildSetting(nil), h.p.Executable.Settings...)
@@ -953,6 +997,7 @@ func (h *handler) captureBoundary(spec profileCaptureSpec) []string {
 // three seconds for it.
 func (h *handler) captureBoundaryBefore(spec profileCaptureSpec, deadline time.Time) []string {
 	kinds := orderProfileKinds(h.p.RuntimeProfiles)
+	spec.kinds = append([]string(nil), kinds...)
 	// Without a run id there is no pair to assemble and nothing to be
 	// idempotent about, so the artifact is written as what it is: a lone
 	// cumulative snapshot of a process that has no run coordinator.
@@ -978,6 +1023,9 @@ func (h *handler) captureBoundaryBefore(spec profileCaptureSpec, deadline time.T
 	// generation instead of reading the clock again.
 	captures := make([]ProfileCapture, 0, len(kinds))
 	for _, kind := range kinds {
+		if !captureProfileAt(kind, spec.point) {
+			continue
+		}
 		captures = append(captures, h.captureKind(run, spec, kind, deadline))
 	}
 	written := run.settle(spec.point, captures)
@@ -1120,16 +1168,25 @@ func (r *profileRun) manifest() *ProfileManifest {
 		Captures: append([]ProfileCapture(nil), r.captures...),
 	}
 	for _, kind := range r.kindsLocked() {
-		manifest.Expected = append(manifest.Expected, ProfileExpectation{
-			Kind: kind, Mode: "cumulative-delta",
-			Inputs: []ProfileExpectedInput{
+		mode := runtimeProfileMode(kind)
+		expectation := ProfileExpectation{Kind: kind, Mode: mode}
+		if mode == profileModeInterval {
+			expectation.Inputs = []ProfileExpectedInput{
+				{Kind: kind, Point: "interval", File: profileBaseName(r.prefix, kind, ProfilePointClose) + profileArtifactExt},
+			}
+		} else {
+			expectation.Inputs = []ProfileExpectedInput{
 				{Kind: kind, Point: "open", File: profileBaseName(r.prefix, kind, ProfilePointOpen) + profileArtifactExt},
 				{Kind: kind, Point: "close", File: profileBaseName(r.prefix, kind, ProfilePointClose) + profileArtifactExt},
-			},
-		})
+			}
+		}
+		manifest.Expected = append(manifest.Expected, expectation)
 	}
 	span := elapsedNs(r.openRef.at, r.closeRef.at)
 	for _, kind := range r.kindsLocked() {
+		if runtimeProfileMode(kind) == profileModeInterval {
+			continue
+		}
 		open := r.captureLocked(ProfilePointOpen, kind)
 		closing := r.captureLocked(ProfilePointClose, kind)
 		if open == nil || closing == nil {
@@ -1146,7 +1203,7 @@ func (r *profileRun) manifest() *ProfileManifest {
 			HeadLossNs:    open.LagFromRefNs,
 			TailExcessNs:  closing.LagFromRefNs,
 			ApproxErrorNs: open.LagFromRefNs + closing.LagFromRefNs,
-			DiffCommand:   "go tool pprof -diff_base " + open.File + " " + closing.File,
+			DiffCommand:   "go tool pprof -base " + open.File + " " + closing.File,
 		}
 		manifest.Pairs = append(manifest.Pairs, pair)
 	}
@@ -1166,7 +1223,11 @@ func (r *profileRun) incompleteKinds() []string {
 	}
 	var kinds []string
 	for _, kind := range r.kindsLocked() {
-		if r.captureLocked(ProfilePointOpen, kind) == nil || r.captureLocked(ProfilePointClose, kind) == nil {
+		missing := r.captureLocked(ProfilePointClose, kind) == nil
+		if runtimeProfileMode(kind) != profileModeInterval {
+			missing = missing || r.captureLocked(ProfilePointOpen, kind) == nil
+		}
+		if missing {
 			kinds = append(kinds, kind)
 		}
 	}
@@ -1175,6 +1236,9 @@ func (r *profileRun) incompleteKinds() []string {
 
 // kindsLocked lists the kinds this run touched, in capture order.
 func (r *profileRun) kindsLocked() []string {
+	if len(r.kinds) > 0 {
+		return append([]string(nil), r.kinds...)
+	}
 	var kinds []string
 	seen := make(map[string]bool, len(r.captures))
 	for _, capture := range r.captures {
@@ -1381,14 +1445,14 @@ func (w *boundedRuntimeProfileWriter) Write(body []byte) (int, error) {
 	return n, err
 }
 
-// orderProfileKinds fixes the capture order at mutex, block, heap and drops
+// orderProfileKinds fixes the capture order and drops
 // duplicates.
 //
 // The order is cheapest first, so a large heap write cannot push the moment
 // the mutex profile is taken further from the boundary. Kinds this package
 // does not know are kept, after the known ones, in the order given.
 func orderProfileKinds(kinds []string) []string {
-	known := []string{"mutex", "block", "heap"}
+	known := []string{"mutex", "block", "threadcreate", "allocs", "heap", "goroutine", "goroutineleak"}
 	seen := make(map[string]bool, len(kinds))
 	for _, kind := range kinds {
 		seen[kind] = true
@@ -1444,6 +1508,9 @@ func profileBaseName(prefix, kind string, point ProfilePoint) string {
 // with a different meaning — and a directory holding both generations must
 // still produce only correct pairs.
 func profileArtifactPrefix(name string) (string, bool) {
+	if trace, ok := traceArtifactPrefix(name); ok {
+		return trace, true
+	}
 	if runCPU, ok := runCPUArtifactPrefix(name); ok {
 		return runCPU, true
 	}
@@ -1474,6 +1541,18 @@ func profileArtifactPrefix(name string) (string, bool) {
 		return "", false
 	}
 	return rest[:cut], true
+}
+
+func traceArtifactPrefix(name string) (string, bool) {
+	const prefixLength = len("trace_") + 32
+	if len(name) <= prefixLength || !strings.HasPrefix(name, "trace_") || !lowerHexText(name[len("trace_"):prefixLength]) {
+		return "", false
+	}
+	prefix, suffix := name[:prefixLength], name[prefixLength:]
+	if suffix == ".out" || suffix == profileSidecarExt {
+		return prefix, true
+	}
+	return "", false
 }
 
 func runCPUArtifactPrefix(name string) (string, bool) {
@@ -1652,8 +1731,10 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 		}
 		_, fixedCPU := fixedCPUArtifactPrefix(entry.Name())
 		_, runCPU := runCPUArtifactPrefix(entry.Name())
+		_, trace := traceArtifactPrefix(entry.Name())
 		if strings.HasSuffix(entry.Name(), "_"+string(ProfilePointClose)+profileArtifactExt) ||
-			((fixedCPU || runCPU) && strings.HasSuffix(entry.Name(), profileArtifactExt)) {
+			((fixedCPU || runCPU) && strings.HasSuffix(entry.Name(), profileArtifactExt)) ||
+			(trace && strings.HasSuffix(entry.Name(), ".out")) {
 			group.hasClose = true
 		}
 	}
@@ -1697,9 +1778,11 @@ func pruneProfileArtifacts(dir string, keepRuns int, keepBytes int64, protect st
 }
 
 func profileGroupOrder(prefix string) int64 {
-	if strings.HasPrefix(prefix, "cpu_") && len(prefix) == len("cpu_")+32 {
-		if millis, err := strconv.ParseUint(prefix[len("cpu_"):len("cpu_")+12], 16, 64); err == nil && millis <= uint64(^uint64(0)>>1) {
-			return int64(millis)
+	for _, marker := range []string{"cpu_", "trace_"} {
+		if strings.HasPrefix(prefix, marker) && len(prefix) == len(marker)+32 {
+			if millis, err := strconv.ParseUint(prefix[len(marker):len(marker)+12], 16, 64); err == nil && millis <= uint64(^uint64(0)>>1) {
+				return int64(millis)
+			}
 		}
 	}
 	if len(prefix) >= 15 {

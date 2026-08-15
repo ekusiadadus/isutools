@@ -80,7 +80,13 @@ func CaptureInputFile(path string) (ExecutableIdentity, error) {
 
 func captureFile(path, source string, readBuildInfo func() (*debug.BuildInfo, bool), afterRead func()) (ExecutableIdentity, error) {
 	identity := ExecutableIdentity{Source: source, Status: ExecutableStatusUnavailable}
-	file, err := os.Open(path)
+	var file *os.File
+	var err error
+	if source == SourceInputFile {
+		file, err = openInputFile(path)
+	} else {
+		file, err = os.Open(path)
+	}
 	if err != nil {
 		return identity, fmt.Errorf("buildinfo: open executable image: %w", err)
 	}
@@ -91,6 +97,9 @@ func captureFile(path, source string, readBuildInfo func() (*debug.BuildInfo, bo
 	}
 	if !before.Mode().IsRegular() {
 		return identity, errors.New("buildinfo: executable image is not regular")
+	}
+	if source == SourceInputFile && !hasSingleLink(before) {
+		return identity, errors.New("buildinfo: executable image has multiple hard links")
 	}
 	if before.Size() < 0 || before.Size() > maxExecutableBytes {
 		return identity, fmt.Errorf("buildinfo: executable image exceeds %d bytes", maxExecutableBytes)
@@ -107,10 +116,21 @@ func captureFile(path, source string, readBuildInfo func() (*debug.BuildInfo, bo
 		afterRead()
 	}
 	afterFD, fdErr := file.Stat()
-	afterPath, pathErr := os.Stat(path)
-	if fdErr != nil || pathErr != nil || !os.SameFile(before, afterFD) || !os.SameFile(before, afterPath) || before.Size() != afterFD.Size() {
+	var afterPath os.FileInfo
+	var pathErr error
+	if source == SourceInputFile {
+		afterPath, pathErr = os.Lstat(path)
+	} else {
+		afterPath, pathErr = os.Stat(path)
+	}
+	if fdErr != nil || pathErr != nil || !os.SameFile(before, afterFD) || !os.SameFile(before, afterPath) ||
+		before.Size() != afterFD.Size() || !before.ModTime().Equal(afterFD.ModTime()) {
 		identity.Status = ExecutableStatusChangedDuringRead
 		return identity, errors.New("buildinfo: executable identity changed during capture")
+	}
+	if source == SourceInputFile && (!hasSingleLink(afterFD) || !hasSingleLink(afterPath)) {
+		identity.Status = ExecutableStatusChangedDuringRead
+		return identity, errors.New("buildinfo: executable hard-link identity changed during capture")
 	}
 	identity.SHA256 = hex.EncodeToString(hasher.Sum(nil))
 	identity.Status = ExecutableStatusCaptured

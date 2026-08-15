@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -23,19 +24,22 @@ import (
 	"github.com/ekusiadadus/isutools/buildinfo"
 	"github.com/ekusiadadus/isutools/internal/pprofanalyze"
 	"github.com/ekusiadadus/isutools/internal/profilecapture"
+	"github.com/ekusiadadus/isutools/internal/profilehandoff"
 	"github.com/ekusiadadus/isutools/internal/profilemodel"
 	"github.com/ekusiadadus/isutools/internal/safefs"
 	"github.com/ekusiadadus/isutools/web"
 )
 
 const (
-	bundleSchema             = "isutools.pprof-bundle/v1"
+	bundleSchema             = "isutools.pprof-bundle/v2"
+	legacyBundleSchema       = "isutools.pprof-bundle/v1"
 	bundleMarkerSchema       = "isutools.pprof-bundle-current/v1"
 	capabilitiesSchema       = "isutools.profile-analysis-capabilities/v1"
 	cliVersion               = "1"
 	pprofDependencyVersion   = "v0.0.0-20260709232956-b9395ee17fa0"
 	maxHTTPMetadataBytes     = int64(256 << 10)
 	maxFetchedProfileBytes   = int64(32 << 20)
+	maxFetchedTraceBytes     = int64(256 << 20)
 	defaultCommandTimeout    = 60 * time.Second
 	minimumCommandTimeout    = time.Second
 	maximumCommandTimeout    = 5 * time.Minute
@@ -59,6 +63,18 @@ type bundleAttempt struct {
 	Dictionary *profilecapture.LabelDictionary     `json:"dictionary,omitempty"`
 }
 
+type bundleTrace struct {
+	ExpectedFile  string `json:"expected_file"`
+	File          string `json:"file,omitempty"`
+	SHA256        string `json:"sha256,omitempty"`
+	Bytes         int64  `json:"bytes,omitempty"`
+	Sidecar       string `json:"sidecar,omitempty"`
+	SidecarSHA256 string `json:"sidecar_sha256,omitempty"`
+	Status        string `json:"status"`
+	Code          string `json:"code,omitempty"`
+	Complete      bool   `json:"complete"`
+}
+
 type profileBundle struct {
 	Schema                string                          `json:"schema"`
 	BundleID              string                          `json:"bundle_id"`
@@ -68,7 +84,10 @@ type profileBundle struct {
 	SnapshotSchemaVersion int                             `json:"snapshot_schema_version"`
 	RunID                 string                          `json:"run_id"`
 	CapturedExecutable    profilemodel.ExecutableIdentity `json:"captured_executable"`
-	Attempts              []bundleAttempt                 `json:"attempts"`
+	Attempts              []bundleAttempt                 `json:"attempts,omitempty"`
+	Trace                 *bundleTrace                    `json:"trace,omitempty"`
+	CommandSchema         string                          `json:"command_schema,omitempty"`
+	TestedGoVersion       string                          `json:"tested_go_version,omitempty"`
 }
 
 type bundleMarker struct {
@@ -87,7 +106,7 @@ func main() {
 
 func runCLI(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, "usage: isutools-pprof <preflight|fetch|analyze|publish> [flags]")
+		_, _ = fmt.Fprintln(stderr, "usage: isutools-pprof <preflight|fetch|analyze|recipes|publish> [flags]")
 		return 2
 	}
 	var err error
@@ -102,6 +121,8 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 		if err == nil && !usable {
 			return 4
 		}
+	case "recipes":
+		err = runRecipes(args[1:], stdout, stderr)
 	case "publish":
 		err = runPublish(args[1:], stdout, stderr)
 	default:
@@ -339,8 +360,8 @@ func bundleFromManifest(base, snapshotHash string, snapshotSchema int, manifest 
 			expectations = append(expectations, web.ProfileExpectation{Kind: "cpu", Mode: profilemodel.ProfileModeInterval, Inputs: []web.ProfileExpectedInput{{Kind: "cpu", Point: "interval", File: manifest.CPU.ExpectedFile}}})
 		}
 	}
-	if len(expectations) == 0 || len(expectations) > profilemodel.MaxAttempts {
-		return profileBundle{}, nil, errors.New("snapshot has no bounded profile expectations")
+	if len(expectations) > profilemodel.MaxAttempts {
+		return profileBundle{}, nil, errors.New("snapshot has too many profile expectations")
 	}
 	captures := make(map[string]web.ProfileCapture)
 	for _, capture := range manifest.Captures {
@@ -356,6 +377,7 @@ func bundleFromManifest(base, snapshotHash string, snapshotSchema int, manifest 
 	bundle := profileBundle{
 		Schema: bundleSchema, SnapshotBase: base, SnapshotFile: base + ".json", SnapshotSHA256: snapshotHash,
 		SnapshotSchemaVersion: snapshotSchema, RunID: manifest.RunID, CapturedExecutable: modelExecutable(*manifest.Executable),
+		CommandSchema: profilehandoff.SchemaV1, TestedGoVersion: runtime.Version(),
 	}
 	seenKinds := make(map[string]struct{}, len(expectations))
 	for _, expectation := range expectations {
@@ -425,11 +447,34 @@ func bundleFromManifest(base, snapshotHash string, snapshotSchema int, manifest 
 		bundle.Attempts = append(bundle.Attempts, attempt)
 	}
 	sort.Slice(bundle.Attempts, func(i, j int) bool { return bundle.Attempts[i].Kind < bundle.Attempts[j].Kind })
+	if trace := manifest.Trace; trace != nil {
+		if !validTraceName(trace.ExpectedFile) {
+			return profileBundle{}, nil, errors.New("unsafe expected trace input")
+		}
+		bundle.Trace = &bundleTrace{ExpectedFile: trace.ExpectedFile, Status: trace.Status, Code: trace.Code, Complete: trace.Complete}
+		if trace.File != "" || trace.SHA256 != "" || trace.Sidecar != "" || trace.SidecarSHA256 != "" {
+			if trace.File != trace.ExpectedFile || !validTraceName(trace.File) || !validHash(trace.SHA256) || trace.Bytes < 1 ||
+				!validAttachmentName(trace.Sidecar) || !validHash(trace.SidecarSHA256) {
+				return profileBundle{}, nil, errors.New("malformed trace artifact identity")
+			}
+			bundle.Trace.File, bundle.Trace.SHA256, bundle.Trace.Bytes = trace.File, trace.SHA256, trace.Bytes
+			bundle.Trace.Sidecar, bundle.Trace.SidecarSHA256 = trace.Sidecar, trace.SidecarSHA256
+			if err := addFetchedArtifact(files, trace.File, trace.SHA256, maxFetchedTraceBytes); err != nil {
+				return profileBundle{}, nil, err
+			}
+			if err := addFetchedArtifact(files, trace.Sidecar, trace.SidecarSHA256, profilecapture.MaxCompletionRecordBytes); err != nil {
+				return profileBundle{}, nil, err
+			}
+		}
+	}
+	if len(bundle.Attempts) == 0 && bundle.Trace == nil {
+		return profileBundle{}, nil, errors.New("snapshot has no bounded profile or trace expectations")
+	}
 	return bundle, files, nil
 }
 
 func addFetchedArtifact(files map[string]fetchedArtifact, name, sha256 string, limit int64) error {
-	if (!validArtifactName(name) && !validAttachmentName(name)) || !validHash(sha256) || limit <= 0 {
+	if (!validArtifactName(name) && !validAttachmentName(name) && !validTraceName(name)) || !validHash(sha256) || limit <= 0 {
 		return errors.New("invalid fetched artifact identity")
 	}
 	value := fetchedArtifact{SHA256: sha256, Limit: limit}
@@ -720,6 +765,184 @@ func sanitizeSourcePaths(summaries []profilemodel.ProfileSummary, sourceRoot str
 	return redacted
 }
 
+type handoffManifest struct {
+	Schema            string                  `json:"schema"`
+	RunID             string                  `json:"run_id"`
+	SnapshotBase      string                  `json:"snapshot_base"`
+	SnapshotSHA256    string                  `json:"snapshot_sha256"`
+	BinarySHA256      string                  `json:"binary_sha256"`
+	BinaryMatch       bool                    `json:"binary_match"`
+	TestedGoVersion   string                  `json:"tested_go_version"`
+	CapturedGoVersion string                  `json:"captured_go_version,omitempty"`
+	Recipes           []profilehandoff.Recipe `json:"recipes"`
+}
+
+func runRecipes(args []string, stdout, stderr io.Writer) error {
+	set := newFlagSet("recipes", stderr)
+	bundleDir := set.String("bundle-dir", "", "bundle directory")
+	binaryPath := set.String("binary", "", "exact target binary")
+	sourceRoot := set.String("source-root", "", "matching source tree")
+	output := set.String("output", "json", "json or shell")
+	timeout := set.Duration("timeout", defaultCommandTimeout, "isolated profile validation timeout")
+	if err := parseFlags(set, args); err != nil {
+		return err
+	}
+	if *bundleDir == "" || (*output != "json" && *output != "shell") || !validTimeout(*timeout) {
+		return &usageError{message: "recipes requires --bundle-dir, --output json|shell, and timeout in 1s..5m"}
+	}
+	sourceAvailable := false
+	if *sourceRoot != "" {
+		info, err := os.Stat(*sourceRoot)
+		if err != nil || !info.IsDir() {
+			return errors.New("source root is not a directory")
+		}
+		sourceAvailable = true
+	}
+	root, err := safefs.Open(*bundleDir, safefs.Options{})
+	if err != nil {
+		return fmt.Errorf("open bundle: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	bundle, err := loadBundle(root)
+	if err != nil {
+		return err
+	}
+	binary := "MATCHING_BINARY"
+	binaryMatch := false
+	if *binaryPath != "" {
+		identity, captureErr := buildinfo.CaptureInputFile(*binaryPath)
+		if captureErr != nil {
+			return fmt.Errorf("capture input binary: %w", captureErr)
+		}
+		binary = *binaryPath
+		binaryMatch = validHash(bundle.CapturedExecutable.SHA256) && identity.SHA256 == bundle.CapturedExecutable.SHA256 &&
+			bundle.CapturedExecutable.Status == profilemodel.ExecutableStatusCaptured &&
+			(bundle.CapturedExecutable.Source == profilemodel.ExecutableSourceProcSelfExe || bundle.CapturedExecutable.Source == profilemodel.ExecutableSourcePlatformBound)
+	}
+	handoff := handoffManifest{
+		Schema: profilehandoff.SchemaV1, RunID: bundle.RunID, SnapshotBase: bundle.SnapshotBase,
+		SnapshotSHA256: bundle.SnapshotSHA256, BinarySHA256: bundle.CapturedExecutable.SHA256,
+		BinaryMatch: binaryMatch, TestedGoVersion: runtime.Version(), CapturedGoVersion: bundle.CapturedExecutable.GoVersion,
+	}
+	for _, attempt := range bundle.Attempts {
+		inputs := make([]profilehandoff.InputFile, 0, len(attempt.Expected))
+		observed := make(map[string]profilemodel.ObservedProfileInput, len(attempt.Observed))
+		for _, value := range attempt.Observed {
+			observed[value.ExpectedFile] = value
+		}
+		complete := len(attempt.Expected) != 0 && len(attempt.Expected) == len(attempt.Observed)
+		for _, expected := range attempt.Expected {
+			value := profilehandoff.InputFile{Point: expected.Point, File: expected.File}
+			if found, ok := observed[expected.File]; ok {
+				value.File, value.SHA256 = found.File, found.SHA256
+			} else {
+				complete = false
+			}
+			inputs = append(inputs, value)
+		}
+		sampleTypes := []profilehandoff.SampleType(nil)
+		if complete {
+			var validated bool
+			sampleTypes, validated = validateRecipeAttempt(root, attempt, *timeout)
+			complete = validated
+		}
+		recipes, generateErr := profilehandoff.Generate(profilehandoff.ProfileInput{
+			Kind: attempt.Kind, Mode: attempt.Mode, Binary: binary, BinaryMatch: binaryMatch,
+			SourceAvailable: sourceAvailable, SourceRoot: *sourceRoot, HasLabels: attempt.Dictionary != nil, SampleTypes: sampleTypes, Inputs: inputs,
+		})
+		if generateErr != nil {
+			return fmt.Errorf("generate %s recipes: %w", attempt.Kind, generateErr)
+		}
+		if !complete {
+			for index := range recipes {
+				recipes[index].Ready = false
+				recipes[index].Code = "profile-missing"
+				recipes[index].Conditions = []string{"fetch every expected profile input and verify its SHA-256"}
+			}
+		}
+		handoff.Recipes = append(handoff.Recipes, recipes...)
+	}
+	if bundle.Trace != nil {
+		file := bundle.Trace.ExpectedFile
+		if bundle.Trace.File != "" {
+			file = bundle.Trace.File
+		}
+		ready := bundle.Trace.Complete && bundle.Trace.Status == "published" && bundle.Trace.File != ""
+		recipes, generateErr := profilehandoff.GenerateTrace(file, ready)
+		if generateErr != nil {
+			return fmt.Errorf("generate trace recipe: %w", generateErr)
+		}
+		handoff.Recipes = append(handoff.Recipes, recipes...)
+	}
+	if *output == "json" {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetEscapeHTML(false)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(handoff); err != nil {
+			return fmt.Errorf("write recipe manifest: %w", err)
+		}
+		return nil
+	}
+	for _, recipe := range handoff.Recipes {
+		if !recipe.Ready {
+			if _, err := fmt.Fprintf(stdout, "# unavailable %s: %s\n", recipe.Purpose, recipe.Code); err != nil {
+				return fmt.Errorf("write recipes: %w", err)
+			}
+			continue
+		}
+		command, renderErr := profilehandoff.RenderShell(recipe.Argv)
+		if renderErr != nil {
+			return renderErr
+		}
+		if _, err := fmt.Fprintln(stdout, command); err != nil {
+			return fmt.Errorf("write recipes: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateRecipeAttempt(root *safefs.Root, attempt bundleAttempt, timeout time.Duration) ([]profilehandoff.SampleType, bool) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, false
+	}
+	files := make([]*os.File, 0, len(attempt.Observed))
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
+	for _, observed := range attempt.Observed {
+		file, openErr := root.OpenRegular(observed.File)
+		if openErr != nil {
+			return nil, false
+		}
+		files = append(files, file)
+	}
+	result, err := launchAnalysisWorker(context.Background(), executable, pprofanalyze.WorkerJob{
+		Mode: attempt.Mode, TopN: 1, Dictionary: attempt.Dictionary, Profiles: files,
+	}, pprofanalyze.WorkerOptions{CgroupRoot: os.Getenv("ISUTOOLS_PPROF_CGROUP_ROOT"), Timeout: timeout})
+	if err != nil || result.ErrorCode != "" || len(result.Summaries) == 0 {
+		return nil, false
+	}
+	seen := make(map[string]bool)
+	types := make([]profilehandoff.SampleType, 0, len(result.Summaries))
+	for _, summary := range result.Summaries {
+		if summary.SampleType == "" || summary.Unit == "" || seen[summary.SampleType+"\x00"+summary.Unit] {
+			continue
+		}
+		seen[summary.SampleType+"\x00"+summary.Unit] = true
+		types = append(types, profilehandoff.SampleType{Type: summary.SampleType, Unit: summary.Unit})
+	}
+	sort.Slice(types, func(i, j int) bool {
+		if types[i].Type != types[j].Type {
+			return types[i].Type < types[j].Type
+		}
+		return types[i].Unit < types[j].Unit
+	})
+	return types, len(types) != 0
+}
+
 func runPublish(args []string, stdout, stderr io.Writer) error {
 	set := newFlagSet("publish", stderr)
 	admin := set.String("admin", "", "admin origin")
@@ -787,8 +1010,11 @@ func loadBundle(root *safefs.Root) (profileBundle, error) {
 		return profileBundle{}, errors.New("bundle manifest hash mismatch")
 	}
 	var bundle profileBundle
-	if err := decodeStrict(body, &bundle); err != nil || bundle.Schema != bundleSchema || bundle.BundleID != marker.BundleID || !validBase(bundle.SnapshotBase) || !validHash(bundle.SnapshotSHA256) || bundle.RunID == "" || len(bundle.Attempts) == 0 {
+	if err := decodeStrict(body, &bundle); err != nil || (bundle.Schema != bundleSchema && bundle.Schema != legacyBundleSchema) || bundle.BundleID != marker.BundleID || !validBase(bundle.SnapshotBase) || !validHash(bundle.SnapshotSHA256) || bundle.RunID == "" || (len(bundle.Attempts) == 0 && bundle.Trace == nil) {
 		return profileBundle{}, errors.New("invalid bundle manifest")
+	}
+	if bundle.Schema == bundleSchema && (bundle.CommandSchema != profilehandoff.SchemaV1 || bundle.TestedGoVersion == "") {
+		return profileBundle{}, errors.New("invalid bundle command provenance")
 	}
 	copy := bundle
 	copy.BundleID = ""
@@ -821,6 +1047,24 @@ func loadBundle(root *safefs.Root) (profileBundle, error) {
 				if readErr != nil || hashBytes(body) != attachment.hash {
 					return profileBundle{}, fmt.Errorf("bundle %s %s hash mismatch", attachment.kind, attachment.file)
 				}
+			}
+		}
+	}
+	if trace := bundle.Trace; trace != nil {
+		if !validTraceName(trace.ExpectedFile) {
+			return profileBundle{}, errors.New("invalid bundle trace expectation")
+		}
+		if trace.File != "" {
+			if trace.File != trace.ExpectedFile || !validHash(trace.SHA256) || trace.Bytes < 1 || !validAttachmentName(trace.Sidecar) || !validHash(trace.SidecarSHA256) {
+				return profileBundle{}, errors.New("invalid bundle trace identity")
+			}
+			body, readErr := root.ReadFile(trace.File, maxFetchedTraceBytes)
+			if readErr != nil || int64(len(body)) != trace.Bytes || hashBytes(body) != trace.SHA256 {
+				return profileBundle{}, errors.New("bundle trace hash mismatch")
+			}
+			sidecar, readErr := root.ReadFile(trace.Sidecar, profilecapture.MaxCompletionRecordBytes)
+			if readErr != nil || hashBytes(sidecar) != trace.SidecarSHA256 {
+				return profileBundle{}, errors.New("bundle trace sidecar hash mismatch")
 			}
 		}
 	}
@@ -1009,6 +1253,9 @@ func validArtifactName(value string) bool {
 }
 func validAttachmentName(value string) bool {
 	return validBase(value) && strings.HasSuffix(value, ".json")
+}
+func validTraceName(value string) bool {
+	return validBase(value) && strings.HasPrefix(value, "trace_") && strings.HasSuffix(value, ".out")
 }
 func hashBytes(body []byte) string { sum := sha256.Sum256(body); return hex.EncodeToString(sum[:]) }
 func checkedMultiply(a, b uint64) (uint64, bool) {

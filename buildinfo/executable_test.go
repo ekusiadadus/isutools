@@ -1,12 +1,50 @@
 package buildinfo
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"testing"
 )
+
+func TestCaptureInputFileRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.WriteFile(target, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CaptureInputFile(link); err == nil {
+		t.Fatal("CaptureInputFile followed a symlink")
+	}
+}
+
+func TestCaptureInputFileRejectsHardlink(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("hard-link identity check is provided on supported Unix targets")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	alias := filepath.Join(dir, "alias")
+	if err := os.WriteFile(target, []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(target, alias); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skip(err)
+		}
+		t.Fatal(err)
+	}
+	if _, err := CaptureInputFile(target); err == nil || !strings.Contains(err.Error(), "hard links") {
+		t.Fatalf("CaptureInputFile hard link = %v", err)
+	}
+}
 
 func TestCaptureFileHashesExactBytesAndSafeBuildProjection(t *testing.T) {
 	dir := t.TempDir()

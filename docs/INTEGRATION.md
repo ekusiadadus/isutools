@@ -437,6 +437,12 @@ isutools-pprof publish --admin http://127.0.0.1:19191 \
   --analysis ./analysis.json --expected-current none
 ```
 
+publish後はRunsの`current UI`を開く。上部のコード位置カードでは、`行解析結果`が
+`function / file / line`の一覧へ、`CPU pprofフレームグラフ`が`ready`なCPU flame viewを
+展開して移動する。解析が未publish、またはreadyなCPU flameが無い場合は、無反応にせず
+Profilesへフォールバックして採取状態を確認できる。保存時のimmutable HTMLは書き換えないため、
+新しい導線を使うときは`html`ではなく`current UI`を選ぶ。
+
 HTTPの代わりにmount済みDataDirから`fetch --data-dir <dir>`も使えるが、derived fileをDataDirへ
 直接書く経路はない。publishは必ずadmin endpointのCASを通る。redirect、URL credential、別origin、
 symlink/non-regular inputは拒否する。409 responseのcurrent IDを自動採用してretryしない。
@@ -1153,3 +1159,38 @@ agent/hubの起動手順を一つの運用文書に集約しています。
 複数台の値はhostごとに表示し、合算しません。required participantの欠落はinvalid、
 optionalの欠落はpartialです。listenerとhub endpointはliteral loopbackのみ受理するため、
 host間transportはSSH local forwardingを使います。
+
+## 14. Offline access log / slow log / trace / PGO
+
+専門toolとの使い分け、run-bound artifact attach、slow-log inode/offset/DB clock、pprof/trace recipe、
+PGO build/rollback/ABBA手順は[専門toolプレイブック](./SPECIALIST_TOOLS.md)へ集約しています。
+外部解析は明示CLIなので`ISUTOOLS=off`でも使用できますが、target processのruntime capture、background work、
+artifact writeは開始しません。
+
+CLIをまとめてbuildします。
+
+```bash
+make build-tools
+bin/isutools inspect accesslog --help
+bin/isutools analyze mysql-slowlog --help
+bin/isutools-pprof recipes --help
+bin/isutools-pgo prepare --help
+bin/isutools-pgo build --help
+```
+
+追加runtime profileとtraceは全て既定offです。profile種別を同じscore runで重ねず、個別のdiagnostic runで
+一つずつ有効にしてください。
+
+```bash
+ISUTOOLS_ALLOCS_PROFILE=on
+ISUTOOLS_GOROUTINE_PROFILE=on
+ISUTOOLS_THREADCREATE_PROFILE=on
+ISUTOOLS_GOROUTINELEAK_PROFILE=on
+ISUTOOLS_TRACE_SECONDS=5
+ISUTOOLS_TRACE_MAX_BYTES=67108864
+```
+
+`ISUTOOLS_TRACE_SECONDS`は1〜30秒。managed CPU/runtime profileと同時設定ならtraceを開始せず、healthへ
+stable conflictを出します。artifact envelope、portable/restricted、CAS、Web公開境界は
+[脅威モデル](./SECURITY_EXTERNAL_ANALYSIS.md)と
+[ADR](./adr/0001-external-analysis-artifacts.md)を参照してください。

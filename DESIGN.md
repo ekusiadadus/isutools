@@ -699,3 +699,21 @@ private-isu 実戦で 0→299,668 を計測しながら達成(dogfooding 済み)
 - [ ] gqlgen / quic-go adapterをnested moduleにするか、別repository/moduleにするか
 - [ ] collector横断generation barrierを1.xで実装するか、reset応答後にbench開始する運用契約で十分か
 - [ ] 背景分析ログの保存先と一次資料リンク
+
+## 14. 外部解析と標準tool handoff
+
+offline access-log、MySQL slow log / pt-query-digest、runtime trace、pprof recipe、PGO候補は、
+snapshotへraw出力を埋め込まず、run ID・snapshot SHA・input/output SHA・visibility・resource budgetを持つ
+`ExternalAnalysisArtifact v1`で接続する。content-addressed immutable fileを先にpublishし、current markerは
+expected-current CASでだけ更新する。strict readerはv1を完全検証し、display readerは未知schemaを
+`unsupported`として表示する。
+
+既存profile-analysis wire formatは変更しない。pprof bundle v2はv1を引き続き読み、trace、command schema、
+tested Go versionを加える。累積open/closeは`-base`、独立run比較だけ`-diff_base`、traceは`go tool trace`。
+binary SHA不一致、pair欠損、source欠損をready recipeにしない。PGOはclean sourceへ自動copyせず、privateな
+candidate directory、固定argvの明示build、build time/size/provenance、`-pgo=off` rollback、predeclared ABBA ledgerを生成する。
+
+決定、crash/retention/migrationの詳細は
+[`docs/adr/0001-external-analysis-artifacts.md`](./docs/adr/0001-external-analysis-artifacts.md)、
+trust boundaryと全上限は
+[`docs/SECURITY_EXTERNAL_ANALYSIS.md`](./docs/SECURITY_EXTERNAL_ANALYSIS.md)を正本とする。

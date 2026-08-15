@@ -199,6 +199,13 @@ func TestProfileAnalysisDerivedHTMLRendersCompleteEvidenceAndEscapesData(t *test
 	base, snapshotHash, profileHash := writeAnalysisFixture(t, h, dir)
 	analysis := validWebAnalysis(t, base, snapshotHash, profileHash, 10)
 	attempt := &analysis.Attempts[0]
+	attempt.Flame = &profilemodel.FlameGraph{
+		Status: "ready", Mode: attempt.Mode, SampleType: "cpu", Unit: "nanoseconds", TotalWeight: 10,
+		Nodes:     []profilemodel.FlameNode{{Function: "main.appGetNotification", Depth: 0, X: 0, Width: 10000, Value: 10, Sign: "positive"}},
+		NodeLimit: profilemodel.MaxFlameNodes, DepthLimit: profilemodel.MaxFlameDepth,
+		InputSHA256: []string{profileHash}, BinarySHA256: strings.Repeat("d", 64),
+		AnalyzerVersion: analysis.Analyzer.Version, GeneratedAt: analysis.GeneratedAt,
+	}
 	analysis.Diagnostics = []profilemodel.Diagnostic{{Level: profilemodel.DiagnosticWarn, Code: profilemodel.DiagnosticProvenanceUnavailable, Message: "test provenance warning"}}
 	attempt.Status = profilemodel.AnalysisStatusPartial
 	attempt.Diagnostics = []profilemodel.Diagnostic{{Level: profilemodel.DiagnosticWarn, Code: profilemodel.DiagnosticSourcePathRedacted, Message: "outside root <redacted>"}}
@@ -235,7 +242,8 @@ func TestProfileAnalysisDerivedHTMLRendersCompleteEvidenceAndEscapesData(t *test
 	}
 	html := string(body)
 	for _, want := range []string{
-		"次に見るソース行", "binary一致を検証済み", "app_handlers.go:711", "main.appGetNotification", "flat", "cumulative",
+		`id="isutools-profile-lines"`, "次に見るソース行", "binary一致を検証済み", "app_handlers.go:711", "main.appGetNotification", "flat", "cumulative",
+		`class="isutools-flame"`, "Flame view (interval / ready)", `aria-label="bounded flame graph"`,
 		"Analysis diagnostics", "Diagnostics", "coverage:", "Top cumulative", "Labels", "50.00%", "/users/{id}", "&lt;script&gt;", analysisSidecarName, analysisCoverageName,
 	} {
 		if !strings.Contains(html, want) {
@@ -251,7 +259,7 @@ func TestProfileAnalysisDerivedHTMLRendersCompleteEvidenceAndEscapesData(t *test
 		preview.Header().Get("X-Isutools-Profile-Analysis") != "current" {
 		t.Fatalf("current analysis preview = %d headers=%v: %s", preview.Code, preview.Header(), preview.Body.String())
 	}
-	for _, want := range []string{"結論: 次に修正する場所", "次に見るソース行", "app_handlers.go:711"} {
+	for _, want := range []string{"結論: 次に修正する場所", `data-target="isutools-profile-lines"`, `data-expand=".isutools-flame" data-expand-ready="true"`, `id="isutools-profile-lines"`, `class="isutools-flame"`, "Flame view (interval / ready)", "次に見るソース行", "app_handlers.go:711"} {
 		if !strings.Contains(preview.Body.String(), want) {
 			t.Errorf("current analysis preview missing %q: %s", want, preview.Body.String())
 		}

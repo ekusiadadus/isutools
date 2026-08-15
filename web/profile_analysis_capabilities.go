@@ -18,25 +18,26 @@ const (
 )
 
 type ProfileAnalysisCapabilities struct {
-	Schema                     string   `json:"schema"`
-	StrongAtomicVisibility     bool     `json:"strong_atomic_visibility"`
-	CrashDurability            string   `json:"crash_durability"`
-	CapabilityError            string   `json:"capability_error,omitempty"`
-	RetentionRuns              int      `json:"retention_runs"`
-	RetentionBytes             uint64   `json:"retention_bytes"`
-	ProfileCaptureMaxBytes     uint64   `json:"profile_capture_max_bytes"`
-	CaptureSidecarMaxBytes     uint64   `json:"capture_sidecar_max_bytes"`
-	CPUCoverageMaxBytes        uint64   `json:"cpu_coverage_max_bytes"`
-	CPULabelDictionaryMaxBytes uint64   `json:"cpu_label_dictionary_max_bytes"`
-	ExpectedProfileFilesPerRun uint64   `json:"expected_profile_files_per_run"`
-	SnapshotArtifactMaxPerRun  uint64   `json:"snapshot_artifact_max_bytes_per_run"`
-	PerRunCeilingBytes         uint64   `json:"per_run_ceiling_bytes"`
-	ProfileUsageKnown          bool     `json:"profile_usage_known"`
-	ProfileUsageBytes          uint64   `json:"profile_usage_bytes,omitempty"`
-	DataDirAvailableKnown      bool     `json:"data_dir_available_known"`
-	DataDirAvailableBytes      uint64   `json:"data_dir_available_bytes,omitempty"`
-	CurrentGeneration          int64    `json:"current_generation"`
-	EnabledProfileKinds        []string `json:"enabled_profile_kinds"`
+	Schema                     string                   `json:"schema"`
+	StrongAtomicVisibility     bool                     `json:"strong_atomic_visibility"`
+	CrashDurability            string                   `json:"crash_durability"`
+	CapabilityError            string                   `json:"capability_error,omitempty"`
+	RetentionRuns              int                      `json:"retention_runs"`
+	RetentionBytes             uint64                   `json:"retention_bytes"`
+	ProfileCaptureMaxBytes     uint64                   `json:"profile_capture_max_bytes"`
+	CaptureSidecarMaxBytes     uint64                   `json:"capture_sidecar_max_bytes"`
+	CPUCoverageMaxBytes        uint64                   `json:"cpu_coverage_max_bytes"`
+	CPULabelDictionaryMaxBytes uint64                   `json:"cpu_label_dictionary_max_bytes"`
+	ExpectedProfileFilesPerRun uint64                   `json:"expected_profile_files_per_run"`
+	SnapshotArtifactMaxPerRun  uint64                   `json:"snapshot_artifact_max_bytes_per_run"`
+	PerRunCeilingBytes         uint64                   `json:"per_run_ceiling_bytes"`
+	ProfileUsageKnown          bool                     `json:"profile_usage_known"`
+	ProfileUsageBytes          uint64                   `json:"profile_usage_bytes,omitempty"`
+	DataDirAvailableKnown      bool                     `json:"data_dir_available_known"`
+	DataDirAvailableBytes      uint64                   `json:"data_dir_available_bytes,omitempty"`
+	CurrentGeneration          int64                    `json:"current_generation"`
+	EnabledProfileKinds        []string                 `json:"enabled_profile_kinds"`
+	RuntimeProfileSemantics    []RuntimeProfileSemantic `json:"runtime_profile_semantics"`
 }
 
 func (h *handler) profileAnalysisCapabilities(writer http.ResponseWriter, request *http.Request) {
@@ -58,6 +59,7 @@ func (h *handler) profileAnalysisCapabilities(writer http.ResponseWriter, reques
 		CPUCoverageMaxBytes: cpuCoverageMaxBytes, CPULabelDictionaryMaxBytes: cpuLabelDictionaryMaxBytes,
 		ExpectedProfileFilesPerRun: expected, SnapshotArtifactMaxPerRun: 2 * maxSnapshotBytes,
 		CurrentGeneration: h.gen.Load(), EnabledProfileKinds: kinds,
+		RuntimeProfileSemantics: RuntimeProfileSemantics(),
 	}
 	capabilities.PerRunCeilingBytes, _ = profileAnalysisPerRunCeiling(expected, h.p.CPUProfileMode == "run")
 	if h.p.DataDir == "" {
