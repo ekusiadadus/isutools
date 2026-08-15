@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ekusiadadus/isutools/httpstats"
 	writercap "github.com/ekusiadadus/isutools/internal/httpwriter"
@@ -63,6 +64,25 @@ type Adapter struct {
 // registered route template after the application handler completes.
 type Observer interface {
 	Observe(session, scenario, method, route string)
+}
+
+// Observation is the richer, still secret-free flow event available to
+// observers that want latency and status overlays. At is the request start;
+// Session is already an HMAC pseudonym and Route is a registered template.
+type Observation struct {
+	Session  string
+	Scenario string
+	Method   string
+	Route    string
+	Status   int
+	Duration time.Duration
+	At       time.Time
+}
+
+// DetailedObserver is optional so existing Observer implementations remain
+// source compatible. Middleware calls exactly one of ObserveRequest/Observe.
+type DetailedObserver interface {
+	ObserveRequest(Observation)
 }
 
 // WithObserver returns a shallow copy with one run-aligned flow sink.
@@ -168,6 +188,12 @@ func (a *Adapter) Middleware(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Time{}
+		if a != nil && a.observer != nil {
+			if _, ok := a.observer.(DetailedObserver); ok {
+				started = time.Now()
+			}
+		}
 		trustedSession := r.Header.Get(TrustedSessionHeaderName)
 		trustedScenario := r.Header.Get(TrustedScenarioHeaderName)
 		r.Header.Del(HeaderName)
@@ -198,8 +224,17 @@ func (a *Adapter) Middleware(next http.Handler) http.Handler {
 		writer := &trustedWriter{ResponseWriter: w, label: label, scenario: state}
 		defer writer.commit()
 		next.ServeHTTP(preserveOptionalInterfaces(writer), r)
+		writer.commit()
 		if a != nil && a.observer != nil && label != "" {
-			observeSafely(a.observer, label, state.get(), r.Method, httpstats.RoutePattern(r))
+			observation := Observation{
+				Session: label, Scenario: state.get(), Method: r.Method, Route: httpstats.RoutePattern(r),
+				Status: writer.status, Duration: time.Since(started), At: started,
+			}
+			if detailed, ok := a.observer.(DetailedObserver); ok {
+				observeDetailedSafely(detailed, observation)
+			} else {
+				observeSafely(a.observer, observation.Session, observation.Scenario, observation.Method, observation.Route)
+			}
 		}
 	})
 }
@@ -207,6 +242,11 @@ func (a *Adapter) Middleware(next http.Handler) http.Handler {
 func observeSafely(observer Observer, session, scenario, method, route string) {
 	defer func() { _ = recover() }()
 	observer.Observe(session, scenario, method, route)
+}
+
+func observeDetailedSafely(observer DetailedObserver, observation Observation) {
+	defer func() { _ = recover() }()
+	observer.ObserveRequest(observation)
 }
 
 // SetScenario assigns a bounded, non-secret scenario to the current request.
@@ -296,6 +336,7 @@ type trustedWriter struct {
 	label    string
 	scenario *scenarioState
 	wrote    bool
+	status   int
 }
 
 func (w *trustedWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -305,6 +346,9 @@ func (w *trustedWriter) commit() {
 		return
 	}
 	w.wrote = true
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
 	w.apply()
 }
 
@@ -327,6 +371,7 @@ func (w *trustedWriter) WriteHeader(status int) {
 		w.ResponseWriter.WriteHeader(status)
 		return
 	}
+	w.status = status
 	w.commit()
 	w.ResponseWriter.WriteHeader(status)
 }

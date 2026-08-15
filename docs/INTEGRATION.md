@@ -202,10 +202,34 @@ r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 1 journeyは32 step、追跡sessionと共有page辞書は各10,000件に制限され、超過は
 health/partialに残ります。同一page文字列はsession間で共有し、追跡メモリを抑えます。
 
-これは明示ラベル別の「実際に通ったflow」の最小実装です。URLからlogin/purchase等を
-勝手に推測せず、必須stepや順序、conversion/drop-offを定義するGA4風funnel DSLは
-まだ実装しません。最初は例えば`anonymous_browse`、`login_and_browse`、`author_post`を
-別ラベルにし、k6のiterationごとに別の疑似`sess`を付けて比較してください。
+これは明示ラベル別の「実際に通ったflow」の基盤です。`ISUTOOLS_FLOW_VIZ=on`と
+`ISUTOOLS_FUNNEL_CONFIG`を設定すると、URLからlogin/purchase等を推測せず、operatorが定義した
+順序付きstepについてsession到達数、前step/開始からのconversion、drop-off、retry、request p95、
+4xx/5xxを集計します。User Flowは循環を保持する有向graphとtransition heatmapでも表示され、
+保存run間diffはconversion percentage-pointと遷移countの差を表示します。
+
+```yaml
+version: 1
+funnels:
+  - id: checkout
+    scenario: buyer
+    mode: ordered
+    within: 2m
+    steps:
+      - {id: cart, route: "GET /cart"}
+      - {id: purchase, route: "POST /checkout"}
+      - {id: complete, route: "GET /checkout/complete"}
+```
+
+`ordered`はstep間の別routeを許容しますが、後段を先に通っても到達とは数えません。同一stepの
+再訪はsession conversionではなくretryです。`within`は最初のstepから最後のstepまでの上限です。
+middlewareはrequest開始時刻を提供します。現在のproxy log契約にはwall-clock timestampがないため、
+`ISUTOOLS_FLOW_SOURCE=proxy`で`within`を使うとtiming missingとしてpartialになります。
+
+設定ファイルは64 KiB以下のsingle-link regular file、最大16 funnel、各2〜16 stepです。
+routeはqueryのない登録済み`METHOD /template`と完全一致し、同一funnelの重複routeを拒否します。
+YAML alias/anchor、unknown field、symlink/hardlink、未知modeはfail closedです。詳細は
+[Flow Visualization](./FLOW_VISUALIZATION.md)と[JSON Schema](./schemas/flow-funnels-v1.schema.json)を参照してください。
 
 `ISUTOOLS_FLOW_SOURCE=proxy`を使う場合だけ、`/posts/123`のような動的IDをnginx `map`または
 `ISUTOOLS_ACCESS_LOG_PATH_RULES`で`/posts/*`へ正規化します。middleware方式はframework adapterが

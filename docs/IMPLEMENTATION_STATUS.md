@@ -11,6 +11,19 @@ and v1.4.0 contains PR #18.
 The existing v1.2 sections below remain historical evidence; their numbers are
 not silently reused for the current working tree.
 
+## Unreleased bounded journey visualization
+
+The current tree turns the existing pseudonymous flow/story data into decision-oriented, self-contained views:
+
+- a versioned YAML/JSON ordered-funnel contract with exact route-template matching, optional 24-hour-bounded window, 16-funnel / 16-step / 10,000-session caps, and fail-closed regular-file parsing
+- per-step session conversion, previous/start conversion, drop-off, retry, request p95, 4xx, and 5xx without storing session IDs or individual histories in snapshots
+- a deterministic directed graph that preserves cycles, a transition heatmap, explicit `(other)` truncation, and 16/48 default versus 32/128 hard node/edge limits
+- saved-run diff rows for funnel percentage-point changes and workload-shape transition deltas; neither is presented as a causal performance result
+- optional detailed middleware observation that remains backward compatible with the original observer interface and adds status, duration, and request-start time
+- `ISUTOOLS_FLOW_VIZ=on|off|auto`, `ISUTOOLS_FUNNEL_CONFIG`, `ISUTOOLS_FLOW_MAX_NODES`, and `ISUTOOLS_FLOW_MAX_EDGES`; all views are inline HTML/SVG with no CDN dependency
+
+Focused package, middleware, proxy collector, source-selection, HTML, graph, heatmap, health, and run-diff tests pass. The remote ISUCON13 app also passed its Go 1.24 tests and two official benchmarks. The second run saved a `pass=true` / score `450394` report with ready funnel and graph data; score is not treated as a causal performance result. See the [`ISUCON13 Journey Visualization field record`](./isucon13-flow-visualization-verification-20260815.md).
+
 ## Unreleased v1.6 compatibility candidate
 
 Issue #45 audited every public ISUCON 1–14 problem repository. This working

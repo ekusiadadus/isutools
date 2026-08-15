@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/ekusiadadus/isutools/dbpool"
+	"github.com/ekusiadadus/isutools/flowstats"
+	"github.com/ekusiadadus/isutools/flowviz"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/procstats"
@@ -179,6 +181,39 @@ func TestDiffComparesTwoRuns(t *testing.T) {
 	// "SELECT fixed" disappeared in b: its delta (-9000ms) must be shown.
 	if !strings.Contains(body, "-9000.0") {
 		t.Errorf("expected resolved-query negative delta in body")
+	}
+}
+
+func TestDiffComparesFunnelConversionAndFlowEdges(t *testing.T) {
+	dir := t.TempDir()
+	write := func(base string, entered, completed, edge int64) {
+		t.Helper()
+		snapshot := Snapshot{Meta: Meta{Score: "1"}, FlowSource: "middleware", Flow: &flowstats.Snapshot{Visualization: &flowviz.Snapshot{
+			Status: flowviz.StatusReady,
+			Funnels: []flowviz.FunnelSnapshot{{
+				ID: "checkout", Entered: entered, Completed: completed,
+				Steps: []flowviz.FunnelStepSnapshot{{ID: "start", Sessions: entered, FromStartBP: 10000}, {ID: "done", Sessions: completed, FromStartBP: completed * 10000 / entered}},
+			}},
+			Graph: flowviz.GraphSnapshot{Edges: []flowviz.GraphEdge{{From: "GET /cart", To: "POST /checkout", Count: edge}}},
+		}}}
+		body, err := json.Marshal(snapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeRunJSON(t, dir, base, string(body))
+	}
+	write("20260815-010000_gen1_a_score1", 10, 4, 8)
+	write("20260815-020000_gen2_b_score1", 10, 7, 3)
+	h := NewHandler(Provider{SQL: agg.NewTable(agg.DefaultMaxKeys), DataDir: dir})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/diff?a=20260815-010000&b=20260815-020000", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"Funnel conversion", "checkout / done", "+30.00", "Flow transitions", "GET /cart", "POST /checkout", "-5"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("flow diff missing %q", want)
+		}
 	}
 }
 

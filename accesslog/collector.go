@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/ekusiadadus/isutools/flowviz"
 )
 
 const (
@@ -103,8 +105,18 @@ func WithMaxCollectBytes(n int64) Option {
 func WithMaxKeys(n int) Option {
 	return func(c *Collector) {
 		if n > 0 {
-			c.agg = NewAggregator(n)
+			c.maxKeys = n
+			c.rebuildAggregator()
 		}
+	}
+}
+
+// WithFlowVisualization enables bounded funnel and transition graph output.
+// It is order-independent with WithMaxKeys.
+func WithFlowVisualization(options flowviz.Options) Option {
+	return func(c *Collector) {
+		c.flowVisualization = options
+		c.rebuildAggregator()
 	}
 }
 
@@ -157,16 +169,19 @@ func WithFormatSpec(spec string) Option {
 type Collector struct {
 	mu sync.Mutex
 
-	path            string
-	fs              FileSystem
-	sameFile        func(fs.FileInfo, fs.FileInfo) bool
-	maxLineBytes    int
-	maxCollectBytes int64
-	agg             *Aggregator
-	pathRules       *PathRules
-	pathRulesError  string
-	format          Format
-	formatError     string
+	path                   string
+	fs                     FileSystem
+	sameFile               func(fs.FileInfo, fs.FileInfo) bool
+	maxLineBytes           int
+	maxCollectBytes        int64
+	maxKeys                int
+	agg                    *Aggregator
+	flowVisualization      flowviz.Options
+	flowVisualizationError string
+	pathRules              *PathRules
+	pathRulesError         string
+	format                 Format
+	formatError            string
 
 	file     File
 	offset   int64
@@ -186,7 +201,7 @@ func New(path string, opts ...Option) *Collector {
 	c := &Collector{
 		path: path, fs: osFileSystem{}, sameFile: os.SameFile,
 		maxLineBytes: defaultMaxLineBytes, maxCollectBytes: defaultMaxCollectBytes,
-		agg: NewAggregator(DefaultMaxKeys), format: FormatAuto,
+		maxKeys: DefaultMaxKeys, agg: NewAggregator(DefaultMaxKeys), format: FormatAuto,
 		health: Health{Status: StatusOK},
 	}
 	for _, opt := range opts {
@@ -198,12 +213,26 @@ func New(path string, opts ...Option) *Collector {
 	if c.formatError != "" {
 		c.recordPartialLocked(c.formatError)
 	}
+	if c.flowVisualizationError != "" {
+		c.recordPartialLocked(c.flowVisualizationError)
+	}
 	c.mu.Lock()
 	if err := c.openLocked(true); err != nil {
 		c.recordErrorLocked(err)
 	}
 	c.mu.Unlock()
 	return c
+}
+
+func (c *Collector) rebuildAggregator() {
+	agg, err := NewAggregatorWithFlowVisualization(c.maxKeys, c.flowVisualization)
+	if err != nil {
+		c.agg = NewAggregator(c.maxKeys)
+		c.flowVisualizationError = "invalid-flow-visualization"
+		return
+	}
+	c.agg = agg
+	c.flowVisualizationError = ""
 }
 
 // Collect consumes all currently available complete lines. It returns only I/O

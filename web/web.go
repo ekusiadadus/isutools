@@ -28,6 +28,7 @@ import (
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
 	"github.com/ekusiadadus/isutools/flowstats"
+	"github.com/ekusiadadus/isutools/flowviz"
 	"github.com/ekusiadadus/isutools/hoststats"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -542,6 +543,74 @@ func (s Snapshot) UserFlows() []accesslog.FlowEntry {
 		return s.AccessLog.Flows
 	}
 	return nil
+}
+
+// FlowVisualization follows the same single-source contract as UserFlows.
+// It never combines middleware and proxy observations from one request.
+func (s Snapshot) FlowVisualization() *flowviz.Snapshot {
+	switch s.FlowSource {
+	case "middleware":
+		if s.Flow != nil {
+			return s.Flow.Visualization
+		}
+		return nil
+	case "proxy":
+		if s.AccessLog != nil {
+			return s.AccessLog.Visualization
+		}
+		return nil
+	case "off":
+		return nil
+	}
+	if s.FlowSource != "" && s.FlowSource != "auto" {
+		return nil
+	}
+	if middlewareFlowObserved(s.Flow) {
+		return s.Flow.Visualization
+	}
+	if proxyFlowObserved(s.AccessLog) {
+		return s.AccessLog.Visualization
+	}
+	// With no observations from either source, keep showing configured funnel
+	// definitions. Auto still prefers middleware for this empty state.
+	if s.Flow != nil && s.Flow.Visualization != nil {
+		return s.Flow.Visualization
+	}
+	if s.AccessLog != nil {
+		return s.AccessLog.Visualization
+	}
+	return nil
+}
+
+func middlewareFlowObserved(value *flowstats.Snapshot) bool {
+	return value != nil && (len(value.Stories) > 0 || value.StoryDropped > 0 || len(value.Flows) > 0 || value.FlowDropped > 0 ||
+		flowVisualizationObserved(value.Visualization))
+}
+
+func proxyFlowObserved(value *accesslog.Snapshot) bool {
+	return value != nil && (len(value.Stories) > 0 || value.StoryDropped > 0 || len(value.Flows) > 0 || value.FlowDropped > 0 ||
+		flowVisualizationObserved(value.Visualization))
+}
+
+func flowVisualizationObserved(value *flowviz.Snapshot) bool {
+	if value == nil {
+		return false
+	}
+	if value.SessionDropped > 0 || value.TimingMissing > 0 || value.Graph.InputEdges > 0 || value.Graph.Dropped > 0 ||
+		len(value.Graph.Nodes) > 0 || len(value.Graph.Edges) > 0 {
+		return true
+	}
+	for _, funnel := range value.Funnels {
+		if funnel.Entered > 0 || funnel.Completed > 0 || funnel.Expired > 0 {
+			return true
+		}
+		for _, step := range funnel.Steps {
+			if step.Sessions > 0 || step.Requests > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // applyRunSections copies a completed run's baseline collector sections into
@@ -1061,11 +1130,47 @@ func (h *handler) take() Snapshot {
 	// live collectors were rotated past it the moment its boundary was taken.
 	applyRunIntervalSections(&snap, sections)
 	applyFlowSource(&snap)
+	applyFlowVisualizationHealth(&snap)
 	h.applyProtocolAdvice(&snap)
 	h.applyQUICTelemetry(&snap)
 	h.applyCacheTelemetry(&snap)
 	applyQueryPlanAdvice(&snap)
 	return snap
+}
+
+func applyFlowVisualizationHealth(snapshot *Snapshot) {
+	if snapshot == nil {
+		return
+	}
+	visualization := snapshot.FlowVisualization()
+	if visualization == nil || !visualization.Partial {
+		return
+	}
+	messages := make([]string, 0, 3)
+	if visualization.SessionDropped > 0 {
+		messages = append(messages, fmt.Sprintf("session limit exceeded; %d funnel sessions were skipped", visualization.SessionDropped))
+	}
+	if visualization.TimingMissing > 0 {
+		messages = append(messages, fmt.Sprintf("timing metadata missing for %d events; configured windows are partial", visualization.TimingMissing))
+	}
+	if visualization.Graph.Partial {
+		messages = append(messages, "invalid or oversized graph transitions were dropped")
+	}
+	if len(messages) == 0 {
+		messages = append(messages, "flow visualization is partial")
+	}
+	snapshot.Meta.Partial = true
+	mergeHealth(&snapshot.Meta, health.Entry{
+		Collector: "flow-viz", Status: health.StatusDegraded,
+		Message: strings.Join(messages, "; "), Dropped: uint64(maxInt64(visualization.SessionDropped, 0)),
+	})
+}
+
+func maxInt64(value, minimum int64) int64 {
+	if value < minimum {
+		return minimum
+	}
+	return value
 }
 
 func applyFlowSource(snap *Snapshot) {
@@ -1080,10 +1185,15 @@ func applyFlowSource(snap *Snapshot) {
 		snap.AccessLog.StoryDropped = 0
 		snap.AccessLog.Flows = nil
 		snap.AccessLog.FlowDropped = 0
+		snap.AccessLog.Visualization = nil
 	}
 	switch snap.FlowSource {
 	case "auto":
-		if snap.Flow != nil && (len(snap.Flow.Stories) > 0 || snap.Flow.StoryDropped > 0 || len(snap.Flow.Flows) > 0 || snap.Flow.FlowDropped > 0) {
+		if middlewareFlowObserved(snap.Flow) {
+			clearProxy()
+		} else if proxyFlowObserved(snap.AccessLog) {
+			snap.Flow = nil
+		} else {
 			clearProxy()
 		}
 	case "middleware":

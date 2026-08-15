@@ -32,7 +32,8 @@ header spoof防止、公式ベンチ、同一binary ABBAまで確認していま
 - `nginx-isutools.conf`: isutoolsが解釈する専用LTSV access log
 - `isupipe-go.isutools.conf`: loopback管理port、永続化・CPU profile、access-log URI丸め設定
 - `isupipe-go.manual-pprof.conf`: manual profile確認時だけ使う一時override
-- `isupipe-go.flow-on.conf`: HMAC疑似sessionと明示scenarioを有効化する独立drop-in
+- `isupipe-go.flow-on.conf`: HMAC疑似session、明示scenario、funnel/graph/heatmapを有効化する独立drop-in
+- `funnels.isutools.yaml`: ISUCON13 route templateだけを使うboundedなfunnel定義
 - `isupipe-go.flow-off.conf`: User Flow / Scenario Storiesだけを即時停止する確認用override
 - `flow-abba-restart.sh` / `flow-abba-bench.py`: 同一binaryでflow labelだけを比較するABBA helper
 - `isupipe-go.off.conf`: 環境変数だけで全計測を止める確認用override
@@ -113,6 +114,10 @@ sudo install -o root -g root -m 0644 \
 sudo install -o root -g root -m 0644 \
   /home/isucon/isutools-example/isupipe-go.flow-on.conf \
   /etc/systemd/system/isupipe-go.service.d/flow-labels.conf
+sudo install -d -o root -g isucon -m 0750 /home/isucon/isutools-config
+sudo install -o root -g isucon -m 0640 \
+  /home/isucon/isutools-example/funnels.isutools.yaml \
+  /home/isucon/isutools-config/funnels.yaml
 sudo install -d -o root -g root -m 0750 /etc/isutools
 if ! sudo test -e /etc/isutools/flow-label.env; then
   flow_key=$(openssl rand -hex 32)
@@ -131,6 +136,9 @@ sudo systemctl restart nginx isupipe-go
 `isutools.HTTP`は`SESSIONID`をHMAC疑似IDへ変換し、`isucon13_official` scenarioとともに
 nginxへ返します。nginxはupstream responseだけをログへ書き、public headerを削除します。
 HMAC keyはroot所有0600の別ファイルへ置き、設定表示・git・結果artifactへ出しません。
+ファネル設定はHMAC秘密とは別の`root:isucon 0640` regular fileとして置き、Journey Funnel、循環可能なUser Flow
+Graph、Transition Heatmap、保存run間のconversion/transition diffを有効にします。次回再起動から
+可視化を止めるには`ISUTOOLS_FLOW_VIZ=off`、flow label自体も止める場合は`ISUTOOLS_FLOW_LABELS=off`です。
 
 `ISUTOOLS_ACCESS_LOG_PATH_RULES`は、nginx LTSVの`/api/user/<username>`と
 `/api/livestream/<id>`をEchoと同じ定数templateへ丸めます。ruleは上からfull-matchで評価されるため、

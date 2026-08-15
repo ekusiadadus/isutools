@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ekusiadadus/isutools/accesslog"
+	"github.com/ekusiadadus/isutools/flowviz"
 )
 
 func TestSystemdAccessLogPathRulesMatchISUCON13Routes(t *testing.T) {
@@ -41,6 +42,28 @@ func TestSystemdAccessLogPathRulesMatchISUCON13Routes(t *testing.T) {
 		if got := rules.Normalize(input); got != want {
 			t.Errorf("Normalize(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestFlowVisualizationDropInAndFunnelConfig(t *testing.T) {
+	body, err := os.ReadFile("isupipe-go.flow-on.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Environment=ISUTOOLS_FLOW_VIZ=on",
+		"Environment=ISUTOOLS_FUNNEL_CONFIG=/home/isucon/isutools-config/funnels.yaml",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("flow-on drop-in missing %q", want)
+		}
+	}
+	config, err := flowviz.LoadConfig("funnels.isutools.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Funnels) != 2 {
+		t.Fatalf("funnels = %#v", config.Funnels)
 	}
 }
 

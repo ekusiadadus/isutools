@@ -1,0 +1,23 @@
+version: 1
+funnels:
+  - id: livestream_reservation
+    scenario: isucon13_official
+    mode: ordered
+    within: 2m
+    steps:
+      - id: icon
+        route: "POST /api/icon"
+      - id: tags
+        route: "GET /api/tag"
+      - id: reserve
+        route: "POST /api/livestream/reservation"
+
+  - id: reaction_post
+    scenario: isucon13_official
+    mode: ordered
+    within: 30s
+    steps:
+      - id: read
+        route: "GET /api/livestream/:livestream_id/reaction"
+      - id: post
+        route: "POST /api/livestream/:livestream_id/reaction"

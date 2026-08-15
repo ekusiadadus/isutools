@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ekusiadadus/isutools/flowviz"
 )
 
 const (
@@ -66,15 +68,16 @@ type Entry struct {
 
 // Snapshot is an immutable copy of one access-log generation.
 type Snapshot struct {
-	Entries      []Entry         `json:"entries"`
-	Protocols    []ProtocolEntry `json:"protocols,omitempty"`
-	Stories      []StoryEntry    `json:"stories,omitempty"`
-	StoryDropped int64           `json:"story_dropped,omitempty"`
-	Flows        []FlowEntry     `json:"flows,omitempty"`
-	FlowDropped  int64           `json:"flow_dropped,omitempty"`
-	Lines        int64           `json:"lines"`
-	PartialLines int64           `json:"partial_lines"`
-	Health       Health          `json:"health"`
+	Entries       []Entry           `json:"entries"`
+	Protocols     []ProtocolEntry   `json:"protocols,omitempty"`
+	Stories       []StoryEntry      `json:"stories,omitempty"`
+	StoryDropped  int64             `json:"story_dropped,omitempty"`
+	Flows         []FlowEntry       `json:"flows,omitempty"`
+	FlowDropped   int64             `json:"flow_dropped,omitempty"`
+	Visualization *flowviz.Snapshot `json:"visualization,omitempty"`
+	Lines         int64             `json:"lines"`
+	PartialLines  int64             `json:"partial_lines"`
+	Health        Health            `json:"health"`
 }
 
 // FlowEntry is one observed session transition (previous request -> next).
@@ -156,13 +159,29 @@ type Aggregator struct {
 	storySessions map[string]*storySession
 	storyPages    map[string]string
 	storyDropped  int64
+	visualization *flowviz.Aggregator
 }
 
 // NewAggregator returns an empty table. A non-positive maxKeys selects the
 // default bound.
 func NewAggregator(maxKeys int) *Aggregator {
+	agg, _ := newAggregator(maxKeys, flowviz.Options{})
+	return agg
+}
+
+// NewAggregatorWithFlowVisualization enables bounded funnel and graph output
+// without changing the legacy constructor's zero-overhead behavior.
+func NewAggregatorWithFlowVisualization(maxKeys int, options flowviz.Options) (*Aggregator, error) {
+	return newAggregator(maxKeys, options)
+}
+
+func newAggregator(maxKeys int, options flowviz.Options) (*Aggregator, error) {
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
+	}
+	visualization, err := flowviz.New(options)
+	if err != nil {
+		return nil, err
 	}
 	return &Aggregator{
 		maxKeys:       maxKeys,
@@ -172,7 +191,8 @@ func NewAggregator(maxKeys int) *Aggregator {
 		flows:         make(map[string]int64),
 		storySessions: make(map[string]*storySession),
 		storyPages:    make(map[string]string),
-	}
+		visualization: visualization,
+	}, nil
 }
 
 // Observe adds a parsed record.
@@ -182,6 +202,12 @@ func (a *Aggregator) Observe(rec Record) {
 	a.lines++
 	a.observeProtocol(rec)
 	a.observeStory(rec)
+	if a.visualization != nil && a.visualization.Enabled() {
+		a.visualization.Observe(flowviz.Event{
+			Session: rec.Session, Scenario: rec.Scenario, Method: rec.Method, Route: rec.URI,
+			Status: rec.Status, Latency: rec.RequestTime, At: rec.ObservedAt,
+		})
+	}
 	if rec.Partial {
 		a.partialLines++
 	}
@@ -192,7 +218,7 @@ func (a *Aggregator) Observe(rec Record) {
 		} else {
 			a.flowDropped++
 		}
-		if prev, ok := a.lastBySess[rec.Session]; ok && prev != page {
+		if prev, ok := a.lastBySess[rec.Session]; ok {
 			key := prev + "\x00" + page
 			if _, exists := a.flows[key]; !exists && len(a.flows) >= maxFlowTransitions {
 				key = flowOverflowKey
@@ -391,9 +417,11 @@ func (a *Aggregator) Snapshot() Snapshot {
 		}
 		return result.Protocols[i].Protocol < result.Protocols[j].Protocol
 	})
+	allFlows := make([]flowviz.Transition, 0, len(a.flows))
 	for key, count := range a.flows {
 		from, to, _ := strings.Cut(key, "\x00")
 		result.Flows = append(result.Flows, FlowEntry{From: from, To: to, Count: count})
+		allFlows = append(allFlows, flowviz.Transition{From: from, To: to, Count: count})
 	}
 	sort.Slice(result.Flows, func(i, j int) bool {
 		if result.Flows[i].Count != result.Flows[j].Count {
@@ -403,6 +431,10 @@ func (a *Aggregator) Snapshot() Snapshot {
 	})
 	if len(result.Flows) > 20 {
 		result.Flows = result.Flows[:20]
+	}
+	if a.visualization != nil && a.visualization.Enabled() {
+		visualization := a.visualization.Snapshot(allFlows)
+		result.Visualization = &visualization
 	}
 	for _, st := range a.stats {
 		e := Entry{
@@ -447,6 +479,9 @@ func (a *Aggregator) Reset() {
 	a.storySessions = make(map[string]*storySession)
 	a.storyPages = make(map[string]string)
 	a.storyDropped = 0
+	if a.visualization != nil {
+		a.visualization.Reset()
+	}
 	a.mu.Unlock()
 }
 

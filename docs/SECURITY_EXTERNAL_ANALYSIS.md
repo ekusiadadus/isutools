@@ -27,6 +27,7 @@ Pseudonymous bounded session IDs, normalized routes, hashed query classes, aggre
 | runtime trace | default 64 MiB, hard 256 MiB | one active process-wide owner | default 5 s, hard 30 s, 16 MiB free reserve | raw file removed unless sidecar publication completes |
 | external envelope | 2 MiB manifest, 32 refs | 64 diagnostics, 8 extensions / 64 KiB each | 10 min and 4 GiB representable ceilings | strict invalid/unsupported |
 | PGO candidate | 64 MiB CPU profile, 256 KiB manifest | one main package, clean source revision | new 0700 directory; files 0600; no overwrite | no ready marker |
+| journey visualization | 64 KiB YAML/JSON config | 16 funnels, 16 steps each, 10,000 session states; graph default 16/48 and hard 32/128 nodes/edges | fixed-size latency histograms; no raw session history in snapshots | disabled/partial with stable reason |
 
 ## Process and filesystem controls
 
@@ -36,6 +37,7 @@ Pseudonymous bounded session IDs, normalized routes, hashed query classes, aggre
 - CPU profiling, execution trace, and manual CPU/trace endpoints share one process-wide owner. Conflicts return HTTP 409 `profiler-busy`.
 - `ISUTOOLS=off` does not apply runtime rates, start trace/profile goroutines, write artifacts, or wrap request handlers. Explicit offline CLIs remain available because they do not mutate the target process.
 - Runtime diagnostic features and MySQL slow logging default off. Diagnostic runs are not score-adoption runs.
+- Funnel configuration is opened as a single-link regular file with no symlink following. Unknown fields, YAML aliases/anchors, duplicate IDs/routes, queries in route templates, and unknown modes are rejected. Visualization receives only HMAC pseudonyms and registered route templates; persisted output contains aggregate counts, never session IDs.
 
 ## Regression gates
 

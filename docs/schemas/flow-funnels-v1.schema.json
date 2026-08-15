@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ekusiadadus/isutools/blob/main/docs/schemas/flow-funnels-v1.schema.json",
+  "title": "isutools flow funnel configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "funnels"],
+  "properties": {
+    "version": {"const": 1},
+    "funnels": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {"$ref": "#/$defs/funnel"}
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._~-]{1,64}$"
+    },
+    "funnel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "scenario", "mode", "steps"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "scenario": {"$ref": "#/$defs/identifier"},
+        "mode": {"const": "ordered"},
+        "within": {"type": "string", "minLength": 1, "maxLength": 32, "description": "Go duration syntax, greater than zero and at most 24h; 0 disables the window"},
+        "steps": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/step"}
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "route"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "route": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^[A-Z]{1,16} /[^\\s?#]{0,495}$"
+        }
+      }
+    }
+  }
+}
