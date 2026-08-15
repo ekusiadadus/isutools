@@ -50,6 +50,7 @@ attach自体は監査可能な`partial`として残るが、完全なrun区間�
 
 ```bash
 isutools analyze mysql-slowlog --file run.slow.log --pt-query-digest \
+  --max-query-bytes 8388608 \
   --coverage \
   --start-device DEV --start-inode INODE --start-offset START \
   --start-db-clock 2026-08-15T12:00:00+09:00 \
@@ -58,6 +59,8 @@ isutools analyze mysql-slowlog --file run.slow.log --pt-query-digest \
   --data-dir /var/lib/isutools --run-id RUN_ID \
   --snapshot-base SNAPSHOT_BASE --snapshot-sha256 SNAPSHOT_SHA --snapshot-schema 3
 ```
+
+巨大な複数行statementを意図して採る場合だけ`--max-query-bytes`を既定1 MiBから引き上げる（hard上限8 MiB）。一行の上限は`--max-line-bytes`（既定1 MiB、hard上限8 MiB）で別に制御する。
 
 portable JSONはfingerprint hash、count、query/lock time、rows、first/last、outlierだけを持つ。pt-query-digest textはrestrictedでWebへ公開しない。外部processは既定60秒、512 MiB address space、16 MiB outputでhard-limitし、`prlimit`が無いhostでは実行しない。Performance Schemaとslow-log classは証明できるkeyがない限り推測結合しない。
 

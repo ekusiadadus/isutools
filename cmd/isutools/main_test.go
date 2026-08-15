@@ -134,6 +134,17 @@ func TestRunAnalyzeSlowlogRequiresExactInputSpan(t *testing.T) {
 	}
 }
 
+func TestRunAnalyzeSlowlogAcceptsExplicitBoundedQueryLimit(t *testing.T) {
+	input := "# Query_time: 0.125 Lock_time: 0.010 Rows_sent: 1 Rows_examined: 42\nSELECT 1234567890;\n"
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{
+		"analyze", "mysql-slowlog", "--max-line-bytes", "1024", "--max-query-bytes", "1024",
+	}, strings.NewReader(input), &stdout, &stderr)
+	if code != 0 || !strings.Contains(stdout.String(), `"events": 1`) {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestRunAnalyzeSlowlogPublishesBoundArtifact(t *testing.T) {
 	input := `# Query_time: 0.125 Lock_time: 0.010 Rows_sent: 1 Rows_examined: 42
 SET timestamp=1786755600;

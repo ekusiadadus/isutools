@@ -33,6 +33,8 @@ func runMySQLSlowlog(ctx context.Context, args []string, stdin io.Reader, stdout
 		snapshotSHA    = flags.String("snapshot-sha256", "", "source snapshot sha256")
 		snapshotSchema = flags.Int("snapshot-schema", 0, "source snapshot schema version")
 		maxInput       = flags.Int64("max-input-bytes", slowlog.DefaultMaxInputBytes, "input byte limit")
+		maxLine        = flags.Int("max-line-bytes", slowlog.DefaultMaxLineBytes, "single line byte limit")
+		maxQuery       = flags.Int("max-query-bytes", slowlog.DefaultMaxQueryBytes, "single query event byte limit")
 		maxEvents      = flags.Int64("max-events", slowlog.DefaultMaxEvents, "event limit")
 		maxClasses     = flags.Int("max-classes", slowlog.DefaultMaxClasses, "query class limit")
 		ptqdTimeout    = flags.Duration("pt-query-digest-timeout", slowlog.DefaultPTQDTimeout, "external analyzer wall timeout")
@@ -107,7 +109,10 @@ func runMySQLSlowlog(ctx context.Context, args []string, stdin io.Reader, stdout
 			coverage.Reason = "input-span-mismatch"
 		}
 	}
-	report, err := slowlog.Parse(bytes.NewReader(body), slowlog.Options{MaxInputBytes: *maxInput, MaxEvents: *maxEvents, MaxClasses: *maxClasses, Coverage: coverage})
+	report, err := slowlog.Parse(bytes.NewReader(body), slowlog.Options{
+		MaxInputBytes: *maxInput, MaxLineBytes: *maxLine, MaxQueryBytes: *maxQuery,
+		MaxEvents: *maxEvents, MaxClasses: *maxClasses, Coverage: coverage,
+	})
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
