@@ -158,6 +158,17 @@ func TestSessionFlowAggregation(t *testing.T) {
 	}
 }
 
+func TestSessionFlowKeepsSelfTransitionsForPollingVisibility(t *testing.T) {
+	a := NewAggregator(0)
+	for i := 0; i < 3; i++ {
+		a.Observe(Record{Method: "GET", URI: "/api/poll", Status: 200, Session: "s1"})
+	}
+	snapshot := a.Snapshot()
+	if len(snapshot.Flows) != 1 || snapshot.Flows[0].From != "GET /api/poll" || snapshot.Flows[0].To != "GET /api/poll" || snapshot.Flows[0].Count != 2 {
+		t.Fatalf("self transitions = %#v", snapshot.Flows)
+	}
+}
+
 func TestSessionFieldParsedFromLTSVAndJSON(t *testing.T) {
 	rec, err := ParseNginxLTSV("method:GET\turi:/\tstatus:200\treqtime:0.1\tupstime:-\tbytes:0\tcache:\tctype:\tsess:abc123\tscenario:login_and_browse")
 	if err != nil {

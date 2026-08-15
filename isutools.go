@@ -44,6 +44,7 @@ import (
 	"github.com/ekusiadadus/isutools/dbinspect"
 	"github.com/ekusiadadus/isutools/dbpool"
 	"github.com/ekusiadadus/isutools/flowstats"
+	"github.com/ekusiadadus/isutools/flowviz"
 	"github.com/ekusiadadus/isutools/hoststats"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -66,10 +67,13 @@ import (
 const defaultAdminAddr = "127.0.0.1:19191"
 
 var (
-	adminOnce       sync.Once
-	adminMu         sync.Mutex
-	adminBind       string
-	collectorHealth = health.NewRegistry()
+	adminOnce                sync.Once
+	adminMu                  sync.Mutex
+	adminBind                string
+	collectorHealth          = health.NewRegistry()
+	flowVisualizationOnce    sync.Once
+	flowVisualizationOptions flowviz.Options
+	flowVisualizationReason  string
 )
 
 // Off reports the immutable process-start decision for ISUTOOLS. Accepted
@@ -85,6 +89,69 @@ const (
 	envNetStats = "ISUTOOLS_NETSTATS"
 	envDBPool   = "ISUTOOLS_DBPOOL"
 )
+
+func resolveFlowVisualizationOptions(getenv func(string) string) (flowviz.Options, string) {
+	if getenv == nil {
+		return flowviz.Options{}, "flow-viz-off"
+	}
+	mode := strings.ToLower(strings.TrimSpace(getenv(flowviz.EnvMode)))
+	switch mode {
+	case "off", "0", "false", "no", "disabled":
+		return flowviz.Options{}, "flow-viz-off"
+	case "", "auto", "on", "1", "true", "yes", "enabled":
+	default:
+		return flowviz.Options{}, "invalid-mode"
+	}
+	options := flowviz.Options{Enabled: true}
+	parseLimit := func(name string, fallback, hard int) (int, bool) {
+		value := strings.TrimSpace(getenv(name))
+		if value == "" {
+			return fallback, true
+		}
+		parsed, err := strconv.Atoi(value)
+		return parsed, err == nil && parsed > 0 && parsed <= hard
+	}
+	var ok bool
+	if options.MaxNodes, ok = parseLimit(flowviz.EnvMaxNodes, flowviz.DefaultMaxNodes, flowviz.HardMaxNodes); !ok || options.MaxNodes < 2 {
+		return flowviz.Options{}, "invalid-limit"
+	}
+	if options.MaxEdges, ok = parseLimit(flowviz.EnvMaxEdges, flowviz.DefaultMaxEdges, flowviz.HardMaxEdges); !ok {
+		return flowviz.Options{}, "invalid-limit"
+	}
+	options.MaxSessions = flowviz.DefaultMaxSessions
+	path := strings.TrimSpace(getenv(flowviz.EnvConfig))
+	if path == "" {
+		options.Config = flowviz.Config{Version: flowviz.SchemaVersion}
+		return options, "graph-only"
+	}
+	config, err := flowviz.LoadConfig(path)
+	if err != nil {
+		return flowviz.Options{}, "invalid-funnel-config"
+	}
+	options.Config = config
+	return options, "funnel-configured"
+}
+
+func processFlowVisualization(getenv func(string) string) (flowviz.Options, string) {
+	flowVisualizationOnce.Do(func() {
+		flowVisualizationOptions, flowVisualizationReason = resolveFlowVisualizationOptions(getenv)
+		if flowVisualizationOptions.Enabled {
+			if err := flowstats.Default.Configure(flowVisualizationOptions); err != nil {
+				flowVisualizationOptions = flowviz.Options{}
+				flowVisualizationReason = "invalid-funnel-config"
+			}
+		}
+		switch flowVisualizationReason {
+		case "flow-viz-off":
+			collectorHealth.Set("flow-viz", health.StatusDisabled, flowVisualizationReason)
+		case "graph-only", "funnel-configured":
+			collectorHealth.Set("flow-viz", health.StatusOK, flowVisualizationReason)
+		default:
+			collectorHealth.Set("flow-viz", health.StatusDegraded, flowVisualizationReason)
+		}
+	})
+	return flowVisualizationOptions, flowVisualizationReason
+}
 
 // envDataDir names the directory snapshots and profile artifacts are published
 // into. Both the transport and the ResetNow capture path read it, and they have
@@ -1728,6 +1795,7 @@ func HTTP(next http.Handler) http.Handler {
 	if Off() {
 		return next
 	}
+	flowVisualization, _ := processFlowVisualization(os.Getenv)
 	pathRulesOnce.Do(func() {
 		spec := os.Getenv("ISUTOOLS_PATH_RULES")
 		if spec == "" {
@@ -1761,7 +1829,11 @@ func HTTP(next http.Handler) http.Handler {
 	flowLabels := sessionlabel.FromEnv(os.Getenv)
 	switch resolveFlowSource(os.Getenv) {
 	case "auto", "middleware":
-		flowLabels = flowLabels.WithObserver(flowstats.Default)
+		if flowVisualization.Enabled {
+			flowLabels = flowLabels.WithObserver(flowstats.Default)
+		} else {
+			flowLabels = flowLabels.WithObserver(legacyFlowObserver{registry: flowstats.Default})
+		}
 	case "proxy", "off":
 	default:
 		collectorHealth.Set("flow", health.StatusDegraded, "invalid-flow-source")
@@ -1779,6 +1851,14 @@ func HTTP(next http.Handler) http.Handler {
 	}
 	next = flowLabels.Middleware(next)
 	return httpstats.Middleware(next)
+}
+
+type legacyFlowObserver struct{ registry *flowstats.Registry }
+
+func (o legacyFlowObserver) Observe(session, scenario, method, route string) {
+	if o.registry != nil {
+		o.registry.Observe(session, scenario, method, route)
+	}
 }
 
 func resolveFlowSource(getenv func(string) string) string {
@@ -1848,6 +1928,7 @@ func Handler() http.Handler {
 	if Off() {
 		return http.NotFoundHandler()
 	}
+	flowVisualization, _ := processFlowVisualization(os.Getenv)
 	core := defaultMeasurement()
 	sqlCommentPolicy, sqlCommentReason := sqlstats.ResolveCommentTagPolicy(os.Getenv)
 	if sqlCommentReason == "invalid-value" {
@@ -1934,6 +2015,7 @@ func Handler() http.Handler {
 		collector := accesslog.New(path,
 			accesslog.WithFormatSpec(os.Getenv(envAccessLogFormat)),
 			accesslog.WithPathRulesSpec(os.Getenv(envAccessLogPathRules), unmatched),
+			accesslog.WithFlowVisualization(flowVisualization),
 		)
 		provider.AccessLog = collector
 		provider.AccessLogGenerationManaged = core.watchAccessLogGeneration(collector)

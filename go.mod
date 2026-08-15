@@ -7,6 +7,7 @@ require (
 	github.com/google/pprof v0.0.0-20260709232956-b9395ee17fa0
 	github.com/shogo82148/go-sql-proxy v0.7.3
 	golang.org/x/sys v0.41.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require filippo.io/edwards25519 v1.1.0 // indirect

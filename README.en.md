@@ -73,6 +73,8 @@ export ISUTOOLS_SESSION_COOKIE=SESSIONID
 export ISUTOOLS_SESSION_HMAC_KEY='random-32-byte-or-longer-secret-not-in-git'
 export ISUTOOLS_SCENARIO=isucon13_official
 export ISUTOOLS_FLOW_SOURCE=middleware
+export ISUTOOLS_FLOW_VIZ=on
+export ISUTOOLS_FUNNEL_CONFIG=/etc/isutools/funnels.yaml
 ```
 
 Adapters cover every framework used by a published ISUCON Go reference app: Gorilla mux, Martini, Goji v2,
@@ -92,6 +94,9 @@ r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 `ISUTOOLS_FLOW_LABELS=off` disables only flow labels; `ISUTOOLS=off` disables all measurement.
 Public `X-Isutools-Session` and `X-Isutools-Scenario` headers are never trusted directly.
 `ISUTOOLS_FLOW_SOURCE=proxy` selects the legacy trusted-response-header path; `off` disables flow collection.
+The dashboard persists an explicit-step funnel with conversion, drop-off, retry, p95, 4xx, and 5xx overlays,
+a cycle-preserving directed User Flow graph, and a transition heatmap in the same snapshot. Run diff also compares
+conversion and transition counts. See [Flow Visualization](./docs/FLOW_VISUALIZATION.md) for the exact semantics.
 See the [all-round compatibility matrix](./docs/isucon-compatibility.md) and
 [proxy examples](./examples/proxies/README.md).
 
@@ -157,7 +162,7 @@ matching-binary pprof handoff. Score zero proves integration only, not performan
 | Proxy logs | nginx/OpenResty, Apache/OpenLiteSpeed, H2O, Envoy, Caddy, HAProxy, Traefik, lighttpd, Varnish, ATS, IIS, and Squid |
 | Runtime | CPU, mutex, block, heap, allocs, goroutine, threadcreate, supported goroutineleak, and trace |
 | Host | Linux procfs / sysfs / cgroup v2, network, and DB pool |
-| Output | Live dashboard, JSON, self-contained HTML, run diff, and multi-host hub |
+| Output | Live dashboard, JSON, self-contained HTML, funnels/flow graph/heatmap, run diff, and multi-host hub |
 
 ## Main settings
 
@@ -170,6 +175,9 @@ matching-binary pprof handoff. Score zero proves integration only, not performan
 | `ISUTOOLS_ACCESS_LOG_FORMAT` | Explicit decoder (`isutools-ltsv`, `isutools-json-v1`, `caddy-json`, `traefik-json`, or `iis-w3c`) |
 | `ISUTOOLS_FLOW_LABELS` | Set User Flow / Scenario Stories to `on`, `off`, or `auto` |
 | `ISUTOOLS_FLOW_SOURCE` | Flow source; default `auto`, or `middleware`, `proxy`, `off` |
+| `ISUTOOLS_FLOW_VIZ` | Set funnel/graph/heatmap to `on`, `off`, or `auto`; default `auto` |
+| `ISUTOOLS_FUNNEL_CONFIG` | Bounded YAML/JSON funnel definitions; omitted means graph-only |
+| `ISUTOOLS_FLOW_MAX_NODES` / `ISUTOOLS_FLOW_MAX_EDGES` | Visible limits; defaults 16/48, hard caps 32/128 |
 | `ISUTOOLS_PPROF_SECONDS` | Benchmark-scoped CPU-profile duration |
 | `ISUTOOLS_TRACE_SECONDS` | Short 1–30 second execution trace; default off and exclusive with managed profiles |
 | `ISUTOOLS_TIMELINE` | Opt in to a bounded run timeline |
@@ -184,6 +192,7 @@ Detailed settings, APIs, endpoints, EXPLAIN grants, and multi-host procedures li
 - [Field feedback and operational notes](./docs/FIELD_FEEDBACK.md)
 - [private-isu example](./examples/private-isu/README.md)
 - [ISUCON13 WSL2 example](./examples/isucon13-wsl/README.md)
+- [Measured ISUCON13 Journey Funnel / Flow Graph](./docs/isucon13-flow-visualization-verification-20260815.md)
 - [ISUCON13 / fresh private-isu specialist-tool field verification](./docs/isucon13-specialist-tools-verification-20260815.en.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
 

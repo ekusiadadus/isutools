@@ -43,6 +43,10 @@ type Record struct {
 	// Scenario is a caller-supplied, non-secret story label such as
 	// "login_and_browse". It is never inferred from authentication material.
 	Scenario string `json:"scenario,omitempty"`
+	// ObservedAt is populated by in-process middleware. Existing proxy formats
+	// omit it, which is reported explicitly when a configured funnel uses a
+	// cross-request time window.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
 
 	QueryStripped bool   `json:"query_stripped,omitempty"`
 	Partial       bool   `json:"partial,omitempty"`

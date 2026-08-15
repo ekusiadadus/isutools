@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/ekusiadadus/isutools/dbpool"
+	"github.com/ekusiadadus/isutools/flowviz"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/safefs"
@@ -39,6 +40,22 @@ type diffPage struct {
 	ProvenanceWarning string
 	SQL, HTTP         []diffRow
 	Contradictions    []diffContradiction
+	Funnels           []funnelDiffRow
+	FlowEdges         []flowEdgeDiffRow
+}
+
+type funnelDiffRow struct {
+	Key                          string
+	ASessions, BSessions         int64
+	DeltaSessions                int64
+	AConversionBP, BConversionBP int64
+	DeltaConversionBP            int64
+}
+
+type flowEdgeDiffRow struct {
+	From, To       string
+	ACount, BCount int64
+	Delta          int64
 }
 
 type diffEvidence struct {
@@ -84,11 +101,107 @@ func (h *handler) diff(w http.ResponseWriter, r *http.Request) {
 		SQL:               diffEntries(snapA.SQL, snapB.SQL),
 		HTTP:              diffEntries(entriesOf(snapA.HTTP), entriesOf(snapB.HTTP)),
 		Contradictions:    detectContradictions(*snapA, *snapB),
+		Funnels:           diffFunnels(snapA.FlowVisualization(), snapB.FlowVisualization()),
+		FlowEdges:         diffFlowEdges(snapA.FlowVisualization(), snapB.FlowVisualization()),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := diffTmpl.Execute(w, page); err != nil {
 		http.Error(w, "isutools: render failed", http.StatusInternalServerError)
 	}
+}
+
+func diffFunnels(a, b *flowviz.Snapshot) []funnelDiffRow {
+	type value struct {
+		sessions   int64
+		conversion int64
+	}
+	rows := map[string][2]value{}
+	collect := func(snapshot *flowviz.Snapshot, side int) {
+		if snapshot == nil {
+			return
+		}
+		funnelCount := min(len(snapshot.Funnels), flowviz.MaxFunnels)
+		for _, funnel := range snapshot.Funnels[:funnelCount] {
+			stepCount := min(len(funnel.Steps), flowviz.MaxStepsPerFunnel)
+			for _, step := range funnel.Steps[:stepCount] {
+				key := funnel.ID + " / " + step.ID
+				pair := rows[key]
+				pair[side] = value{sessions: step.Sessions, conversion: step.FromStartBP}
+				rows[key] = pair
+			}
+		}
+	}
+	collect(a, 0)
+	collect(b, 1)
+	result := make([]funnelDiffRow, 0, len(rows))
+	for key, pair := range rows {
+		result = append(result, funnelDiffRow{
+			Key: key, ASessions: pair[0].sessions, BSessions: pair[1].sessions,
+			DeltaSessions: pair[1].sessions - pair[0].sessions,
+			AConversionBP: pair[0].conversion, BConversionBP: pair[1].conversion,
+			DeltaConversionBP: pair[1].conversion - pair[0].conversion,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		iAbs, jAbs := absInt64(result[i].DeltaConversionBP), absInt64(result[j].DeltaConversionBP)
+		if iAbs != jAbs {
+			return iAbs > jAbs
+		}
+		return result[i].Key < result[j].Key
+	})
+	return result
+}
+
+func diffFlowEdges(a, b *flowviz.Snapshot) []flowEdgeDiffRow {
+	type counts struct{ a, b int64 }
+	rows := map[string]counts{}
+	collect := func(snapshot *flowviz.Snapshot, side int) {
+		if snapshot == nil {
+			return
+		}
+		edgeCount := min(len(snapshot.Graph.Edges), flowviz.HardMaxEdges)
+		for _, edge := range snapshot.Graph.Edges[:edgeCount] {
+			key := edge.From + "\x00" + edge.To
+			value := rows[key]
+			if side == 0 {
+				value.a = edge.Count
+			} else {
+				value.b = edge.Count
+			}
+			rows[key] = value
+		}
+	}
+	collect(a, 0)
+	collect(b, 1)
+	result := make([]flowEdgeDiffRow, 0, len(rows))
+	for key, value := range rows {
+		from, to, _ := strings.Cut(key, "\x00")
+		result = append(result, flowEdgeDiffRow{From: from, To: to, ACount: value.a, BCount: value.b, Delta: value.b - value.a})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		iAbs, jAbs := absInt64(result[i].Delta), absInt64(result[j].Delta)
+		if iAbs != jAbs {
+			return iAbs > jAbs
+		}
+		if result[i].From != result[j].From {
+			return result[i].From < result[j].From
+		}
+		return result[i].To < result[j].To
+	})
+	if len(result) > 30 {
+		result = result[:30]
+	}
+	return result
+}
+
+func absInt64(value int64) int64 {
+	if value == math.MinInt64 {
+		return math.MaxInt64
+	}
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 // detectContradictions reports the exact, intentionally conservative case in
@@ -365,7 +478,9 @@ func diffEntries(a, b []agg.Entry) []diffRow {
 }
 
 var diffTmpl = template.Must(template.New("diff").Funcs(template.FuncMap{
-	"ms1": func(v float64) string { return strconv.FormatFloat(v, 'f', 1, 64) },
+	"ms1":         func(v float64) string { return strconv.FormatFloat(v, 'f', 1, 64) },
+	"pctBP":       percentBasisPoints,
+	"signedPctBP": signedPercentBasisPoints,
 }).Parse(`<!doctype html>
 <html>
 <head>
@@ -398,6 +513,18 @@ a { color: #0b57d0; }
 <p class="meta">outcome: {{.Outcome.Signal}} ({{.Outcome.Metric}}) A={{ms1 .Outcome.A}} B={{ms1 .Outcome.B}}; {{.Outcome.Formula}}; limitation: {{.Outcome.Limitation}}</p>
 {{range .Improvements}}<p class="meta">improved resource: {{.Signal}} ({{.Metric}}) A={{ms1 .A}} B={{ms1 .B}}; {{.Formula}}; limitation: {{.Limitation}}</p>{{end}}
 </div>{{end}}
+
+<h2>Funnel conversion</h2>
+{{if .Funnels}}<p class="meta">conversion is session-based; delta is B - A percentage points. A changed scenario mix or run duration is not a causal estimate.</p>
+<table><thead><tr><th>conversion delta(pp)</th><th>A conversion</th><th>B conversion</th><th>A sessions</th><th>B sessions</th><th>session delta</th><th>funnel / step</th></tr></thead>
+<tbody>{{range .Funnels}}<tr><td>{{signedPctBP .DeltaConversionBP}}</td><td>{{pctBP .AConversionBP}}</td><td>{{pctBP .BConversionBP}}</td><td>{{.ASessions}}</td><td>{{.BSessions}}</td><td>{{if gt .DeltaSessions 0}}+{{end}}{{.DeltaSessions}}</td><td class="l">{{.Key}}</td></tr>{{end}}</tbody></table>
+{{else}}<p class="empty">no comparable funnel data</p>{{end}}
+
+<h2>Flow transitions</h2>
+{{if .FlowEdges}}<p class="meta">transition count delta is B - A; it describes workload shape, not latency improvement.</p>
+<table><thead><tr><th>delta</th><th>A count</th><th>B count</th><th>from</th><th>to</th></tr></thead>
+<tbody>{{range .FlowEdges}}<tr><td>{{if gt .Delta 0}}+{{end}}{{.Delta}}</td><td>{{.ACount}}</td><td>{{.BCount}}</td><td class="l">{{.From}}</td><td class="l">{{.To}}</td></tr>{{end}}</tbody></table>
+{{else}}<p class="empty">no comparable flow transition data</p>{{end}}
 
 <h2>SQL</h2>
 {{if .SQL}}

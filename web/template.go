@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ekusiadadus/isutools/flowviz"
 	"github.com/ekusiadadus/isutools/hoststats"
 	"github.com/ekusiadadus/isutools/httpstats"
 	"github.com/ekusiadadus/isutools/internal/agg"
@@ -911,9 +912,14 @@ var reportFuncs = template.FuncMap{
 	"f1": func(value float64) string {
 		return strconv.FormatFloat(value, 'f', 1, 64)
 	},
-	"size":      humanBytes,
-	"sizeDelta": humanBytesDelta,
-	"dur":       humanDuration,
+	"flowGraph":    buildFlowGraphView,
+	"flowHeatmap":  buildFlowHeatmap,
+	"safeFlowViz":  boundedFlowVisualization,
+	"pctBP":        percentBasisPoints,
+	"flowVizReady": func(value *flowviz.Snapshot) bool { return value != nil && value.Status != flowviz.StatusDisabled },
+	"size":         humanBytes,
+	"sizeDelta":    humanBytesDelta,
+	"dur":          humanDuration,
 	// ns renders a nanosecond count the profile records carry as raw integers,
 	// so a capture's distance from its boundary reads in the same units as
 	// every other duration on the page.
@@ -973,6 +979,20 @@ details { font-size: .8rem; margin: .4rem 0; }
 summary { cursor: pointer; color: #666; }
 ul.files { font-size: .85rem; line-height: 1.7; padding-left: 1.2rem; }
 pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-break: break-all; }
+.flow-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(28rem, 1fr)); gap: 1rem; align-items: start; }
+.flow-card { border: 1px solid #d1d5db; border-radius: .35rem; padding: .7rem; overflow-x: auto; }
+.flow-card h3 { font-size: .9rem; margin: 0 0 .4rem; }
+.funnel-step { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(12rem, 2fr) auto; gap: .6rem; align-items: center; margin: .35rem 0; }
+.funnel-step progress { width: 100%; height: 1.15rem; accent-color: #2563eb; }
+.flow-svg { width: 100%; min-width: 36rem; height: auto; background: #fafafa; border: 1px solid #e5e7eb; }
+.flow-svg line, .flow-svg path.flow-edge { stroke: #64748b; opacity: .55; }
+.flow-svg circle { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; }
+.flow-svg text { font-size: 11px; text-anchor: middle; dominant-baseline: middle; }
+.heatmap { width: auto; max-width: 100%; }
+.heatmap th { writing-mode: vertical-rl; max-height: 10rem; text-align: left; }
+.heatmap td { min-width: 2.2rem; text-align: center; }
+.heat0 { background: #fff; color: #aaa; } .heat1 { background: #eff6ff; } .heat2 { background: #bfdbfe; }
+.heat3 { background: #93c5fd; } .heat4 { background: #3b82f6; color: #fff; } .heat5 { background: #1d4ed8; color: #fff; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -1274,6 +1294,43 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 </tr>{{end}}</tbody>
 </table>{{else}}<p class="empty">no access-log observations in this generation</p>{{end}}
 {{else}}<p class="empty">not configured (set ISUTOOLS_ACCESS_LOG)</p>{{end}}
+
+{{$flowViz := safeFlowViz .Snapshot.FlowVisualization}}
+{{if flowVizReady $flowViz}}
+<span id="journey-visualization"></span><h2>Journey Visualization <span class="meta">(bounded pseudonymous sessions / registered route templates)</span></h2>
+<p class="meta">status {{$flowViz.Status}}{{if $flowViz.Partial}} &middot; <span class="warn">partial</span>{{end}} &middot; session dropped {{$flowViz.SessionDropped}} &middot; timing missing {{$flowViz.TimingMissing}} &middot; hidden transition count {{$flowViz.Graph.HiddenCount}}{{if $flowViz.Graph.Truncated}} &middot; graph truncated into (other){{end}}</p>
+
+<h3>Journey Funnel</h3>
+{{if $flowViz.Funnels}}
+<div class="flow-grid">{{range $flowViz.Funnels}}<section class="flow-card">
+<h3>{{$flowViz.Status}} &middot; {{.ID}} <span class="meta">scenario {{.Scenario}} &middot; {{.Mode}}{{if .Within}} within {{.Within}}{{end}}</span></h3>
+<p class="meta">entered {{.Entered}} &middot; completed {{.Completed}} &middot; conversion {{pctBP .ConversionBP}}{{if .Expired}} &middot; expired {{.Expired}}{{end}}</p>
+<div role="img" aria-label="funnel {{.ID}}">{{range .Steps}}<div class="funnel-step">
+<span title="{{.Route}}"><strong>{{.ID}}</strong><br><span class="meta">{{.Route}}</span></span>
+<progress max="10000" value="{{.FromStartBP}}">{{pctBP .FromStartBP}}</progress>
+<span>{{.Sessions}} sess &middot; {{pctBP .FromStartBP}}<br><span class="meta">prev {{pctBP .FromPreviousBP}} &middot; drop-off {{.DropOff}} &middot; retry {{.Retries}} &middot; 4xx {{.Status4xx}} &middot; 5xx {{.Status5xx}} &middot; p95 {{dur .RequestP95}}</span></span>
+</div>{{end}}</div>
+</section>{{end}}</div>
+{{else}}<p class="empty">no funnel definitions (set ISUTOOLS_FUNNEL_CONFIG; graph-only visualization remains available)</p>{{end}}
+
+<div class="flow-grid">
+<section class="flow-card"><h3>User Flow Graph</h3>
+{{$graph := flowGraph $flowViz.Graph}}
+{{if $graph.Edges}}<svg class="flow-svg" role="img" aria-label="user flow graph" viewBox="0 0 800 500">
+<defs><marker id="flow-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker></defs>
+{{range $graph.Edges}}{{if .Self}}<path class="flow-edge self-loop" d="{{.Path}}" fill="none" stroke-width="{{.Width}}" marker-end="url(#flow-arrow)"><title>{{.From}} → {{.To}} · {{.Count}}</title></path>{{else}}<line x1="{{.X1}}" y1="{{.Y1}}" x2="{{.X2}}" y2="{{.Y2}}" stroke-width="{{.Width}}" marker-end="url(#flow-arrow)"><title>{{.From}} → {{.To}} · {{.Count}}</title></line>{{end}}{{end}}
+{{range $graph.Nodes}}<g><circle cx="{{.X}}" cy="{{.Y}}" r="{{.Radius}}"><title>{{.ID}} · weighted transitions {{.Count}}</title></circle><text x="{{.X}}" y="{{.Y}}">{{.Label}}</text></g>{{end}}
+</svg>{{else}}<p class="empty">no visible transitions</p>{{end}}
+</section>
+
+<section class="flow-card"><h3>Transition Heatmap</h3>
+{{$heatmap := flowHeatmap $flowViz.Graph}}
+{{if $heatmap.Nodes}}<table class="heatmap"><thead><tr><th>from \ to</th>{{range $heatmap.Nodes}}<th title="{{.}}">{{.}}</th>{{end}}</tr></thead>
+<tbody>{{range $heatmap.Rows}}{{$row := .}}<tr><td class="l">{{.From}}</td>{{range .Cells}}<td class="heat{{.Level}}" title="{{$row.From}} → {{.To}}">{{if .Count}}{{.Count}}{{else}}·{{end}}</td>{{end}}</tr>{{end}}</tbody></table>
+{{else}}<p class="empty">no visible transitions</p>{{end}}
+</section>
+</div>
+{{end}}
 
 <h2>Scenario Stories <span class="meta">(明示scenarioラベル別の実測request列。疑似sessが必要)</span></h2>
 {{if .Snapshot.ScenarioStories}}

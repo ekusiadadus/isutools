@@ -73,6 +73,8 @@ export ISUTOOLS_SESSION_COOKIE=SESSIONID
 export ISUTOOLS_SESSION_HMAC_KEY='32-byte以上のgitへ入れない乱数'
 export ISUTOOLS_SCENARIO=isucon13_official
 export ISUTOOLS_FLOW_SOURCE=middleware
+export ISUTOOLS_FLOW_VIZ=on
+export ISUTOOLS_FUNNEL_CONFIG=/etc/isutools/funnels.yaml
 ```
 
 handler単位のscenarioとrouter templateには、全公開ISUCONで使われたGorilla mux、Martini、
@@ -92,6 +94,9 @@ r.With(chiv5.Scenario("checkout")).Get("/checkout", checkout)
 `ISUTOOLS_FLOW_LABELS=off`ならflow label処理だけを停止し、`ISUTOOLS=off`なら全計測を停止します。
 public clientが送った`X-Isutools-Session` / `X-Isutools-Scenario`は信用しません。
 `ISUTOOLS_FLOW_SOURCE=proxy`は従来のtrusted response header方式、`off`はflow集計停止です。
+dashboardは、定義済みstepのconversion/drop-off/retry/p95/4xx/5xxファネル、循環を保持する
+有向User Flowグラフ、遷移ヒートマップを同じsnapshotへ保存します。run間diffではconversionと
+遷移量の変化も比較できます。設定例と正確な意味は[Flow Visualization](./docs/FLOW_VISUALIZATION.md)です。
 全ISUCON回とproxyの一覧は[互換性表](./docs/isucon-compatibility.md)、設定断片は
 [proxy例](./examples/proxies/README.md)を参照してください。
 
@@ -155,7 +160,7 @@ score 0は性能成果ではなく、初期構成の機能成立だけを示し�
 | Proxy log | nginx/OpenResty、Apache/OpenLiteSpeed、H2O、Envoy、Caddy、HAProxy、Traefik、lighttpd、Varnish、ATS、IIS、Squid |
 | Runtime | CPU、mutex、block、heap、allocs、goroutine、threadcreate、対応時goroutineleak、trace |
 | Host | Linux procfs / sysfs / cgroup v2、network、DB pool |
-| Output | Live dashboard、JSON、自己完結HTML、run間diff、multi-host hub |
+| Output | Live dashboard、JSON、自己完結HTML、ファネル/Flowグラフ/ヒートマップ、run間diff、multi-host hub |
 
 ## 主な設定
 
@@ -168,6 +173,9 @@ score 0は性能成果ではなく、初期構成の機能成立だけを示し�
 | `ISUTOOLS_ACCESS_LOG_FORMAT` | 明示decoder (`isutools-ltsv` / `isutools-json-v1` / `caddy-json` / `traefik-json` / `iis-w3c`) |
 | `ISUTOOLS_FLOW_LABELS` | User Flow / Scenario Storiesを`on` / `off` / `auto` |
 | `ISUTOOLS_FLOW_SOURCE` | flow集計元。既定`auto`、`middleware` / `proxy` / `off` |
+| `ISUTOOLS_FLOW_VIZ` | ファネル/グラフ/ヒートマップを`on` / `off` / `auto`。既定`auto` |
+| `ISUTOOLS_FUNNEL_CONFIG` | bounded YAML/JSONファネル定義。未設定時もgraph-onlyで動作 |
+| `ISUTOOLS_FLOW_MAX_NODES` / `ISUTOOLS_FLOW_MAX_EDGES` | 可視化上限。既定16/48、hard cap 32/128 |
 | `ISUTOOLS_PPROF_SECONDS` | benchmark区間のCPU profile秒数 |
 | `ISUTOOLS_TRACE_SECONDS` | 1〜30秒の短いexecution trace。既定off、managed profileと排他 |
 | `ISUTOOLS_TIMELINE` | boundedなrun時系列をopt-in |
@@ -190,6 +198,7 @@ score 0は性能成果ではなく、初期構成の機能成立だけを示し�
 - [現場フィードバックと運用上の注意](./docs/FIELD_FEEDBACK.md)
 - [private-isu例](./examples/private-isu/README.md)
 - [ISUCON13 WSL2例](./examples/isucon13-wsl/README.md)
+- [ISUCON13 Journey Funnel / Flow Graph実測](./docs/isucon13-flow-visualization-verification-20260815.md)
 - [ISUCON13 / fresh private-isu specialist tools実測](./docs/isucon13-specialist-tools-verification-20260815.md)
 - [2026-08-14 ISUCON13現場指摘の最終監査](./docs/isucon13-field-audit-20260814.md)
 - [ISUCON14 case study](./docs/case-studies/isucon14-20260805.md)
