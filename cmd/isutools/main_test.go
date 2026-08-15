@@ -118,6 +118,22 @@ SELECT * FROM users WHERE email='private@example.com' AND id=123;
 	}
 }
 
+func TestRunAnalyzeSlowlogRequiresExactInputSpan(t *testing.T) {
+	input := "# Query_time: 0.125 Lock_time: 0.010 Rows_sent: 1 Rows_examined: 42\nSELECT 123;\n"
+	var stdout, stderr bytes.Buffer
+	code := run(context.Background(), []string{
+		"analyze", "mysql-slowlog", "--coverage",
+		"--start-device", "1", "--start-inode", "2", "--start-offset", "100", "--start-db-clock", "2026-08-15T12:00:00+09:00",
+		"--end-device", "1", "--end-inode", "2", "--end-offset", "101", "--end-db-clock", "2026-08-15T12:01:00+09:00",
+	}, strings.NewReader(input), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"complete": false`) || !strings.Contains(stdout.String(), `"reason": "input-span-mismatch"`) {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+}
+
 func TestRunAnalyzeSlowlogPublishesBoundArtifact(t *testing.T) {
 	input := `# Query_time: 0.125 Lock_time: 0.010 Rows_sent: 1 Rows_examined: 42
 SET timestamp=1786755600;

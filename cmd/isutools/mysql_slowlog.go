@@ -102,6 +102,10 @@ func runMySQLSlowlog(ctx context.Context, args []string, stdin io.Reader, stdout
 			slowlog.CapturePoint{Identity: slowlog.FileIdentity{Device: *startDevice, Inode: *startInode}, Offset: *startOffset, DBClock: started},
 			slowlog.CapturePoint{Identity: slowlog.FileIdentity{Device: *endDevice, Inode: *endInode}, Offset: *endOffset, DBClock: ended},
 		)
+		if coverage.Complete && (coverage.EndOffset < coverage.StartOffset || coverage.EndOffset-coverage.StartOffset != uint64(len(body))) {
+			coverage.Complete = false
+			coverage.Reason = "input-span-mismatch"
+		}
 	}
 	report, err := slowlog.Parse(bytes.NewReader(body), slowlog.Options{MaxInputBytes: *maxInput, MaxEvents: *maxEvents, MaxClasses: *maxClasses, Coverage: coverage})
 	if err != nil {
