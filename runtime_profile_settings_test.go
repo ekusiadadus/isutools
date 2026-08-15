@@ -4,6 +4,8 @@ import (
 	"runtime/pprof"
 	"slices"
 	"testing"
+
+	"github.com/ekusiadadus/isutools/web"
 )
 
 func TestResolveAdditionalRuntimeProfilesAreExplicitOptIn(t *testing.T) {
@@ -31,5 +33,13 @@ func TestAdditionalRuntimeProfileDefaultsDoNothing(t *testing.T) {
 	settings := resolveProfileSettings(envMap(nil))
 	if settings.allocs || settings.goroutine || settings.threadcreate || settings.goroutineleak {
 		t.Fatalf("additional profiles must default off: %+v", settings)
+	}
+}
+
+func TestDisabledTraceDoesNotBecomeANonNilCoordinator(t *testing.T) {
+	provider := web.Provider{}
+	attachTraceCapture(&provider, nil)
+	if provider.TraceCapture != nil {
+		t.Fatal("disabled trace was boxed into a non-nil coordinator")
 	}
 }

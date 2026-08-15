@@ -1900,8 +1900,8 @@ func Handler() http.Handler {
 		RunSnapshot:     core.latestRunSnapshot,
 		Timeline:        core.timelineSection,
 		RuntimeProfiles: core.profiles,
-		TraceCapture:    core.traceBridge,
 	}
+	attachTraceCapture(&provider, core.traceBridge)
 	if source := provider.FlowSource; source == "auto" || source == "middleware" {
 		provider.Flow = flowstats.Default
 	}

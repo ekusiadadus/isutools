@@ -27,7 +27,8 @@ for unit in nginx mysql pdns isupipe-go; do
 done
 
 headers=$(mktemp)
-trap 'rm -f "$headers"; abort_run' EXIT INT TERM
+collect_response=$(mktemp)
+trap 'rm -f "$headers" "$collect_response"; abort_run' EXIT INT TERM
 curl -fsS -D "$headers" -o /dev/null -X POST "$admin_url/reset"
 run_id=$(awk 'tolower($1) == "x-isutools-run-id:" {gsub("\\r", "", $2); print $2}' "$headers")
 test -n "$run_id" || {
@@ -68,7 +69,16 @@ stamp=$(date '+%Y%m%d-%H%M%S')
 durable_result="$data_dir/official-benchmark-$stamp-$run_id.json"
 install -m 0640 "$bench_result" "$durable_result"
 
-curl -fsS -X POST "$admin_url/collect" >/dev/null
+for attempt in $(seq 1 16); do
+  collect_status=$(curl -sS -o "$collect_response" -w '%{http_code}' -X POST "$admin_url/collect")
+  if [[ "$collect_status" == 204 ]]; then
+    break
+  fi
+  if [[ "$collect_status" != 503 || "$attempt" == 16 ]]; then
+    printf 'isutools collect failed: status=%s attempt=%s\n' "$collect_status" "$attempt" >&2
+    exit 1
+  fi
+done
 save_response=$(curl -fsS -X POST \
   "$admin_url/save?score=$score&pass=$pass")
 read -r saved_file snapshot_base snapshot_sha256 < <(
@@ -83,7 +93,7 @@ find "$data_dir" -maxdepth 1 -type f \
 sha256sum "$durable_result" "$data_dir/$saved_file"
 
 trap - EXIT INT TERM
-rm -f "$headers"
+rm -f "$headers" "$collect_response"
 printf 'benchmark_score=%s\nbenchmark_pass=%s\nbenchmark_language=%s\n' "$score" "$pass" "$language"
 printf 'saved_file=%s\nsnapshot_base=%s\nsnapshot_sha256=%s\nstage_dir=%s\n' \
   "$saved_file" "$snapshot_base" "$snapshot_sha256" "$stage_dir"

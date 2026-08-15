@@ -33,6 +33,16 @@ type traceWebBridge struct {
 	dataDir string
 }
 
+// attachTraceCapture avoids boxing a nil *traceWebBridge into a non-nil
+// interface. A typed nil would make an explicitly disabled trace participate
+// in every run and replace its truthful disabled health with an unavailable
+// owner diagnostic.
+func attachTraceCapture(provider *web.Provider, bridge *traceWebBridge) {
+	if bridge != nil {
+		provider.TraceCapture = bridge
+	}
+}
+
 func (b *traceWebBridge) StartRun(request web.TraceStartRequest) web.TraceStartResult {
 	if b == nil || b.owner == nil {
 		return web.TraceStartResult{RunID: request.RunID, Epoch: request.Epoch, State: tracecapture.StateSkipped, Code: "trace-owner-unavailable"}

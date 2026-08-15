@@ -43,3 +43,16 @@ func TestSystemdAccessLogPathRulesMatchISUCON13Routes(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteBenchRetriesBoundedAccessLogCollection(t *testing.T) {
+	body, err := os.ReadFile("remote-bench.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(body)
+	for _, want := range []string{"for attempt in $(seq 1 16)", `"$collect_status" == 204`, `"$collect_status" != 503`, `"$attempt" == 16`} {
+		if !strings.Contains(script, want) {
+			t.Errorf("remote-bench.sh is missing %q", want)
+		}
+	}
+}
