@@ -3,10 +3,12 @@
 package httpstats
 
 import (
+	"context"
 	"fmt"
 	"math/bits"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -22,6 +24,10 @@ const (
 	// DefaultMaxKeys is the maximum number of distinct HTTP identities held by
 	// a Collector. New identities past the limit are merged into OverflowPath.
 	DefaultMaxKeys = 10000
+	// DefaultMaxShapeKeys bounds exact endpoint + SQL shape pairs per run.
+	DefaultMaxShapeKeys = 2048
+	// EnvSQLShapes enables bounded endpoint + normalized SQL shape attribution.
+	EnvSQLShapes = "ISUTOOLS_SQL_SHAPES"
 	// OverflowPath identifies observations merged after the key limit.
 	OverflowPath = "(other)"
 
@@ -58,8 +64,14 @@ type httpEvent struct {
 type Option func(*config)
 
 type config struct {
-	maxKeys int
-	rules   []Rule
+	maxKeys   int
+	rules     []Rule
+	sqlShapes bool
+}
+
+// WithSQLShapeAttribution enables bounded request-context SQL-shape tracking.
+func WithSQLShapeAttribution(enabled bool) Option {
+	return func(cfg *config) { cfg.sqlShapes = enabled }
 }
 
 // WithMaxKeys changes the distinct-key limit. A value of zero merges every
@@ -102,6 +114,20 @@ type Entry struct {
 	SQLCount           int64 `json:"sql_count,omitempty"`
 	SQLMaxPerRequest   int64 `json:"sql_max_per_request,omitempty"`
 	SQLTrackedRequests int64 `json:"sql_tracked_requests,omitempty"`
+	// SQLShapeTrackedRequests distinguishes current shape-aware snapshots from
+	// older snapshots, including routes with no captured SQL.
+	SQLShapeTrackedRequests int64      `json:"sql_shape_tracked_requests,omitempty"`
+	SQLShapes               []SQLShape `json:"sql_shapes,omitempty"`
+}
+
+// SQLShape counts one normalized statement on one HTTP identity. Overflow is
+// an explicit bucket, never a statement reconstructed from raw SQL.
+type SQLShape struct {
+	Key           string        `json:"key"`
+	Count         int64         `json:"count"`
+	Total         time.Duration `json:"total_ns"`
+	Errors        int64         `json:"errors"`
+	MaxPerRequest int64         `json:"max_per_request"`
 }
 
 // Snapshot is a point-in-time copy sorted by total duration descending.
@@ -129,14 +155,16 @@ type identity struct {
 }
 
 type stat struct {
-	count              int64
-	total              int64
-	max                int64
-	bytes              int64
-	sqlCount           int64
-	sqlMaxPerRequest   int64
-	sqlTrackedRequests int64
-	buckets            [numBuckets]int64
+	count                   int64
+	total                   int64
+	max                     int64
+	bytes                   int64
+	sqlCount                int64
+	sqlMaxPerRequest        int64
+	sqlTrackedRequests      int64
+	sqlShapeTrackedRequests int64
+	shapes                  map[string]SQLShape
+	buckets                 [numBuckets]int64
 }
 
 type shard struct {
@@ -145,9 +173,10 @@ type shard struct {
 }
 
 type table struct {
-	maxKeys int64
-	keys    atomic.Int64
-	shards  [numShards]shard
+	maxKeys   int64
+	keys      atomic.Int64
+	shapeKeys atomic.Int64
+	shards    [numShards]shard
 }
 
 // Collector owns HTTP measurements and generation boundaries. Reset swaps in
@@ -164,6 +193,7 @@ type Collector struct {
 	rules      []Rule
 	eventRules []SafeProfileRouteRule
 	observer   atomic.Pointer[eventObserverSlot]
+	sqlShapes  bool
 
 	// gens is the boundary bookkeeping, guarded by mu.
 	gens generationState
@@ -208,15 +238,16 @@ var Default = New()
 
 // New returns an independent Collector.
 func New(opts ...Option) *Collector {
-	cfg := config{maxKeys: DefaultMaxKeys}
+	cfg := config{maxKeys: DefaultMaxKeys, sqlShapes: os.Getenv(EnvSQLShapes) == "1"}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
 	c := &Collector{
-		maxKeys: cfg.maxKeys,
-		rules:   cfg.rules,
+		maxKeys:   cfg.maxKeys,
+		rules:     cfg.rules,
+		sqlShapes: cfg.sqlShapes,
 	}
 	c.current = c.newGeneration()
 	return c
@@ -266,7 +297,13 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = withRoutePatternState(r)
-		requestContext, sqlCounter := requestsql.WithCounter(r.Context())
+		var requestContext context.Context
+		var sqlCounter *requestsql.Counter
+		if c.sqlShapes {
+			requestContext, sqlCounter = requestsql.WithShapeCounter(r.Context())
+		} else {
+			requestContext, sqlCounter = requestsql.WithCounter(r.Context())
+		}
 		r = r.WithContext(requestContext)
 		g := c.begin()
 		start := time.Now()
@@ -297,7 +334,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 				tracker.start(false)
 			}
 			finishedAt := time.Now()
-			sqlCount := sqlCounter.Close()
+			sqlCount, sqlShapes := sqlCounter.CloseShapes()
 			if tracker.finishHandler(capture.bytes) {
 				// Long-lived connections are released from the request generation
 				// as soon as they are confirmed, so Reset never waits for them.
@@ -310,7 +347,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 					status:   capture.status,
 				}
 				duration := finishedAt.Sub(start)
-				c.finish(g, id, duration, capture.bytes, sqlCount)
+				c.finish(g, id, duration, capture.bytes, sqlCount, sqlShapes)
 				finishHTTPEvent(event, finishedAt, c.timelineKey(r), duration, capture.status >= http.StatusInternalServerError)
 			}
 			if panicked != nil {
@@ -546,6 +583,10 @@ func (t *table) observe(id identity, duration time.Duration, responseBytes int64
 }
 
 func (t *table) observeRequest(id identity, duration time.Duration, responseBytes, sqlCount int64, tracked bool) {
+	t.observeRequestShapes(id, duration, responseBytes, sqlCount, tracked, nil)
+}
+
+func (t *table) observeRequestShapes(id identity, duration time.Duration, responseBytes, sqlCount int64, tracked bool, shapes map[string]requestsql.Shape) {
 	if duration < 0 {
 		duration = 0
 	}
@@ -561,7 +602,7 @@ func (t *table) observeRequest(id identity, duration time.Duration, responseByte
 	if !ok && id.path != OverflowPath {
 		if !t.reserveKey() {
 			sh.mu.Unlock()
-			t.observeRequest(identity{method: "*", path: OverflowPath, protocol: "*"}, duration, responseBytes, sqlCount, tracked)
+			t.observeRequestShapes(identity{method: "*", path: OverflowPath, protocol: "*"}, duration, responseBytes, sqlCount, tracked, shapes)
 			return
 		}
 		s = &stat{}
@@ -577,9 +618,43 @@ func (t *table) observeRequest(id identity, duration time.Duration, responseByte
 	if tracked {
 		s.sqlCount += sqlCount
 		s.sqlTrackedRequests++
+		if shapes != nil {
+			s.sqlShapeTrackedRequests++
+		}
 		if sqlCount > s.sqlMaxPerRequest {
 			s.sqlMaxPerRequest = sqlCount
 		}
+	}
+	keys := make([]string, 0, len(shapes))
+	for shape := range shapes {
+		keys = append(keys, shape)
+	}
+	sort.Strings(keys)
+	resolved := make(map[string]requestsql.Shape, len(shapes))
+	for _, shape := range keys {
+		value := shapes[shape]
+		if s.shapes == nil {
+			s.shapes = make(map[string]SQLShape)
+		}
+		if _, exists := s.shapes[shape]; !exists && shape != requestsql.OverflowShape && !t.reserveShapeKey() {
+			shape = requestsql.OverflowShape
+		}
+		merged := resolved[shape]
+		merged.Count += value.Count
+		merged.Total += value.Total
+		merged.Errors += value.Errors
+		resolved[shape] = merged
+	}
+	for shape, value := range resolved {
+		row := s.shapes[shape]
+		row.Key = shape
+		row.Count += value.Count
+		row.Total += value.Total
+		row.Errors += value.Errors
+		if value.Count > row.MaxPerRequest {
+			row.MaxPerRequest = value.Count
+		}
+		s.shapes[shape] = row
 	}
 	if ns > s.max {
 		s.max = ns
@@ -599,6 +674,19 @@ func (t *table) clear() {
 		sh.mu.Unlock()
 	}
 	t.keys.Store(0)
+	t.shapeKeys.Store(0)
+}
+
+func (t *table) reserveShapeKey() bool {
+	for {
+		used := t.shapeKeys.Load()
+		if used >= DefaultMaxShapeKeys {
+			return false
+		}
+		if t.shapeKeys.CompareAndSwap(used, used+1) {
+			return true
+		}
+	}
 }
 
 func (t *table) reserveKey() bool {
@@ -619,22 +707,29 @@ func (t *table) snapshot() Snapshot {
 		sh := &t.shards[i]
 		sh.mu.Lock()
 		for id, s := range sh.stats {
+			shapes := make([]SQLShape, 0, len(s.shapes))
+			for _, shape := range s.shapes {
+				shapes = append(shapes, shape)
+			}
+			sort.Slice(shapes, func(i, j int) bool { return shapes[i].Key < shapes[j].Key })
 			entries = append(entries, Entry{
-				Key:                displayKey(id),
-				Method:             id.method,
-				Path:               id.path,
-				Protocol:           id.protocol,
-				Status:             id.status,
-				Count:              s.count,
-				Total:              time.Duration(s.total),
-				Avg:                time.Duration(s.total / s.count),
-				Max:                time.Duration(s.max),
-				P95:                time.Duration(p95(s)),
-				TotalBytes:         s.bytes,
-				AvgBytes:           s.bytes / s.count,
-				SQLCount:           s.sqlCount,
-				SQLMaxPerRequest:   s.sqlMaxPerRequest,
-				SQLTrackedRequests: s.sqlTrackedRequests,
+				Key:                     displayKey(id),
+				Method:                  id.method,
+				Path:                    id.path,
+				Protocol:                id.protocol,
+				Status:                  id.status,
+				Count:                   s.count,
+				Total:                   time.Duration(s.total),
+				Avg:                     time.Duration(s.total / s.count),
+				Max:                     time.Duration(s.max),
+				P95:                     time.Duration(p95(s)),
+				TotalBytes:              s.bytes,
+				AvgBytes:                s.bytes / s.count,
+				SQLCount:                s.sqlCount,
+				SQLMaxPerRequest:        s.sqlMaxPerRequest,
+				SQLTrackedRequests:      s.sqlTrackedRequests,
+				SQLShapeTrackedRequests: s.sqlShapeTrackedRequests,
+				SQLShapes:               shapes,
 			})
 		}
 		sh.mu.Unlock()

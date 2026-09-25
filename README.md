@@ -50,6 +50,7 @@ DB pool、EXPLAIN、nginx、pprofまで含む手順は[導入ガイド](./docs/I
 | Bottleneck Overview | SQL、HTTP、DB pool、CPU、I/Oのうち、次に確認する場所 |
 | SQL / HTTP | 遅い1回だけでなく、回数を含む累計コストとp95 |
 | SQL per endpoint | エンドポイント別のSQL合計・1リクエスト当たりの平均回数・最大回数 |
+| Endpoint × SQL shape | opt-inで正規化SQL形をendpointへ帰属し、回数・累計時間・overflowと計測範囲を表示 |
 | [実験条件と結果](docs/EXPERIMENTS.md) | 全ホストのCPU余力、SQL回数、負荷条件、合否、減点、再起動確認を同じ表で比較 |
 | Runs / Diff | 変更前後のscore、失敗、total、count、averageの差 |
 | User Flow | 同じ疑似sessionが実際に通ったページ遷移の上位20 |
@@ -181,6 +182,7 @@ score 0は性能成果ではなく、初期構成の機能成立だけを示し�
 | `ISUTOOLS_PPROF_SECONDS` | benchmark区間のCPU profile秒数 |
 | `ISUTOOLS_TRACE_SECONDS` | 1〜30秒の短いexecution trace。既定off、managed profileと排他 |
 | `ISUTOOLS_TIMELINE` | boundedなrun時系列をopt-in |
+| `ISUTOOLS_SQL_SHAPES` | `1`でendpoint×正規化SQL形を収集。既定off。request内32形、run内2,048組を超えるとoverflowへ集約 |
 
 ### CPU profileがないとき（`cpu-busy`）
 

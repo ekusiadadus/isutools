@@ -8,6 +8,7 @@ import (
 
 	"github.com/ekusiadadus/isutools/advisor"
 	"github.com/ekusiadadus/isutools/internal/agg"
+	"github.com/ekusiadadus/isutools/internal/requestsql"
 )
 
 // diagnosticCandidate is an evidence-bound experiment suggestion. Its text
@@ -79,6 +80,25 @@ func diagnosticCandidates(snapshot Snapshot) []diagnosticCandidate {
 			Title:    "短いSQLの反復を調査",
 			Evidence: evidence,
 			NextStep: next,
+		})
+	}
+	// A route/shape pair makes the next source inspection more specific than
+	// the global SQL count. It is still a candidate, not proof of N+1 or cost.
+	var repeated *endpointShapeRow
+	for _, row := range endpointShapeRows(snapshot.HTTP) {
+		if row.Tracked == 0 || row.Count < frequentCalls || row.Total <= 0 || row.Shape == "" || row.Shape == requestsql.OverflowShape || row.Shape == requestsql.UnknownShape {
+			continue
+		}
+		if repeated == nil || row.Total > repeated.Total || (row.Total == repeated.Total && row.Count > repeated.Count) {
+			copy := row
+			repeated = &copy
+		}
+	}
+	if repeated != nil {
+		candidates = append(candidates, diagnosticCandidate{
+			Title:    "エンドポイント別の反復SQLを調査",
+			Evidence: fmt.Sprintf("heuristic: %s %s でSQL形 %q が%d回、tracked requests %d件、平均 %.2f回/request、最多 %d回/request、累計 %s。N+1や性能律速の証明ではありません。", repeated.Method, repeated.Path, boundedDiagnosticSQLKey(repeated.Shape), repeated.Count, repeated.Tracked, repeated.PerRequest, repeated.MaxPerRequest, humanDuration(repeated.Total)),
+			NextStep: "このrouteのhandlerとSQL呼び出しを照合し、取得回数を減らす一変更を同条件のscore・pass・penalty・error rateで比較します。",
 		})
 	}
 
