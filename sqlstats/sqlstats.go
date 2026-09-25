@@ -15,6 +15,7 @@ import (
 	proxy "github.com/shogo82148/go-sql-proxy"
 
 	"github.com/ekusiadadus/isutools/internal/agg"
+	"github.com/ekusiadadus/isutools/internal/requestsql"
 )
 
 // DriverSuffix is appended to the original driver name on registration:
@@ -96,8 +97,8 @@ func register(name string) error {
 }
 
 func hooks() *proxy.HooksContext {
-	pre := func(_ context.Context, _ *proxy.Stmt, _ []driver.NamedValue) (interface{}, error) {
-		return hookMeasurement{started: time.Now(), measurement: Default.begin()}, nil
+	pre := func(ctx context.Context, _ *proxy.Stmt, _ []driver.NamedValue) (interface{}, error) {
+		return hookMeasurement{started: time.Now(), measurement: Default.begin(), requestContext: ctx}, nil
 	}
 	observe := func(ctx interface{}, stmt *proxy.Stmt, err error) {
 		// A panic in measurement must never break the application's query.
@@ -111,6 +112,7 @@ func hooks() *proxy.HooksContext {
 		if err == driver.ErrSkip {
 			return
 		}
+		requestsql.Completed(measurement.requestContext)
 		Default.finish(measurement.measurement, normalize(stmt.QueryString), time.Since(measurement.started), err != nil)
 	}
 	return &proxy.HooksContext{
@@ -128,6 +130,7 @@ func hooks() *proxy.HooksContext {
 }
 
 type hookMeasurement struct {
-	started     time.Time
-	measurement *measurement
+	started        time.Time
+	measurement    *measurement
+	requestContext context.Context
 }

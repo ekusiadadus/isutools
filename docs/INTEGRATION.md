@@ -43,6 +43,37 @@ db, err := sql.Open(driverName, dsn) // sqlx.Open でも同じ
 登録に失敗した場合はアプリを止めず、元の driver 名を返します。厳格な起動確認が
 必要な CI では `isutools.RegisterSQL("mysql")` の error を確認してください。
 
+### エンドポイント別・1リクエスト当たりのSQL回数
+
+`isutools.HTTP` とラップ済みDBドライバを併用し、SQL実行にリクエストのcontextを渡します。
+
+```go
+func getPosts(w http.ResponseWriter, r *http.Request) {
+    rows, err := db.QueryContext(r.Context(), "SELECT id FROM posts")
+    if err != nil {
+        http.Error(w, "database error", http.StatusInternalServerError)
+        return
+    }
+    defer rows.Close()
+    // read rows and write the response
+}
+```
+
+レポートの **SQL per endpoint** はHTTP methodと正規化したpathでまとめ、statusとprotocolを
+合算します。HTTP件数、計測対象HTTP件数（tracked requests）、SQL合計、平均SQL回数/リクエスト、
+1リクエストの最大SQL回数を表示します。平均はSQL合計 ÷ tracked requestsで、SQLが0回の
+リクエストも分母に含めます。初期表示は平均回数の降順で、列見出しから並べ替えられます。
+
+`QueryContext`、`QueryRowContext`、`ExecContext`やprepared statementのContextメソッド等で
+同じcontextを引き継ぐ必要があります。handler終了までに完了したSQLを数え、SQLエラーも含めます。
+`db.Query` / `db.Exec`、`context.Background()`に置き換えた呼び出し、handler終了後の処理は
+紐付けられません。WS/SSEは通常のHTTP集計と同様に対象外です。tracked requestsはHTTP側の
+計測件数であり、contextが失われたSQLまで捕捉できたことを示すものではありません。
+
+JSONの各HTTP行には`sql_count`、`sql_max_per_request`、`sql_tracked_requests`が保存されます。
+旧スナップショットなど計測情報のない行は未計測（`—`）と表示し、平均の分母から除外します。
+新たに保存するHTMLとlive reportに表示され、旧データからSQLとの対応を復元することはできません。
+
 ### MySQL / MariaDB
 
 ```bash

@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ekusiadadus/isutools/internal/requestsql"
 )
 
 const (
@@ -93,6 +95,13 @@ type Entry struct {
 	P95        time.Duration `json:"p95_ns"`
 	TotalBytes int64         `json:"total_bytes"`
 	AvgBytes   int64         `json:"avg_bytes"`
+	// SQL fields count calls completed through sqlstats with the request
+	// context. SQLTrackedRequests counts middleware-observed HTTP requests,
+	// including requests with zero captured calls; it does not prove that all
+	// database clients in the application are instrumented.
+	SQLCount           int64 `json:"sql_count,omitempty"`
+	SQLMaxPerRequest   int64 `json:"sql_max_per_request,omitempty"`
+	SQLTrackedRequests int64 `json:"sql_tracked_requests,omitempty"`
 }
 
 // Snapshot is a point-in-time copy sorted by total duration descending.
@@ -120,11 +129,14 @@ type identity struct {
 }
 
 type stat struct {
-	count   int64
-	total   int64
-	max     int64
-	bytes   int64
-	buckets [numBuckets]int64
+	count              int64
+	total              int64
+	max                int64
+	bytes              int64
+	sqlCount           int64
+	sqlMaxPerRequest   int64
+	sqlTrackedRequests int64
+	buckets            [numBuckets]int64
 }
 
 type shard struct {
@@ -254,6 +266,8 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = withRoutePatternState(r)
+		requestContext, sqlCounter := requestsql.WithCounter(r.Context())
+		r = r.WithContext(requestContext)
 		g := c.begin()
 		start := time.Now()
 		event := c.beginHTTPEvent(start)
@@ -283,6 +297,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 				tracker.start(false)
 			}
 			finishedAt := time.Now()
+			sqlCount := sqlCounter.Close()
 			if tracker.finishHandler(capture.bytes) {
 				// Long-lived connections are released from the request generation
 				// as soon as they are confirmed, so Reset never waits for them.
@@ -295,7 +310,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 					status:   capture.status,
 				}
 				duration := finishedAt.Sub(start)
-				c.finish(g, id, duration, capture.bytes)
+				c.finish(g, id, duration, capture.bytes, sqlCount)
 				finishHTTPEvent(event, finishedAt, c.timelineKey(r), duration, capture.status >= http.StatusInternalServerError)
 			}
 			if panicked != nil {
@@ -527,11 +542,18 @@ func newTable(maxKeys int) *table {
 }
 
 func (t *table) observe(id identity, duration time.Duration, responseBytes int64) {
+	t.observeRequest(id, duration, responseBytes, 0, false)
+}
+
+func (t *table) observeRequest(id identity, duration time.Duration, responseBytes, sqlCount int64, tracked bool) {
 	if duration < 0 {
 		duration = 0
 	}
 	if responseBytes < 0 {
 		responseBytes = 0
+	}
+	if sqlCount < 0 {
+		sqlCount = 0
 	}
 	sh := &t.shards[hashIdentity(id)%numShards]
 	sh.mu.Lock()
@@ -539,7 +561,7 @@ func (t *table) observe(id identity, duration time.Duration, responseBytes int64
 	if !ok && id.path != OverflowPath {
 		if !t.reserveKey() {
 			sh.mu.Unlock()
-			t.observe(identity{method: "*", path: OverflowPath, protocol: "*"}, duration, responseBytes)
+			t.observeRequest(identity{method: "*", path: OverflowPath, protocol: "*"}, duration, responseBytes, sqlCount, tracked)
 			return
 		}
 		s = &stat{}
@@ -552,6 +574,13 @@ func (t *table) observe(id identity, duration time.Duration, responseBytes int64
 	s.count++
 	s.total += ns
 	s.bytes += responseBytes
+	if tracked {
+		s.sqlCount += sqlCount
+		s.sqlTrackedRequests++
+		if sqlCount > s.sqlMaxPerRequest {
+			s.sqlMaxPerRequest = sqlCount
+		}
+	}
 	if ns > s.max {
 		s.max = ns
 	}
@@ -591,18 +620,21 @@ func (t *table) snapshot() Snapshot {
 		sh.mu.Lock()
 		for id, s := range sh.stats {
 			entries = append(entries, Entry{
-				Key:        displayKey(id),
-				Method:     id.method,
-				Path:       id.path,
-				Protocol:   id.protocol,
-				Status:     id.status,
-				Count:      s.count,
-				Total:      time.Duration(s.total),
-				Avg:        time.Duration(s.total / s.count),
-				Max:        time.Duration(s.max),
-				P95:        time.Duration(p95(s)),
-				TotalBytes: s.bytes,
-				AvgBytes:   s.bytes / s.count,
+				Key:                displayKey(id),
+				Method:             id.method,
+				Path:               id.path,
+				Protocol:           id.protocol,
+				Status:             id.status,
+				Count:              s.count,
+				Total:              time.Duration(s.total),
+				Avg:                time.Duration(s.total / s.count),
+				Max:                time.Duration(s.max),
+				P95:                time.Duration(p95(s)),
+				TotalBytes:         s.bytes,
+				AvgBytes:           s.bytes / s.count,
+				SQLCount:           s.sqlCount,
+				SQLMaxPerRequest:   s.sqlMaxPerRequest,
+				SQLTrackedRequests: s.sqlTrackedRequests,
 			})
 		}
 		sh.mu.Unlock()

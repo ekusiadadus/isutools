@@ -894,6 +894,7 @@ func barrierWindow(window [2]time.Time) string {
 // are named functions rather than closures so each one can be tested on its
 // own, without rendering a page to find out what it prints.
 var reportFuncs = template.FuncMap{
+	"endpointSQLRows": endpointSQLRows,
 	"ms": func(d time.Duration) string {
 		return strconv.FormatFloat(float64(d.Nanoseconds())/1e6, 'f', 1, 64)
 	},
@@ -1142,6 +1143,7 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 {{end}}{{else}}<p class="empty">not captured (no DB connection observed yet)</p>{{end}}
 
 <span id="sql"></span><h2>SQL</h2>
+<p class="meta"><a class="jump-link" href="#endpoint-sql" data-target="endpoint-sql">エンドポイント別のSQL回数・SQL/request</a></p>
 {{if .Snapshot.SQL}}
 <table>
 <thead><tr>
@@ -1220,6 +1222,19 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 <p class="meta">type=ALL(全表走査)・Using filesort(索引で解けないソート)・Using temporary(一時表)の行を網掛けにしています。— は当該列が NULL、つまりサーバが値を返さなかったことを表します。</p>
 <p class="meta">灰色の行は計測区間内に実行されたサンプルではありません(区間外・DB 時計異常・partial な区間)。リテラルが違えば実行計画も変わるため、advisor の判定対象からは外しています。鮮度の列にその理由が入ります。</p>
 {{end}}{{end}}
+
+<span id="endpoint-sql"></span><h2>SQL per endpoint / エンドポイント別SQL回数</h2>
+<p class="meta">HTTP method + 正規化したpath単位でstatus・protocolを合算。平均SQL回数/リクエストの多い順。SQLが0回のリクエストも分母に含みます。</p>
+{{if .Snapshot.HTTP}}
+<table id="endpoint-sql-table">
+<thead><tr><th>endpoint</th><th>requests</th><th>tracked requests</th><th>SQL count</th><th>SQL/request (avg)</th><th>SQL/request (max)</th></tr></thead>
+<tbody>{{range endpointSQLRows .Snapshot.HTTP}}<tr>
+<td class="l">{{.Method}} {{.Path}}</td><td data-v="{{.Requests}}">{{.Requests}}</td><td data-v="{{.Tracked}}">{{.Tracked}} / {{.Requests}}</td>
+{{if .Tracked}}<td data-v="{{.SQLCount}}">{{.SQLCount}}</td><td data-v="{{.SQLPerRequest}}">{{printf "%.2f" .SQLPerRequest}}</td><td data-v="{{.SQLMax}}">{{.SQLMax}}</td>{{else}}<td>—</td><td>—</td><td>—</td>{{end}}
+</tr>{{end}}</tbody>
+</table>
+{{else}}<p class="empty">no HTTP observations</p>{{end}}
+<p class="meta">isutoolsでラップしたDBのQueryContext / ExecContext等にrequest.Context()を渡すと、handler終了までに完了したSQLを集計します（エラーを含む）。contextを渡さないSQL・バックグラウンド処理・WS/SSEは対象外。tracked requestsはHTTP側で計測した件数で、全SQLの捕捉を保証しません。平均の分母はtracked requests。旧データ等の未計測は — と表示します。</p>
 
 <span id="http"></span><h2>HTTP</h2>
 {{if .Snapshot.HTTP}}
