@@ -65,3 +65,44 @@ func TestPoolRatioDisplayQualifiesEstimate(t *testing.T) {
 		t.Fatal("misleading wait presentation")
 	}
 }
+
+func TestPoolClosureChurnWithoutWaitsIsVisiblePerTarget(t *testing.T) {
+	start := time.Unix(100, 0)
+	s := Snapshot{DBPool: []dbpool.Entry{
+		{TargetID: "app", BaselineAt: start, FinalAt: start.Add(time.Minute), MaxIdleClosed: 4476},
+		{TargetID: "low", BaselineAt: start, FinalAt: start.Add(time.Minute), MaxIdleClosed: 18},
+		{TargetID: "partial", BaselineAt: start, FinalAt: start.Add(time.Minute), Partial: true, MaxIdleClosed: 9000},
+	}}
+	got, ok := dbPoolSignal(s)
+	if !ok || got.Level != "warn" || !strings.Contains(got.Evidence, "app max-idle 4476") ||
+		!strings.Contains(got.Evidence, "74.6/s") || !strings.Contains(got.Evidence, "wait starts 0") ||
+		strings.Contains(got.Evidence, "low max-idle") || strings.Contains(got.Evidence, "partial max-idle") ||
+		!strings.Contains(got.NextAction, "1条件ずつ") || !strings.Contains(got.NextAction, "証明できず") {
+		t.Fatalf("churn signal = %+v", got)
+	}
+	if body := renderReport(t, s); !strings.Contains(body, "app max-idle 4476") {
+		t.Fatal("report did not render the churn candidate")
+	}
+}
+
+func TestPoolClosureChurnRequiresCountAndIntervalRate(t *testing.T) {
+	start := time.Unix(100, 0)
+	for _, entry := range []dbpool.Entry{
+		{MaxIdleClosed: 5000}, // no interval
+		{BaselineAt: start, FinalAt: start.Add(time.Minute), MaxIdleClosed: 99},
+		{BaselineAt: start, FinalAt: start.Add(24 * time.Hour), MaxIdleClosed: 100},
+		{BaselineAt: start, FinalAt: start.Add(time.Minute), Code: dbpool.CodeCounterRewind, MaxIdleClosed: 5000},
+	} {
+		got, _ := dbPoolSignal(Snapshot{DBPool: []dbpool.Entry{entry}})
+		if strings.Contains(got.Evidence, "closure candidates") {
+			t.Fatalf("unexpected churn candidate: %+v", got)
+		}
+	}
+	got, _ := dbPoolSignal(Snapshot{DBPool: []dbpool.Entry{{
+		TargetID: "ttl", BaselineAt: start, FinalAt: start.Add(time.Minute),
+		MaxIdleTimeClosed: 30, MaxLifetimeClosed: 70,
+	}}})
+	if got.Level != "warn" || !strings.Contains(got.Evidence, "ttl max-idle 0 / idle-time 30 / lifetime 70") {
+		t.Fatalf("closure reasons = %+v", got)
+	}
+}

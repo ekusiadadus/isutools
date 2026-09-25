@@ -856,6 +856,7 @@ var reportFuncs = template.FuncMap{
 	"experimentEvidenceRows": experimentEvidenceRows,
 	"poolWaitRatio":          poolWaitRatio,
 	"endpointSQLRows":        endpointSQLRows,
+	"endpointShapeRows":      endpointShapeRows,
 	"ms": func(d time.Duration) string {
 		return strconv.FormatFloat(float64(d.Nanoseconds())/1e6, 'f', 1, 64)
 	},
@@ -1207,6 +1208,16 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 </table>
 {{else}}<p class="empty">no HTTP observations</p>{{end}}
 <p class="meta">isutoolsでラップしたDBのQueryContext / ExecContext等にrequest.Context()を渡すと、handler終了までに完了したSQLを集計します（エラーを含む）。contextを渡さないSQL・バックグラウンド処理・WS/SSEは対象外。tracked requestsはHTTP側で計測した件数で、全SQLの捕捉を保証しません。平均の分母はtracked requests。旧データ等の未計測は — と表示します。</p>
+
+<h3>Endpoint × SQL shape / エンドポイント別SQL形</h3>
+<p class="meta">ISUTOOLS_SQL_SHAPES=1 で有効。同じrequest contextで完了したSQLだけを、handler終了時の正規化routeに帰属させます。SQL形は既存SQL表と同じ正規化済みキーです。最大2,048組、request内最大32形を超えた分は (other SQL shapes) に集約します。全SQL集計との差は背景処理・context欠落・計測区間の違いでも生じます。</p>
+{{if .Snapshot.HTTP}}<table id="endpoint-sql-shape-coverage"><thead><tr><th>endpoint</th><th>shape tracked / requests</th><th>shape calls / attributed SQL</th><th>overflow calls</th></tr></thead><tbody>
+{{range endpointSQLRows .Snapshot.HTTP}}<tr><td class="l">{{.Method}} {{.Path}}</td>{{if .ShapeTracked}}<td>{{.ShapeTracked}} / {{.Requests}}</td><td>{{.ShapeCount}} / {{.SQLCount}}</td><td>{{.ShapeOverflow}}</td>{{else}}<td>—</td><td>—</td><td>—</td>{{end}}</tr>{{end}}
+</tbody></table>{{end}}
+{{with endpointShapeRows .Snapshot.HTTP}}
+<table id="endpoint-sql-shapes"><thead><tr><th>endpoint</th><th>SQL shape</th><th>count</th><th>total(ms)</th><th>errors</th><th>SQL/request (avg)</th><th>max/request</th><th>tracked requests</th></tr></thead>
+<tbody>{{range .}}<tr><td class="l">{{.Method}} {{.Path}}</td><td class="l">{{cut .Shape 120}}</td><td data-v="{{.Count}}">{{.Count}}</td><td data-v="{{.Total.Nanoseconds}}">{{dur .Total}}</td><td data-v="{{.Errors}}">{{.Errors}}</td><td data-v="{{.PerRequest}}">{{printf "%.2f" .PerRequest}}</td><td data-v="{{.MaxPerRequest}}">{{.MaxPerRequest}}</td><td>{{.Tracked}}</td></tr>{{end}}</tbody></table>
+{{else}}<p class="empty">no attributed SQL shapes in this snapshot; check request-context coverage above</p>{{end}}
 
 <span id="http"></span><h2>HTTP</h2>
 {{if .Snapshot.HTTP}}

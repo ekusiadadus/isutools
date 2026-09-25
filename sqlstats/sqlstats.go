@@ -112,8 +112,10 @@ func hooks() *proxy.HooksContext {
 		if err == driver.ErrSkip {
 			return
 		}
-		requestsql.Completed(measurement.requestContext)
-		Default.finish(measurement.measurement, normalize(stmt.QueryString), time.Since(measurement.started), err != nil)
+		shape := normalize(stmt.QueryString)
+		duration := time.Since(measurement.started)
+		requestsql.CompletedShape(measurement.requestContext, shape, duration, err != nil)
+		Default.finish(measurement.measurement, shape, duration, err != nil)
 	}
 	return &proxy.HooksContext{
 		PreExec: pre,

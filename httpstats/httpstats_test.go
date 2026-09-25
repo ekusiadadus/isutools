@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ekusiadadus/isutools/internal/requestsql"
 )
 
 type recordingEventObserver struct {
@@ -120,6 +122,76 @@ func TestMiddlewareRecordsRoutePatternWithoutQuery(t *testing.T) {
 	}
 	if e.Total <= 0 || e.Avg <= 0 || e.Max <= 0 || e.P95 <= 0 {
 		t.Errorf("durations must be recorded: %#v", e)
+	}
+}
+
+func TestEndpointShapesUseFinalRouteAndIncludeZeroSQLRequests(t *testing.T) {
+	c := New(WithSQLShapeAttribution(true))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /search/{id}", func(_ http.ResponseWriter, r *http.Request) {
+		if r.PathValue("id") != "empty" {
+			requestsql.CompletedShape(r.Context(), "SELECT seat FROM seats WHERE id = ?", time.Millisecond, false)
+			requestsql.CompletedShape(r.Context(), "SELECT seat FROM seats WHERE id = ?", 2*time.Millisecond, false)
+		}
+	})
+	h := c.Middleware(mux)
+	for _, path := range []string{"/search/123?token=private", "/search/empty"} {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+	}
+	entries := c.Snapshot()
+	if len(entries) != 1 || entries[0].Path != "/search/{id}" {
+		t.Fatalf("route entries = %+v", entries)
+	}
+	e := entries[0]
+	if e.SQLCount != 2 || e.SQLTrackedRequests != 2 || e.SQLShapeTrackedRequests != 2 || len(e.SQLShapes) != 1 {
+		t.Fatalf("SQL coverage = %+v", e)
+	}
+	if shape := e.SQLShapes[0]; shape.Count != 2 || shape.Total != 3*time.Millisecond || shape.MaxPerRequest != 2 {
+		t.Fatalf("SQL shape = %+v", shape)
+	}
+	if strings.Contains(e.Path, "123") || strings.Contains(e.Path, "private") {
+		t.Fatalf("raw request path leaked: %+v", e)
+	}
+}
+
+func TestSQLShapesOffKeepsScalarRequestCount(t *testing.T) {
+	c := New(WithSQLShapeAttribution(false))
+	h := c.Middleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		requestsql.CompletedShape(r.Context(), "SELECT ?", time.Millisecond, false)
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	entries := c.Snapshot()
+	if len(entries) != 1 || entries[0].SQLCount != 1 || entries[0].SQLTrackedRequests != 1 || entries[0].SQLShapeTrackedRequests != 0 || len(entries[0].SQLShapes) != 0 {
+		t.Fatalf("shape attribution should be off: %+v", entries)
+	}
+}
+
+func TestSQLShapeEnvironmentAndExplicitOverride(t *testing.T) {
+	t.Setenv(EnvSQLShapes, "1")
+	if !New().sqlShapes || New(WithSQLShapeAttribution(false)).sqlShapes {
+		t.Fatal("environment opt-in or explicit override was ignored")
+	}
+	t.Setenv(EnvSQLShapes, "0")
+	if New().sqlShapes || !New(WithSQLShapeAttribution(true)).sqlShapes {
+		t.Fatal("default opt-out or explicit override was ignored")
+	}
+}
+
+func TestEndpointShapeBudgetPreservesOverflowAndMaximum(t *testing.T) {
+	table := newTable(10)
+	table.shapeKeys.Store(DefaultMaxShapeKeys - 1)
+	shapes := map[string]requestsql.Shape{
+		"a": {Count: 1, Total: time.Millisecond},
+		"b": {Count: 2, Total: 2 * time.Millisecond},
+		"c": {Count: 3, Total: 3 * time.Millisecond},
+	}
+	table.observeRequestShapes(identity{method: "GET", path: "/x"}, time.Second, 0, 6, true, shapes)
+	rows := table.snapshot()
+	if len(rows) != 1 || rows[0].SQLCount != 6 || len(rows[0].SQLShapes) != 2 {
+		t.Fatalf("shape budget = %+v", rows)
+	}
+	if rows[0].SQLShapes[0].Key != requestsql.OverflowShape || rows[0].SQLShapes[0].Count != 5 || rows[0].SQLShapes[0].MaxPerRequest != 5 {
+		t.Fatalf("overflow shape = %+v", rows[0].SQLShapes)
 	}
 }
 

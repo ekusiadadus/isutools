@@ -76,6 +76,18 @@ JSONの各HTTP行には`sql_count`、`sql_max_per_request`、`sql_tracked_reques
 旧スナップショットなど計測情報のない行は未計測（`—`）と表示し、平均の分母から除外します。
 新たに保存するHTMLとlive reportに表示され、旧データからSQLとの対応を復元することはできません。
 
+`ISUTOOLS_SQL_SHAPES=1`をアプリ起動前に指定すると、**Endpoint × SQL shape** に
+HTTP method・正規化route・正規化SQL形ごとの回数、累計時間、エラー、1リクエストの最多回数を
+記録します。SQL形は既存のSQL表と同じliteral/comment除去済みキーで、raw SQLや引数は保存しません。
+`shape tracked / requests`はこの機能で計測したHTTP件数、`shape calls / attributed SQL`は
+形ごとの回数の合計と既存のHTTP紐付けSQL件数です。JSONの`sql_shape_tracked_requests`と
+`sql_shapes`にも保存され、0と未計測は区別します。
+request内で32種類、run内で2,048組のendpoint×形を超えると、超過分の回数・時間・エラーを
+`(other SQL shapes)`へ集約します。overflow件数は表とJSONの`sql_shapes`に残ります。
+旧run、contextを渡さないSQL、handler終了後のSQL、WS/SSEは形ごとの帰属を復元できません。
+SQL形の反復はN+1の証明ではなく、対象handlerを調べる候補です。opt-inによる実ベンチの
+スコア影響は未測定なので、同条件でon/offを比較してください。
+
 ### MySQL / MariaDB
 
 ```bash
