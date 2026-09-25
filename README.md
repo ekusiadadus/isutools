@@ -50,6 +50,7 @@ DB pool、EXPLAIN、nginx、pprofまで含む手順は[導入ガイド](./docs/I
 | Bottleneck Overview | SQL、HTTP、DB pool、CPU、I/Oのうち、次に確認する場所 |
 | SQL / HTTP | 遅い1回だけでなく、回数を含む累計コストとp95 |
 | SQL per endpoint | エンドポイント別のSQL合計・1リクエスト当たりの平均回数・最大回数 |
+| [実験条件と結果](docs/EXPERIMENTS.md) | 全ホストのCPU余力、SQL回数、負荷条件、合否、減点、再起動確認を同じ表で比較 |
 | Runs / Diff | 変更前後のscore、失敗、total、count、averageの差 |
 | User Flow | 同じ疑似sessionが実際に通ったページ遷移の上位20 |
 | Scenario Stories | 明示scenarioごとの実測request列、session数、request数 |

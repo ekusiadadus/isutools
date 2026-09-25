@@ -45,6 +45,8 @@ db, err := sql.Open(driverName, dsn) // sqlx.Open でも同じ
 
 ### エンドポイント別・1リクエスト当たりのSQL回数
 
+負荷条件・合否・減点・全ホストを同じ実験表に保存する方法は[実験記録ガイド](EXPERIMENTS.md)を参照してください。
+
 `isutools.HTTP` とラップ済みDBドライバを併用し、SQL実行にリクエストのcontextを渡します。
 
 ```go

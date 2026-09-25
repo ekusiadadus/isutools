@@ -54,7 +54,7 @@ func TestSavedRunCanBePreviewedWithCurrentRendererWithoutMutatingOriginal(t *tes
 	handler := NewHandler(Provider{DataDir: dir})
 	preview := httptest.NewRecorder()
 	handler.ServeHTTP(preview, httptest.NewRequest(http.MethodGet, "/20260806-120000.000000000-000001?view=current", nil))
-	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), "結論: 次に修正する場所") ||
+	if preview.Code != http.StatusOK || !strings.Contains(preview.Body.String(), "次に検証する場所") ||
 		!strings.Contains(preview.Body.String(), "/api/app/notification") {
 		t.Fatalf("current renderer preview = %d %q", preview.Code, preview.Body.String())
 	}

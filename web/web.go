@@ -434,12 +434,13 @@ type Meta struct {
 	ProvenanceValid bool   `json:"provenance_valid"`
 	// Score is the benchmark score supplied via POST /save?score=; persisted
 	// snapshots always carry it so every report is attributable to a result.
-	Score         string         `json:"score,omitempty"`
-	BenchmarkPass *bool          `json:"benchmark_pass,omitempty"`
-	Host          sysinfo.Info   `json:"host"`
-	Partial       bool           `json:"partial"`
-	Health        []health.Entry `json:"health,omitempty"`
-	Run           *RunInfo       `json:"run,omitempty"`
+	Score         string              `json:"score,omitempty"`
+	BenchmarkPass *bool               `json:"benchmark_pass,omitempty"`
+	Experiment    *ExperimentMetadata `json:"experiment,omitempty"`
+	Host          sysinfo.Info        `json:"host"`
+	Partial       bool                `json:"partial"`
+	Health        []health.Entry      `json:"health,omitempty"`
+	Run           *RunInfo            `json:"run,omitempty"`
 	// Profiles is the run's runtime-profile record: every capture attempted at
 	// either boundary and the pairs that can be differenced. It is filled when
 	// a run is persisted, because that is the first moment both halves exist;
@@ -1638,6 +1639,11 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 		h.writeAdminError(w, r, http.StatusBadRequest, SaveReasonInvalidPass, "")
 		return
 	}
+	experiment, err := parseExperiment(w, r)
+	if err != nil {
+		h.writeAdminError(w, r, http.StatusBadRequest, "invalid-experiment", "")
+		return
+	}
 	// Refuse a clearly unusable root before changing run state. The root is
 	// opened again for publication so a later filesystem race still fails
 	// closed, but configuration errors cannot consume the active run.
@@ -1736,6 +1742,7 @@ func (h *handler) save(w http.ResponseWriter, r *http.Request) {
 	}
 	snap := h.take()
 	snap.Meta.Score = score
+	snap.Meta.Experiment = experiment
 	if passSet {
 		snap.Meta.BenchmarkPass = &benchmarkPass
 	}

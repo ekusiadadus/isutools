@@ -894,7 +894,9 @@ func barrierWindow(window [2]time.Time) string {
 // are named functions rather than closures so each one can be tested on its
 // own, without rendering a page to find out what it prints.
 var reportFuncs = template.FuncMap{
-	"endpointSQLRows": endpointSQLRows,
+	"diagnosticCandidates":   diagnosticCandidates,
+	"experimentEvidenceRows": experimentEvidenceRows,
+	"endpointSQLRows":        endpointSQLRows,
 	"ms": func(d time.Duration) string {
 		return strconv.FormatFloat(float64(d.Nanoseconds())/1e6, 'f', 1, 64)
 	},
@@ -1003,8 +1005,19 @@ pre.cmd { font-size: .8rem; margin: .2rem 0 .8rem; white-space: pre-wrap; word-b
 <p class="meta">{{.Snapshot.Meta.Host.Hostname}} &middot; {{.Snapshot.Meta.Host.CPUModel}} &middot; {{.Snapshot.Meta.Host.NumCPU}} cores &middot; {{gb .Snapshot.Meta.Host.MemTotalBytes}} GB &middot; {{.Snapshot.Meta.Host.OS}}</p>
 <p class="meta">collectors: SQL &middot; DB schema &middot; HTTP &middot; process &middot; nginx access log</p>
 
+<span id="experiment-evidence"></span><h2>実験条件と結果</h2>
+<p class="meta">同じ条件で変更前後を反復比較してください。pass=trueでも減点・再起動後の検証を別に確認します。スコアの近さだけでは構成全体の上限を示せません。申告欄はベンチ実行者が入力した情報です。</p>
+<table><thead><tr><th>確認項目</th><th>この走行</th></tr></thead>
+<tbody>{{range experimentEvidenceRows .Snapshot}}<tr><td class="l">{{.Metric}}</td><td class="l" style="white-space:normal">{{.Value}}</td></tr>{{end}}</tbody></table>
+<p class="meta">process CPU 100%は約1コア、host CPU 100%は全コア合計です。CPU idleだけでホストの未使用や性能上限を判断できません。未登録ホストは自動検出されません。peerはそれぞれの計測区間・状態を確認してください。SQLとHTTPの件数差にはContextなしの呼び出し、バックグラウンドSQL、計測境界のずれも含まれ得ます。</p>
+
+{{with diagnosticCandidates .Snapshot}}<h2>優先して検証する候補</h2>
+<table><thead><tr><th>候補</th><th>観測された根拠</th><th>次の実験</th></tr></thead><tbody>
+{{range .}}<tr><td class="l">{{.Title}}</td><td class="l" style="white-space:normal">{{.Evidence}}</td><td class="l" style="white-space:normal">{{.NextStep}}</td></tr>{{end}}
+</tbody></table>{{end}}
+
 {{$diagnosis := diagnosis .Snapshot}}
-<span id="diagnosis"></span><h2>結論: 次に修正する場所 <span class="meta">(実測と候補を分離)</span></h2>
+<span id="diagnosis"></span><h2>次に検証する場所 <span class="meta">(実測と候補を分離)</span></h2>
 <p class="meta">この要約は修正の探索順を示します。候補のendpoint/queryと、profileで検証済みのソース行は同じ意味ではありません。</p>
 <div class="decision-grid">
 <article class="decision {{$diagnosis.PrimaryLevel}}">
@@ -1224,7 +1237,7 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 {{end}}{{end}}
 
 <span id="endpoint-sql"></span><h2>SQL per endpoint / エンドポイント別SQL回数</h2>
-<p class="meta">HTTP method + 正規化したpath単位でstatus・protocolを合算。平均SQL回数/リクエストの多い順。SQLが0回のリクエストも分母に含みます。</p>
+<p class="meta">HTTP method + 正規化したpath単位でstatus・protocolを合算。捕捉した平均SQL回数/リクエストの多い順。SQLが0回のリクエストも分母に含みます。表示が0でも、ContextなしのSQLが発行されていない証明にはなりません。</p>
 {{if .Snapshot.HTTP}}
 <table id="endpoint-sql-table">
 <thead><tr><th>endpoint</th><th>requests</th><th>tracked requests</th><th>SQL count</th><th>SQL/request (avg)</th><th>SQL/request (max)</th></tr></thead>
@@ -1371,7 +1384,7 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 <h2>Processes</h2>
 {{if .Snapshot.Proc}}
 <p class="meta">status {{.Snapshot.Proc.Health.Status}} &middot; interval jiffies {{.Snapshot.Proc.IntervalJiffies}} &middot; {{.Snapshot.Proc.CPUs}} CPUs</p>
-{{with .Snapshot.Proc.CPUTotal}}<p class="meta"><strong>CPU total: {{f1 .BusyPercent}}% busy</strong> (user {{f1 .UserPercent}}% / sys {{f1 .SystemPercent}}% / iowait {{f1 .IOWaitPercent}}% / idle {{f1 .IdlePercent}}%) — idle が大きければ並列度・設定不足、busy 100% 近くなら CPU 飽和</p>{{end}}
+{{with .Snapshot.Proc.CPUTotal}}<p class="meta"><strong>CPU total: {{f1 .BusyPercent}}% busy</strong> (user {{f1 .UserPercent}}% / sys {{f1 .SystemPercent}}% / iowait {{f1 .IOWaitPercent}}% / idle {{f1 .IdlePercent}}%) — 全コア合計で100%。idleはCPUの余力を示しますが、並列度不足やシステム全体の上限を証明するものではありません。</p>{{end}}
 {{if .Snapshot.Proc.TopCPU}}<table>
 <thead><tr><th>CPU%</th><th>CPU(s)</th><th>RSS(MiB)</th><th>PID</th><th>command</th></tr></thead>
 <tbody>{{range .Snapshot.Proc.TopCPU}}<tr>

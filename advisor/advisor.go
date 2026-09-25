@@ -147,7 +147,7 @@ func provenanceClass(id string) (category, source, freshness, scope, limitation 
 func checkDSN(opts Options) []Check {
 	c := Check{
 		ID:    "dsn-interpolate-params",
-		Title: "MySQL DSN: interpolateParams(プリペアドステートメント往復の削減)",
+		Title: "MySQL DSN: interpolateParams(パラメータ付きSQLの往復候補)",
 	}
 	switch {
 	case opts.DSN == "" || !strings.Contains(strings.ToLower(opts.DriverName), "mysql"):
@@ -157,8 +157,8 @@ func checkDSN(opts Options) []Check {
 		c.Status = StatusOK
 	default:
 		c.Status = StatusMissing
-		c.Detail = "DSN に interpolateParams=true がない(クエリ毎に Prepare/Execute の2往復)"
-		c.Recommendation = "DSN へ interpolateParams=true を追加(go-sql-driver はクライアント側プレースホルダ展開になり往復半減)"
+		c.Detail = "DSN に interpolateParams=true がない。パラメータ付きSQLではprepareの往復が増える場合がありますが、明示的なprepared statementの再利用などでは条件が異なります。"
+		c.Recommendation = "interpolateParams=trueを単独の変更として試し、同じ負荷・初期データで正しさ、score、p95、error rateを比較します。効果は未測定です。"
 	}
 	return []Check{c}
 }

@@ -259,7 +259,7 @@ func TestProfileAnalysisDerivedHTMLRendersCompleteEvidenceAndEscapesData(t *test
 		preview.Header().Get("X-Isutools-Profile-Analysis") != "current" {
 		t.Fatalf("current analysis preview = %d headers=%v: %s", preview.Code, preview.Header(), preview.Body.String())
 	}
-	for _, want := range []string{"結論: 次に修正する場所", `data-target="isutools-profile-lines"`, `data-expand=".isutools-flame" data-expand-ready="true"`, `id="isutools-profile-lines"`, `class="isutools-flame"`, "Flame view (interval / ready)", "次に見るソース行", "app_handlers.go:711"} {
+	for _, want := range []string{"次に検証する場所", `data-target="isutools-profile-lines"`, `data-expand=".isutools-flame" data-expand-ready="true"`, `id="isutools-profile-lines"`, `class="isutools-flame"`, "Flame view (interval / ready)", "次に見るソース行", "app_handlers.go:711"} {
 		if !strings.Contains(preview.Body.String(), want) {
 			t.Errorf("current analysis preview missing %q: %s", want, preview.Body.String())
 		}

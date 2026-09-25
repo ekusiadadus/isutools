@@ -42,6 +42,8 @@ type diffPage struct {
 	Contradictions    []diffContradiction
 	Funnels           []funnelDiffRow
 	FlowEdges         []flowEdgeDiffRow
+	Experiment        []experimentComparisonRow
+	ExperimentWarning string
 }
 
 type funnelDiffRow struct {
@@ -103,6 +105,8 @@ func (h *handler) diff(w http.ResponseWriter, r *http.Request) {
 		Contradictions:    detectContradictions(*snapA, *snapB),
 		Funnels:           diffFunnels(snapA.FlowVisualization(), snapB.FlowVisualization()),
 		FlowEdges:         diffFlowEdges(snapA.FlowVisualization(), snapB.FlowVisualization()),
+		Experiment:        experimentComparison(*snapA, *snapB),
+		ExperimentWarning: experimentComparisonWarning(snapA.Meta.Experiment, snapB.Meta.Experiment),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := diffTmpl.Execute(w, page); err != nil {
@@ -508,6 +512,12 @@ a { color: #0b57d0; }
 <h1>diff: {{.A}} (score {{.AScore}}) &rarr; {{.B}} (score {{.BScore}})</h1>
 <p class="meta">delta = B - A。合計時間の変化量順、上位30件。件数が異なる行では合計deltaを改善・悪化とは判定できません。avgと負荷条件を確認してください。<a href="./">&larr; runs</a></p>
 {{if .ProvenanceWarning}}<p class="warn">{{.ProvenanceWarning}}</p>{{end}}
+<h2>実験条件と結果</h2>
+<p class="warn">{{.ExperimentWarning}}</p>
+<p class="meta">スコア・合否・減点・再起動確認と全ホストのCPU余力を合わせて確認します。process CPU 100%は約1コア、host CPU 100%は全コア合計です。未計測をidleとみなさず、スコアの近さだけで頭打ちを判定しません。</p>
+<table><thead><tr><th>確認項目</th><th>A</th><th>B</th></tr></thead><tbody>
+{{range .Experiment}}<tr><td class="l">{{.Metric}}</td><td class="l" style="white-space:normal">{{.A}}</td><td class="l" style="white-space:normal">{{.B}}</td></tr>{{end}}
+</tbody></table>
 {{range .Contradictions}}<div class="contradiction">
 <p class="warn">{{.Label}}</p>
 <p class="meta">outcome: {{.Outcome.Signal}} ({{.Outcome.Metric}}) A={{ms1 .Outcome.A}} B={{ms1 .Outcome.B}}; {{.Outcome.Formula}}; limitation: {{.Outcome.Limitation}}</p>

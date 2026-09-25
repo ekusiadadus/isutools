@@ -151,7 +151,7 @@ func TestReportPutsDecisionAndCodeEvidenceBeforeDenseTables(t *testing.T) {
 		Meta: Meta{Profiles: &ProfileManifest{RunID: "run-without-cpu"}},
 	}
 	body := renderReport(t, snapshot)
-	decision := strings.Index(body, "結論: 次に修正する場所")
+	decision := strings.Index(body, "次に検証する場所")
 	overview := strings.Index(body, "Bottleneck Overview")
 	if decision < 0 || overview < 0 || decision >= overview {
 		t.Fatalf("decision must precede evidence tables: decision=%d overview=%d", decision, overview)

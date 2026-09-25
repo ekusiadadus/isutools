@@ -51,6 +51,7 @@ See the [integration guide](./docs/INTEGRATION.md) for DB-pool, EXPLAIN, nginx, 
 | Bottleneck Overview | Which of SQL, HTTP, DB pool, CPU, or I/O deserves the next check |
 | SQL / HTTP | Cumulative cost and p95, not just one slow request |
 | SQL per endpoint | Total SQL calls and average / maximum calls per request, grouped by endpoint |
+| [Experiment evidence](docs/EXPERIMENTS.md) | Compare host CPU headroom, SQL counts, workload settings, pass/fail, penalties, and restart confirmation together |
 | Runs / Diff | Score, failure, total, count, and average changes between runs |
 | User Flow | The top 20 page transitions actually taken by one pseudonymous session |
 | Scenario Stories | Observed request sequences and counts for each explicit scenario |

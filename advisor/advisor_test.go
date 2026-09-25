@@ -45,6 +45,11 @@ func TestDSNInterpolateParams(t *testing.T) {
 	if c.Status != StatusMissing {
 		t.Errorf("status = %q, want missing when interpolateParams is absent", c.Status)
 	}
+	if strings.Contains(c.Detail, "クエリ毎") || strings.Contains(c.Recommendation, "往復半減") ||
+		!strings.Contains(c.Detail, "場合") || !strings.Contains(c.Detail, "prepared statement") ||
+		!strings.Contains(c.Recommendation, "同じ負荷") || !strings.Contains(c.Recommendation, "正しさ") {
+		t.Errorf("DSN advice overclaims universal benefit or lacks experiment boundary: %+v", c)
+	}
 
 	checks = Collect(context.Background(), Options{
 		DriverName: "mysql",
