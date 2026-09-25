@@ -153,23 +153,7 @@ func diagnoseBottleneck(snapshot Snapshot) bottleneckDiagnosis {
 		Amplifier:       "負荷を増幅している操作は未判定です",
 	}
 
-	var waits int64
-	var waitDuration time.Duration
-	var open, maxOpen int
-	for _, entry := range snapshot.DBPool {
-		waits += entry.WaitCount
-		waitDuration += entry.WaitDuration
-		open += entry.Open
-		maxOpen += entry.MaxOpen
-	}
-	if waits > 0 {
-		avg := waitDuration / time.Duration(waits)
-		diagnosis.PrimaryLevel = "hot"
-		diagnosis.Primary = "第一修正候補: DB接続プール待ちを減らす"
-		diagnosis.PrimaryEvidence = fmt.Sprintf("wait %s回・累計%s・平均%s、open %d / max %d。requestが接続取得前に待っています。", humanCount(waits), humanDuration(waitDuration), humanDuration(avg), open, maxOpen)
-		diagnosis.PrimaryAction = "DB Poolのtarget別waitと、SQL/handler内で接続を保持する区間を確認します。上限を増やすだけでなく、transaction範囲とquery回数を先に縮めます。"
-		diagnosis.PrimaryAnchor = "db-pool"
-	} else if snapshot.Proc != nil && snapshot.Proc.CPUTotal != nil && procIntervalMatchesRun(snapshot) && snapshot.Proc.CPUTotal.BusyPercent >= 90 {
+	if snapshot.Proc != nil && snapshot.Proc.CPUTotal != nil && procIntervalMatchesRun(snapshot) && snapshot.Proc.CPUTotal.BusyPercent >= 90 {
 		diagnosis.PrimaryLevel = "hot"
 		diagnosis.Primary = "第一修正候補: CPU hot pathを短くする"
 		diagnosis.PrimaryEvidence = fmt.Sprintf("run区間のCPU busy %.1f%%。", snapshot.Proc.CPUTotal.BusyPercent)
@@ -182,6 +166,12 @@ func diagnoseBottleneck(snapshot Snapshot) bottleneckDiagnosis {
 		diagnosis.PrimaryEvidence = fmt.Sprintf("count %s・累計%s・%s", humanCount(top.Count), humanDuration(top.Total), truncateRunes(top.Key, 100))
 		diagnosis.PrimaryAction = "HTTP一回あたりの発行回数、rows examined、Query Planを照合します。"
 		diagnosis.PrimaryAnchor = "sql"
+	} else if pool, ok := dbPoolSignal(snapshot); ok {
+		diagnosis.PrimaryLevel = "warn"
+		diagnosis.Primary = "DB接続プールの計測を確認"
+		diagnosis.PrimaryEvidence = pool.Evidence
+		diagnosis.PrimaryAction = pool.NextAction
+		diagnosis.PrimaryAnchor = "db-pool"
 	}
 
 	if len(snapshot.HTTP) > 0 {
@@ -422,38 +412,6 @@ func absDuration(value time.Duration) time.Duration {
 		return -value
 	}
 	return value
-}
-
-func dbPoolSignal(snapshot Snapshot) (bottleneckSignal, bool) {
-	if len(snapshot.DBPool) == 0 {
-		return bottleneckSignal{}, false
-	}
-	var waits int64
-	var waitDuration time.Duration
-	var open, maxOpen int
-	for _, entry := range snapshot.DBPool {
-		waits += entry.WaitCount
-		waitDuration += entry.WaitDuration
-		open += entry.Open
-		maxOpen += entry.MaxOpen
-	}
-	level := "ok"
-	next := "pool wait はありません。DB接続上限は現在の主要因ではありません。"
-	if waits > 0 {
-		level = "hot"
-		next = "pool 上限が request latency を決めています。平均wait、in-use、DB max_connections を確認します。"
-	}
-	avg := time.Duration(0)
-	if waits > 0 {
-		avg = waitDuration / time.Duration(waits)
-	}
-	return bottleneckSignal{
-		Order:      "capacity",
-		Level:      level,
-		Signal:     "DB pool",
-		Evidence:   fmt.Sprintf("waits %d · total %s · avg %s · open %d / max %d", waits, humanDuration(waitDuration), humanDuration(avg), open, maxOpen),
-		NextAction: next,
-	}, true
 }
 
 func sqlRowsSignal(snapshot Snapshot) (bottleneckSignal, bool) {
@@ -896,6 +854,7 @@ func barrierWindow(window [2]time.Time) string {
 var reportFuncs = template.FuncMap{
 	"diagnosticCandidates":   diagnosticCandidates,
 	"experimentEvidenceRows": experimentEvidenceRows,
+	"poolWaitRatio":          poolWaitRatio,
 	"endpointSQLRows":        endpointSQLRows,
 	"ms": func(d time.Duration) string {
 		return strconv.FormatFloat(float64(d.Nanoseconds())/1e6, 'f', 1, 64)
@@ -1266,7 +1225,7 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 <span id="db-pool"></span><h2>DB Pool <span class="meta">(database/sql のコネクションプール。点の値は終端境界、カウンタは区間デルタ)</span></h2>
 <table>
 <thead><tr>
-<th>max open</th><th>open</th><th>in use</th><th>idle</th><th>waits</th><th>wait 合計*</th><th>平均 wait</th><th>idle closed</th><th>idletime closed</th><th>lifetime closed</th><th>interval</th><th>target</th><th>endpoint</th>
+<th>max open</th><th>open</th><th>in use</th><th>idle</th><th>waits</th><th>wait 合計*</th><th>wait時間 / 開始件数*</th><th>idle closed</th><th>idletime closed</th><th>lifetime closed</th><th>interval</th><th>target</th><th>endpoint</th>
 </tr></thead>
 <tbody>
 {{range .Snapshot.DBPool}}<tr>
@@ -1276,7 +1235,7 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 <td data-v="{{.Idle}}">{{.Idle}}</td>
 <td data-v="{{.WaitCount}}"{{if .WaitCount}} class="flag"{{end}}>{{.WaitCount}}</td>
 <td data-v="{{.WaitDuration.Nanoseconds}}">{{dur .WaitDuration}}</td>
-<td data-v="{{.AverageWait.Nanoseconds}}">{{if .WaitCount}}{{dur .AverageWait}}{{else}}-{{end}}</td>
+<td>{{poolWaitRatio .}}</td>
 <td data-v="{{.MaxIdleClosed}}">{{.MaxIdleClosed}}</td>
 <td data-v="{{.MaxIdleTimeClosed}}">{{.MaxIdleTimeClosed}}</td>
 <td data-v="{{.MaxLifetimeClosed}}">{{.MaxLifetimeClosed}}</td>
@@ -1286,7 +1245,8 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 </tr>{{end}}
 </tbody>
 </table>
-<p class="meta">* wait 合計 (wait_duration) は待たされた goroutine 全員の待ち時間の総和であり、経過時間ではありません。並列待機のぶん run の長さを超えることがあるので、クエリ遅延と比べるときは並列度を含まない「平均 wait」(wait_duration ÷ waits) を使ってください。waits が 0 でなければ、そのぶんの待ち時間を決めたのは DB ではなくプール上限です。</p>
+<p class="meta">* wait 合計は、待ちが終了した時点で加算されるgoroutine全員の待ち時間の総和です。経過時間ではありません。waitsは待ち開始時に増えるため、区間境界では件数と時間の対象が一致しません。時間 / 開始件数は参考比率で、厳密な平均 waitではありません。片方が0またはpartialな場合は — と表示します。両方0でも進行中の待ちや接続保持を否定できません。counter-rewind行の値は区間デルタではなく終端の累積値です。</p>
+<p class="meta">設定された最大idle数・idle時間・接続寿命はDB.Statsから取得できません。closed回数だけで設定不足や再接続コストは断定できません。Conn.Close / Rows.Close、transaction内外のDB呼び出し、DB側負荷を合わせて確認してください。</p>
 {{end}}
 
 <h2>Counters <span class="meta">(isutools.Count によるアプリ内カウンタ)</span></h2>

@@ -80,38 +80,64 @@ type profileLineHotspot struct {
 
 func profileLineHotspots(analysis profilemodel.ProfileAnalysisV1) []profileLineHotspot {
 	const maxRows = 12
-	rows := make([]profileLineHotspot, 0, maxRows)
-	for _, attempt := range analysis.Attempts {
-		for _, summary := range attempt.Summaries {
-			for _, report := range summary.Reports {
-				if report.Granularity != profilemodel.GranularityLines {
-					continue
-				}
-				for _, group := range []struct {
-					metric string
-					nodes  []profilemodel.ProfileNode
-				}{
-					{metric: "cumulative", nodes: report.TopCumulative},
-					{metric: "flat", nodes: report.TopFlat},
-				} {
-					for _, node := range group.nodes {
-						if node.File == "" || node.Line <= 0 {
-							continue
-						}
-						rows = append(rows, profileLineHotspot{
-							Kind: attempt.Kind, SampleType: summary.SampleType, Metric: group.metric,
-							Location: fmt.Sprintf("%s:%d", node.File, node.Line), Node: node,
-							Percent: profilePercent(node.Value, summary.PercentDenominator),
-						})
-						if len(rows) == maxRows {
-							return rows
-						}
+	cpuRows := make([]profileLineHotspot, 0, maxRows)
+	otherRows := make([]profileLineHotspot, 0, maxRows)
+	appendSummary := func(attempt profilemodel.ProfileAttempt, summary profilemodel.ProfileSummary, rows *[]profileLineHotspot) {
+		for _, report := range summary.Reports {
+			if report.Granularity != profilemodel.GranularityLines {
+				continue
+			}
+			for _, group := range []struct {
+				metric string
+				nodes  []profilemodel.ProfileNode
+			}{
+				{metric: "cumulative", nodes: report.TopCumulative},
+				{metric: "flat", nodes: report.TopFlat},
+			} {
+				for _, node := range group.nodes {
+					if len(*rows) == maxRows {
+						return
 					}
+					if node.File == "" || node.Line <= 0 {
+						continue
+					}
+					*rows = append(*rows, profileLineHotspot{
+						Kind: attempt.Kind, SampleType: summary.SampleType, Metric: group.metric,
+						Location: fmt.Sprintf("%s:%d", node.File, node.Line), Node: node,
+						Percent: profilePercent(node.Value, summary.PercentDenominator),
+					})
 				}
 			}
 		}
 	}
-	return rows
+	for _, attempt := range analysis.Attempts {
+		if attempt.Kind == "cpu" {
+			// CPU time is the useful sample type for instruction-level work.
+			// Keep it ahead of the CPU profile's samples/count summary.
+			for _, summary := range attempt.Summaries {
+				if summary.SampleType == "cpu" && summary.Unit == "nanoseconds" {
+					appendSummary(attempt, summary, &cpuRows)
+				}
+			}
+			for _, summary := range attempt.Summaries {
+				if summary.SampleType != "cpu" || summary.Unit != "nanoseconds" {
+					appendSummary(attempt, summary, &cpuRows)
+				}
+			}
+			continue
+		}
+		for _, summary := range attempt.Summaries {
+			appendSummary(attempt, summary, &otherRows)
+		}
+	}
+	// Reserve space for both CPU and runtime evidence without comparing values
+	// whose units or sampling semantics differ.
+	cpuCount := min(len(cpuRows), maxRows/2)
+	otherCount := min(len(otherRows), maxRows-cpuCount)
+	cpuCount = min(len(cpuRows), maxRows-otherCount)
+	rows := make([]profileLineHotspot, 0, cpuCount+otherCount)
+	rows = append(rows, cpuRows[:cpuCount]...)
+	return append(rows, otherRows[:otherCount]...)
 }
 
 func profileRows(nodes []profilemodel.ProfileNode, denominator int64) []profileTemplateRow {

@@ -92,6 +92,8 @@ func Generate(input ProfileInput) ([]Recipe, error) {
 		case spec.source && !input.SourceAvailable:
 			recipe.Ready, recipe.Code = false, "source-unavailable"
 			recipe.Conditions = []string{"provide the matching source revision or source search path"}
+		case spec.source:
+			recipe.Conditions = []string{"source directory exists, but its revision was not verified; confirm it matches the captured binary before interpreting source lines"}
 		}
 		result = append(result, recipe)
 	}

@@ -87,6 +87,8 @@ go tool trace trace_CAPTURE.out
 
 累積open/closeだけ`-base`、独立run比較だけ`-diff_base`を使う。`-normalize`はworkload量を正規化したい比較で明示的にだけ使う。binary SHA不一致、pair欠損、source欠損、trace incompleteはready commandにならない。Go公式もdiagnostic同士が干渉し得るとしているため、CPU、trace、memory/block系は個別runで測る。
 
+SIMDを検討するときはCPU profileの`cpu/nanoseconds`で熱い関数・行を絞り、capture時とSHAが一致するbinaryを`pprof -disasm`で調べる。assemblyにvector命令があるかは人が確認する。`--source-root`はdirectoryの存在だけを検査し、capture時のsource revisionとの一致は検証しないため、`-list`/`-weblist`の行を解釈する前にsource revisionとbuild条件を確認する。profileのsampleだけではvector化の有無、命令ごとの実行回数、hardware counter、SIMD変更による改善は判定できない。変更後は同じworkloadでcorrectnessとscore・CPU時間を比較する。
+
 追加profileは全てopt-in:
 
 ```bash

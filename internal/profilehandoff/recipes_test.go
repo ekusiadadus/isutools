@@ -29,6 +29,12 @@ func TestGenerateUsesBaseForCumulativeAndNeverTraceTool(t *testing.T) {
 	if source := strings.Join(findRecipe(t, recipes, "pprof-source").Argv, " "); !strings.Contains(source, "-source_path=/matching source") {
 		t.Fatalf("source recipe=%q", source)
 	}
+	for _, purpose := range []string{"pprof-source", "pprof-weblist"} {
+		recipe := findRecipe(t, recipes, purpose)
+		if len(recipe.Conditions) != 1 || !strings.Contains(recipe.Conditions[0], "revision was not verified") {
+			t.Fatalf("%s provenance conditions=%+v", purpose, recipe.Conditions)
+		}
+	}
 }
 
 func TestGenerateGatesBinarySourceAndLabels(t *testing.T) {

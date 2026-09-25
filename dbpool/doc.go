@@ -2,11 +2,10 @@
 // measurement run.
 //
 // The pool is the narrowest part of most ISUCON application stacks. When
-// SetMaxOpenConns is smaller than the number of concurrent handlers, requests
-// queue *inside* database/sql, where neither the SQL statistics nor the HTTP
-// handler timings can see them: every individual query looks fast while the
-// request that issued it is slow. Reporting WaitCount and WaitDuration over
-// the run interval is what makes that invisible queue visible.
+// SetMaxOpenConns can make requests queue inside database/sql. Driver-level
+// SQL timings do not include time before a connection is acquired, while HTTP
+// timings may include it. WaitCount and WaitDuration expose this queue, though
+// the two counters update at different moments and waits may span boundaries.
 //
 // This version displays numbers only. There is deliberately no advisor
 // threshold yet:

@@ -41,24 +41,24 @@ type Entry struct {
 	// Idle is the number of pooled, unused connections at that moment.
 	Idle int `json:"idle"`
 
-	// WaitCount is how many times a caller had to wait for a connection during
-	// the interval. Any non-zero value means the pool limit, not the database,
-	// decided the latency of those calls.
+	// WaitCount is the change in the number of connection requests queued by
+	// database/sql during the interval. A queued request may still be waiting
+	// at the final boundary or may later be canceled.
 	WaitCount int64 `json:"wait_count"`
-	// WaitDuration is the summed wait of every waiting goroutine during the
-	// interval — not wall-clock time. It can legitimately exceed the length of
-	// the run, so it must always be displayed with that caveat and is best
-	// read through AverageWait.
+	// WaitDuration is the change in accumulated wait time. Each wait is added
+	// when it ends, so the delta can include time before the baseline and
+	// excludes waits still in progress. It sums concurrent goroutines rather
+	// than elapsed run time. Read it alongside WaitCount, whose update occurs
+	// at wait start instead of wait completion.
 	WaitDuration time.Duration `json:"wait_duration_ns"`
-	// MaxIdleClosed counts connections closed during the interval because the
-	// idle pool was full (SetMaxIdleConns too small for the traffic).
+	// MaxIdleClosed counts connections closed during the interval under the
+	// MaxIdleConns policy, including when the configured limit is reduced.
 	MaxIdleClosed int64 `json:"max_idle_closed"`
 	// MaxIdleTimeClosed counts connections closed during the interval by
 	// SetConnMaxIdleTime.
 	MaxIdleTimeClosed int64 `json:"max_idle_time_closed"`
 	// MaxLifetimeClosed counts connections closed during the interval by
-	// SetConnMaxLifetime. A large value means the run spent its time
-	// reconnecting.
+	// SetConnMaxLifetime. It does not measure reconnection time.
 	MaxLifetimeClosed int64 `json:"max_lifetime_closed"`
 
 	// BaselineAt and FinalAt are the measured ends of this entry's interval,
@@ -83,14 +83,25 @@ func (e Entry) Interval() time.Duration {
 	return e.FinalAt.Sub(e.BaselineAt)
 }
 
-// AverageWait is the mean time one waiting caller spent queued for a
-// connection. Unlike WaitDuration itself this is safe to compare with a query
-// latency, because dividing the summed wait by the number of waits removes the
-// concurrency factor without assuming anything about the distribution. It is
-// zero when nobody waited.
+// AverageWait preserves the historical WaitDuration/WaitCount calculation.
+// This quotient is not necessarily the mean for one cohort of requests:
+// WaitCount increases when a request begins waiting, while WaitDuration
+// increases when it finishes. A request spanning a run boundary contributes
+// to different intervals. It is zero when WaitCount is zero.
 func (e Entry) AverageWait() time.Duration {
 	if e.WaitCount <= 0 {
 		return 0
 	}
 	return e.WaitDuration / time.Duration(e.WaitCount)
+}
+
+// WaitRatio returns the boundary-counter quotient when both deltas are
+// positive and the entry is complete. The value is an estimate, not a precise
+// per-request mean, because waits can cross either measurement boundary.
+// Unavailable ratios are reported with ok=false rather than as zero latency.
+func (e Entry) WaitRatio() (value time.Duration, ok bool) {
+	if e.Partial || e.Code != "" || e.WaitCount <= 0 || e.WaitDuration <= 0 {
+		return 0, false
+	}
+	return e.WaitDuration / time.Duration(e.WaitCount), true
 }

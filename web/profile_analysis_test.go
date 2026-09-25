@@ -71,6 +71,44 @@ func TestProfileAnalysisCapabilitiesAreReadOnlyAndFailClosedInputsAreExplicit(t 
 	}
 }
 
+func TestProfileLineHotspotsKeepsCPUTimeVisibleAlongsideRuntimeProfiles(t *testing.T) {
+	makeNodes := func(prefix string, count int) []profilemodel.ProfileNode {
+		nodes := make([]profilemodel.ProfileNode, count)
+		for i := range nodes {
+			nodes[i] = profilemodel.ProfileNode{Function: prefix, File: prefix + ".go", Line: int64(i + 1), Value: int64(count - i)}
+		}
+		return nodes
+	}
+	lines := func(nodes []profilemodel.ProfileNode) []profilemodel.ProfileReport {
+		return []profilemodel.ProfileReport{{Granularity: profilemodel.GranularityLines, TopCumulative: nodes}}
+	}
+	analysis := profilemodel.ProfileAnalysisV1{Attempts: []profilemodel.ProfileAttempt{
+		{Kind: "mutex", Summaries: []profilemodel.ProfileSummary{{SampleType: "delay", Unit: "nanoseconds", PercentDenominator: 100, Reports: lines(makeNodes("mutex", 12))}}},
+		{Kind: "cpu", Summaries: []profilemodel.ProfileSummary{
+			{SampleType: "samples", Unit: "count", PercentDenominator: 100, Reports: lines(makeNodes("samples", 12))},
+			{SampleType: "cpu", Unit: "nanoseconds", PercentDenominator: 100, Reports: lines(makeNodes("cpu", 12))},
+		}},
+	}}
+	rows := profileLineHotspots(analysis)
+	if len(rows) != 12 {
+		t.Fatalf("rows=%d, want 12", len(rows))
+	}
+	for i := 0; i < 6; i++ {
+		if rows[i].Kind != "cpu" || rows[i].SampleType != "cpu" || rows[i].Node.Function != "cpu" {
+			t.Fatalf("CPU row %d=%+v", i, rows[i])
+		}
+	}
+	for i := 6; i < 12; i++ {
+		if rows[i].Kind != "mutex" {
+			t.Fatalf("runtime row %d=%+v", i, rows[i])
+		}
+	}
+	analysis.Attempts = analysis.Attempts[1:]
+	if rows := profileLineHotspots(analysis); len(rows) != 12 || rows[11].Kind != "cpu" {
+		t.Fatalf("CPU-only rows=%+v", rows)
+	}
+}
+
 func TestProfileAnalysisPublishCASAndImmutableOriginal(t *testing.T) {
 	dir := t.TempDir()
 	h := newHandler(Provider{DataDir: dir, ProfileAnalysis: true})

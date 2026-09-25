@@ -57,8 +57,8 @@ func TestBottleneckOverviewRanksDemandAndCapacitySignals(t *testing.T) {
 	if got := bySignal["CPU"]; got.Level != "ok" || !strings.Contains(got.NextAction, "余力") {
 		t.Fatalf("CPU signal = %+v, want low run-aligned CPU to redirect the investigation", got)
 	}
-	if got := bySignal["DB pool"]; got.Level != "ok" || !strings.Contains(got.Evidence, "waits 0") {
-		t.Fatalf("DB pool signal = %+v, want zero waits reported", got)
+	if got := bySignal["DB pool"]; got.Level != "info" || !strings.Contains(got.Evidence, "wait starts 0") || !strings.Contains(got.NextAction, "否定するものではありません") {
+		t.Fatalf("DB pool signal = %+v, want zero counter deltas without excluding ongoing waits", got)
 	}
 	if got := bySignal["SQL row efficiency"]; got.Level != "hot" || !strings.Contains(got.Evidence, "640.0") {
 		t.Fatalf("row-efficiency signal = %+v, want the costly inefficient digest", got)
@@ -126,10 +126,11 @@ func TestDiagnosisSummarySeparatesFixCandidateFromCodeEvidence(t *testing.T) {
 	}
 
 	diagnosis := diagnoseBottleneck(snapshot)
-	if diagnosis.PrimaryLevel != "hot" ||
-		!strings.Contains(diagnosis.Primary, "DB接続プール") ||
-		!strings.Contains(diagnosis.PrimaryEvidence, "59,001") {
-		t.Fatalf("primary diagnosis = %+v, want pool saturation first", diagnosis)
+	if diagnosis.PrimaryLevel != "warn" || diagnosis.PrimaryAnchor != "sql" {
+		t.Fatalf("primary diagnosis = %+v, pool waits alone must not force first priority", diagnosis)
+	}
+	if pool, ok := dbPoolSignal(snapshot); !ok || !strings.Contains(pool.Evidence, "59001") || pool.Level != "warn" {
+		t.Fatalf("pool evidence = %+v", pool)
 	}
 	if !strings.Contains(diagnosis.Amplifier, "long-poll候補") ||
 		!strings.Contains(diagnosis.HTTPSearchKey, "/api/app/notification") {

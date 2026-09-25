@@ -890,6 +890,11 @@ func runRecipes(args []string, stdout, stderr io.Writer) error {
 			}
 			continue
 		}
+		for _, condition := range recipe.Conditions {
+			if _, err := fmt.Fprintf(stdout, "# %s: %s\n", recipe.Purpose, condition); err != nil {
+				return fmt.Errorf("write recipe conditions: %w", err)
+			}
+		}
 		command, renderErr := profilehandoff.RenderShell(recipe.Argv)
 		if renderErr != nil {
 			return renderErr

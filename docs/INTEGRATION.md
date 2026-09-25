@@ -736,6 +736,7 @@ netstats の値を閾値にする advisor check は意図的にありません�
 
 `database/sql` のプール統計(`(*sql.DB).Stats`)を run の両端で取ります。
 唯一の前提は「**登録済みの TargetID で `WatchDBPool` を呼ぶこと**」です。
+`SQLDriverName` や `sql.Open` だけでは pool は自動登録されません。
 
 ```go
 db, err := sql.Open(isutools.SQLDriverName("mysql"), dsn)
@@ -772,8 +773,19 @@ run の途中で watch したプールは**次の run から**計測されます
 レポートの `meta.partial` が立ちます(未 watch を告げる `dbpool-not-registered` だけは
 info 扱いで、`partial` にはしません)。
 
-数値のしきい値判定は v1.2 では意図的に入れていません(`WaitDuration` は全 goroutine の
+数値のしきい値判定は意図的に入れていません(`WaitDuration` は全 goroutine の
 待ち時間の総和なので、区間の実時間と比べても意味を持たないため)。
+`WaitCount` は待ち始めた時点、`WaitDuration` は待ち終えた時点で増えます。
+run 境界をまたぐ待ちでは二つの差分が別の run に入るため、
+`WaitDuration / WaitCount` は同じ待ちの厳密な平均ではなく推定値です。
+部分区間や片方の差分が 0 の場合、平均は算出できません。待ちの発生だけで
+遅延の主因や上限変更の効果を断定せず、HTTP 遅延、SQL、DB 側の状態と照合します。
+
+表示する `MaxOpen` は終了時点の上限で、0 は無制限です。`Stats` は
+`SetMaxIdleConns`、`SetConnMaxIdleTime`、`SetConnMaxLifetime` の設定値を返しません。
+`idle closed`、`idletime closed`、`lifetime closed` は各条件による close 件数で、
+設定が小さすぎることや再接続に費やした時間を直接示しません。
+プール統計だけでは専有 `sql.Conn` / `sql.Tx` の保持箇所や deadlock は特定できません。
 
 ## 10. DB target と用途別 credential
 
