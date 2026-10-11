@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ekusiadadus/isutools/internal/requestsql"
+	"github.com/ekusiadadus/isutools/internal/requestwork"
 	"github.com/ekusiadadus/isutools/internal/runctl"
 )
 
@@ -340,8 +341,8 @@ func (c *Collector) release(g *generation) {
 // finish records a completed request and ends its in-flight status. Recording
 // happens before the generation can settle, so a Drain that returns has seen
 // every row of the generation it drained.
-func (c *Collector) finish(g *generation, id identity, duration time.Duration, responseBytes int64, sqlCount int64, shapes map[string]requestsql.Shape) {
-	g.table.observeRequestShapes(id, duration, responseBytes, sqlCount, true, shapes)
+func (c *Collector) finish(g *generation, id identity, duration time.Duration, responseBytes int64, sqlCount int64, shapes map[string]requestsql.Shape, work *requestwork.Summary) {
+	g.table.observeRequestWork(id, duration, responseBytes, sqlCount, true, shapes, work)
 	c.mu.Lock()
 	g.inFlight--
 	g.settleLocked()

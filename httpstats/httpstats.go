@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ekusiadadus/isutools/internal/requestsql"
+	"github.com/ekusiadadus/isutools/internal/requestwork"
 )
 
 const (
@@ -28,6 +29,8 @@ const (
 	DefaultMaxShapeKeys = 2048
 	// EnvSQLShapes enables bounded endpoint + normalized SQL shape attribution.
 	EnvSQLShapes = "ISUTOOLS_SQL_SHAPES"
+	// EnvRequestWork enables bounded SQL and outgoing HTTP duration attribution.
+	EnvRequestWork = "ISUTOOLS_REQUEST_WORK"
 	// OverflowPath identifies observations merged after the key limit.
 	OverflowPath = "(other)"
 
@@ -64,9 +67,15 @@ type httpEvent struct {
 type Option func(*config)
 
 type config struct {
-	maxKeys   int
-	rules     []Rule
-	sqlShapes bool
+	maxKeys     int
+	rules       []Rule
+	sqlShapes   bool
+	requestWork bool
+}
+
+// WithRequestWork enables bounded dependency timing for context-aware calls.
+func WithRequestWork(enabled bool) Option {
+	return func(cfg *config) { cfg.requestWork = enabled }
 }
 
 // WithSQLShapeAttribution enables bounded request-context SQL-shape tracking.
@@ -95,6 +104,8 @@ func WithPathRules(rules []Rule) Option {
 // Entry is one aggregated HTTP identity. Duration fields are encoded as
 // integer nanoseconds in JSON. P95 is the upper bound of a log2 bucket.
 type Entry struct {
+	// Work is nil when dependency timing was not enabled (including older snapshots).
+	Work       *RequestWork  `json:"work,omitempty"`
 	Key        string        `json:"key"`
 	Method     string        `json:"method"`
 	Path       string        `json:"path"`
@@ -155,6 +166,7 @@ type identity struct {
 }
 
 type stat struct {
+	work                    *RequestWork
 	count                   int64
 	total                   int64
 	max                     int64
@@ -176,6 +188,7 @@ type table struct {
 	maxKeys   int64
 	keys      atomic.Int64
 	shapeKeys atomic.Int64
+	workKeys  atomic.Int64
 	shards    [numShards]shard
 }
 
@@ -186,14 +199,15 @@ type table struct {
 //
 // Lock order: mu may be held while acquiring connMu, never the reverse.
 type Collector struct {
-	mu         sync.Mutex
-	resetMu    sync.Mutex
-	current    *generation
-	maxKeys    int
-	rules      []Rule
-	eventRules []SafeProfileRouteRule
-	observer   atomic.Pointer[eventObserverSlot]
-	sqlShapes  bool
+	mu          sync.Mutex
+	resetMu     sync.Mutex
+	current     *generation
+	maxKeys     int
+	rules       []Rule
+	eventRules  []SafeProfileRouteRule
+	observer    atomic.Pointer[eventObserverSlot]
+	sqlShapes   bool
+	requestWork bool
 
 	// gens is the boundary bookkeeping, guarded by mu.
 	gens generationState
@@ -238,16 +252,17 @@ var Default = New()
 
 // New returns an independent Collector.
 func New(opts ...Option) *Collector {
-	cfg := config{maxKeys: DefaultMaxKeys, sqlShapes: os.Getenv(EnvSQLShapes) == "1"}
+	cfg := config{maxKeys: DefaultMaxKeys, sqlShapes: os.Getenv(EnvSQLShapes) == "1", requestWork: os.Getenv(EnvRequestWork) == "1"}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
 		}
 	}
 	c := &Collector{
-		maxKeys:   cfg.maxKeys,
-		rules:     cfg.rules,
-		sqlShapes: cfg.sqlShapes,
+		maxKeys:     cfg.maxKeys,
+		rules:       cfg.rules,
+		sqlShapes:   cfg.sqlShapes,
+		requestWork: cfg.requestWork,
 	}
 	c.current = c.newGeneration()
 	return c
@@ -304,6 +319,10 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 		} else {
 			requestContext, sqlCounter = requestsql.WithCounter(r.Context())
 		}
+		var workCounter *requestwork.Counter
+		if c.requestWork {
+			requestContext, workCounter = requestwork.WithCounter(requestContext)
+		}
 		r = r.WithContext(requestContext)
 		g := c.begin()
 		start := time.Now()
@@ -335,6 +354,11 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 			}
 			finishedAt := time.Now()
 			sqlCount, sqlShapes := sqlCounter.CloseShapes()
+			var work *requestwork.Summary
+			if workCounter != nil {
+				summary := workCounter.Close(start, finishedAt)
+				work = &summary
+			}
 			if tracker.finishHandler(capture.bytes) {
 				// Long-lived connections are released from the request generation
 				// as soon as they are confirmed, so Reset never waits for them.
@@ -347,7 +371,7 @@ func (c *Collector) Middleware(next http.Handler) http.Handler {
 					status:   capture.status,
 				}
 				duration := finishedAt.Sub(start)
-				c.finish(g, id, duration, capture.bytes, sqlCount, sqlShapes)
+				c.finish(g, id, duration, capture.bytes, sqlCount, sqlShapes, work)
 				finishHTTPEvent(event, finishedAt, c.timelineKey(r), duration, capture.status >= http.StatusInternalServerError)
 			}
 			if panicked != nil {
@@ -587,6 +611,10 @@ func (t *table) observeRequest(id identity, duration time.Duration, responseByte
 }
 
 func (t *table) observeRequestShapes(id identity, duration time.Duration, responseBytes, sqlCount int64, tracked bool, shapes map[string]requestsql.Shape) {
+	t.observeRequestWork(id, duration, responseBytes, sqlCount, tracked, shapes, nil)
+}
+
+func (t *table) observeRequestWork(id identity, duration time.Duration, responseBytes, sqlCount int64, tracked bool, shapes map[string]requestsql.Shape, work *requestwork.Summary) {
 	if duration < 0 {
 		duration = 0
 	}
@@ -602,7 +630,7 @@ func (t *table) observeRequestShapes(id identity, duration time.Duration, respon
 	if !ok && id.path != OverflowPath {
 		if !t.reserveKey() {
 			sh.mu.Unlock()
-			t.observeRequestShapes(identity{method: "*", path: OverflowPath, protocol: "*"}, duration, responseBytes, sqlCount, tracked, shapes)
+			t.observeRequestWork(identity{method: "*", path: OverflowPath, protocol: "*"}, duration, responseBytes, sqlCount, tracked, shapes, work)
 			return
 		}
 		s = &stat{}
@@ -610,6 +638,12 @@ func (t *table) observeRequestShapes(id identity, duration time.Duration, respon
 	} else if !ok {
 		s = &stat{}
 		sh.stats[id] = s
+	}
+	if work != nil {
+		if s.work == nil {
+			s.work = &RequestWork{}
+		}
+		t.mergeWork(s.work, *work, duration)
 	}
 	ns := duration.Nanoseconds()
 	s.count++
@@ -713,6 +747,7 @@ func (t *table) snapshot() Snapshot {
 			}
 			sort.Slice(shapes, func(i, j int) bool { return shapes[i].Key < shapes[j].Key })
 			entries = append(entries, Entry{
+				Work:                    cloneWork(s.work),
 				Key:                     displayKey(id),
 				Method:                  id.method,
 				Path:                    id.path,
