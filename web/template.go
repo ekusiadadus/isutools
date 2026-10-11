@@ -856,6 +856,9 @@ var reportFuncs = template.FuncMap{
 	"experimentEvidenceRows": experimentEvidenceRows,
 	"poolWaitRatio":          poolWaitRatio,
 	"endpointSQLRows":        endpointSQLRows,
+ "endpointWorkRows": endpointWorkRows,
+ "workAverage": workAverage,
+ "workRatio": workRatio,
 	"endpointShapeRows":      endpointShapeRows,
 	"ms": func(d time.Duration) string {
 		return strconv.FormatFloat(float64(d.Nanoseconds())/1e6, 'f', 1, 64)
@@ -1218,6 +1221,20 @@ limitation: {{.Provenance.Limitation}}<br>docs: {{.Provenance.Docs}}</details></
 <table id="endpoint-sql-shapes"><thead><tr><th>endpoint</th><th>SQL shape</th><th>count</th><th>total(ms)</th><th>errors</th><th>SQL/request (avg)</th><th>max/request</th><th>tracked requests</th></tr></thead>
 <tbody>{{range .}}<tr><td class="l">{{.Method}} {{.Path}}</td><td class="l">{{cut .Shape 120}}</td><td data-v="{{.Count}}">{{.Count}}</td><td data-v="{{.Total.Nanoseconds}}">{{dur .Total}}</td><td data-v="{{.Errors}}">{{.Errors}}</td><td data-v="{{.PerRequest}}">{{printf "%.2f" .PerRequest}}</td><td data-v="{{.MaxPerRequest}}">{{.MaxPerRequest}}</td><td>{{.Tracked}}</td></tr>{{end}}</tbody></table>
 {{else}}<p class="empty">no attributed SQL shapes in this snapshot; check request-context coverage above</p>{{end}}
+
+<span id="request-work"></span><h2>Request dependency timing / リクエストの待ち時間</h2>
+<p class="meta">ISUTOOLS_REQUEST_WORK=1 と clientstats.WrapTransport で有効。method + route別に集計。SQL・外部HTTPは同じrequest contextでhandler終了までに完了した呼び出しが対象です。未帰属時間にはアプリ処理・DB pool待ち・未計測や未完了の呼び出しも含まれ、CPU時間ではありません。</p>
+<table id="endpoint-work-table"><thead><tr><th>endpoint</th><th>tracked / requests</th><th>wall samples / truncated</th><th>HTTP avg(ms)</th><th>SQL only avg(ms)</th><th>external only avg(ms)</th><th>overlap avg(ms)</th><th>unattributed avg(ms)</th><th>external count</th><th>external/request</th><th>SQL sum/request(ms)</th><th>external sum/request(ms)</th><th>errors</th></tr></thead><tbody>
+{{range endpointWorkRows .Snapshot.HTTP}}<tr><td class="l">{{.Method}} {{.Path}}</td><td>{{.Work.TrackedRequests}} / {{.Requests}}</td><td>{{.Work.CompleteRequests}} / {{.Work.TruncatedRequests}}</td>
+{{if .Work.CompleteRequests}}<td>{{dur (workAverage .Work.CompleteTotal .Work.CompleteRequests)}}</td><td>{{dur (workAverage .Work.SQLOnly .Work.CompleteRequests)}}</td><td>{{dur (workAverage .Work.ExternalOnly .Work.CompleteRequests)}}</td><td>{{dur (workAverage .Work.Overlap .Work.CompleteRequests)}}</td><td>{{dur (workAverage .Work.Other .Work.CompleteRequests)}}</td>{{else}}<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>{{end}}
+{{if .Work.TrackedRequests}}<td>{{.Work.ExternalCount}}</td><td>{{printf "%.2f" (workRatio .Work.ExternalCount .Work.TrackedRequests)}}</td><td>{{dur (workAverage .Work.SQLTotal .Work.TrackedRequests)}}</td><td>{{dur (workAverage .Work.ExternalTotal .Work.TrackedRequests)}}</td><td>{{.Work.ExternalErrors}}</td>{{else}}<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>{{end}}</tr>{{end}}
+</tbody></table>
+<p class="meta">壁時計の4区分は重複区間を1回だけ数え、合計がHTTP avgになります。1リクエスト256区間を超えると壁時計内訳のみ対象外（truncated）。呼び出し合計は全tracked requestsが分母で、並列実行ではHTTP時間を超えることがあります。0回は全クライアントの計測を保証せず、未計測は —。SQL時間はdriver Exec/Queryで、Rows読み取り・トランザクション保持時間を含みません。</p>
+<h3>Outgoing HTTP / 外部API</h3>
+<table id="endpoint-dependencies"><thead><tr><th>endpoint</th><th>dependency</th><th>calls</th><th>errors</th><th>reused</th><th>total(ms)</th><th>avg(ms)</th><th>acquire avg(ms)</th><th>DNS avg(ms)</th><th>connect avg(ms)</th><th>TLS avg(ms)</th><th>response wait avg(ms)</th><th>headers avg(ms)</th><th>body avg(ms)</th></tr></thead><tbody>
+{{range endpointWorkRows .Snapshot.HTTP}}{{$row := .}}{{range .Work.Calls}}<tr><td class="l">{{$row.Method}} {{$row.Path}}</td><td class="l">{{.Label}}</td><td>{{.Count}}</td><td>{{.Errors}}</td><td>{{.Reused}}</td><td>{{dur .Total}}</td><td>{{dur (workAverage .Total .Count)}}</td><td>{{dur (workAverage .Acquire .Count)}}</td><td>{{dur (workAverage .DNS .Count)}}</td><td>{{dur (workAverage .Connect .Count)}}</td><td>{{dur (workAverage .TLS .Count)}}</td><td>{{dur (workAverage .Wait .Count)}}</td><td>{{dur (workAverage .Headers .Count)}}</td><td>{{dur (workAverage .Body .Count)}}</td></tr>{{end}}{{end}}
+</tbody></table>
+<p class="meta">固定ラベル別。各redirectは1回。totalはRoundTrip開始から本文EOF/Close/読み取りエラーまで（本文を読むまでのアプリ側待ちも含む）。errorsはHTTP 400以上または完了時点の通信・本文エラー（EOF後のCloseエラーは除外）。acquireは接続取得、response waitは送信完了から最初の応答byte、headersはRoundTrip終了まで。phaseは重複し加算不可、再利用時やhttptrace非対応Transportでは0になり得ます。平均の分母は全calls。URL・query・header・本文は記録しません。</p>
 
 <span id="http"></span><h2>HTTP</h2>
 {{if .Snapshot.HTTP}}

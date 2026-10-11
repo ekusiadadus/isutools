@@ -50,6 +50,7 @@ See the [integration guide](./docs/INTEGRATION.md) for DB-pool, EXPLAIN, nginx, 
 |---|---|
 | Bottleneck Overview | Which of SQL, HTTP, DB pool, CPU, or I/O deserves the next check |
 | SQL / HTTP | Cumulative cost and p95, not just one slow request |
+| Request dependency timing | Opt-in SQL / outgoing HTTP / overlap / unattributed wall time, dependency counts and connection/DNS/TLS/response phases |
 | SQL per endpoint | Total SQL calls and average / maximum calls per request, grouped by endpoint |
 | [Experiment evidence](docs/EXPERIMENTS.md) | Compare host CPU headroom, SQL counts, workload settings, pass/fail, penalties, and restart confirmation together |
 | Runs / Diff | Score, failure, total, count, and average changes between runs |
@@ -211,3 +212,33 @@ Adapters are separate Go modules. CI validates the root and every framework adap
 ## License
 
 [MIT](./LICENSE)
+
+## Outgoing HTTP dependency timing
+
+Set `ISUTOOLS_REQUEST_WORK=1` before startup and wrap each existing client transport once:
+
+```go
+client.Transport = clientstats.WrapTransport(client.Transport, "shipping")
+```
+
+Import `github.com/ekusiadadus/isutools/clientstats`. Use a static, non-secret label.
+Pass the incoming `r.Context()` with `http.NewRequestWithContext` and `client.Do`,
+and consume/close the response body before the handler returns. Keep SQL on the same
+context through the instrumented driver. `client.Get` does not propagate that context.
+
+Live and saved reports separate SQL-only, external-only, overlapping and unattributed
+wall time. Unattributed time includes uninstrumented work and is not CPU time.
+Call totals may exceed wall time under concurrency. SQL durations exclude pool wait,
+row iteration and transaction lifetime. HTTP total ends at the first EOF, Close or
+read error, including application delays before reading the body. Errors include
+HTTP >=400 and errors at completion; a later Close error after EOF is not counted.
+Redirects are separate attempts. Trace phases overlap and must not be added together;
+missing callbacks and reused connections may report zero.
+
+Timing is off by default. Old snapshots remain unmeasured (`—`). At most 256 intervals
+per request contribute to the wall-time partition; truncated requests are excluded from
+wall averages but retain call totals. Labels are capped at 64 bytes, 32 per request and
+2,048 HTTP-identity/label pairs per run, with explicit overflow buckets. No outgoing URL,
+headers, bodies or raw errors are stored. Calls without the request context, unfinished
+bodies, background work and WS/SSE remain unattributed. Real benchmark overhead is not
+measured; compare on/off on your target workload. See the [integration guide](docs/INTEGRATION.md).

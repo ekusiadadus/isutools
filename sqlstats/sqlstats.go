@@ -16,6 +16,7 @@ import (
 
 	"github.com/ekusiadadus/isutools/internal/agg"
 	"github.com/ekusiadadus/isutools/internal/requestsql"
+	"github.com/ekusiadadus/isutools/internal/requestwork"
 )
 
 // DriverSuffix is appended to the original driver name on registration:
@@ -113,7 +114,9 @@ func hooks() *proxy.HooksContext {
 			return
 		}
 		shape := normalize(stmt.QueryString)
-		duration := time.Since(measurement.started)
+		finished := time.Now()
+		duration := finished.Sub(measurement.started)
+		requestwork.CompletedSQL(measurement.requestContext, measurement.started, finished)
 		requestsql.CompletedShape(measurement.requestContext, shape, duration, err != nil)
 		Default.finish(measurement.measurement, shape, duration, err != nil)
 	}

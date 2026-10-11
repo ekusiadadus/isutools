@@ -88,6 +88,61 @@ request内で32種類、run内で2,048組のendpoint×形を超えると、超�
 SQL形の反復はN+1の証明ではなく、対象handlerを調べる候補です。opt-inによる実ベンチの
 スコア影響は未測定なので、同条件でon/offを比較してください。
 
+### SQL以外の待ち時間・外部HTTP APIを調べる
+
+アプリ起動前に `ISUTOOLS_REQUEST_WORK=1` を設定し、外部API用の既存clientの
+Transportを一度ラップします。特定の大会や配送APIには依存しません。
+
+```go
+import "github.com/ekusiadadus/isutools/clientstats"
+
+// During startup, before concurrent use. Keep the existing timeout,
+// cookie jar, redirect policy and transport settings.
+shippingClient.Transport = clientstats.WrapTransport(shippingClient.Transport, "shipping")
+
+// Inside a handler wrapped by isutools.HTTP (or a framework adapter):
+req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, statusURL, nil)
+if err != nil { /* handle error */ }
+resp, err := shippingClient.Do(req)
+if err != nil { /* handle error */ }
+defer resp.Body.Close()
+// Decode/read the response body before returning from the handler.
+```
+
+`httpstats.New(httpstats.WithRequestWork(true))`でも有効化できます。SQL形の設定とは独立です。
+`http.Get`や`client.Get`はincoming requestのcontextを引き継がないため、上記のように
+`NewRequestWithContext`と`Do`を使ってください。SQLもラップ済みdriverの
+`QueryContext` / `ExecContext`等に同じcontextを渡します。既存の過去runへの後付けはできません。
+
+**Request dependency timing** はendpoint単位で呼び出し数、外部HTTP平均回数/request、
+SQL・外部HTTPの累計時間/requestを表示します。壁時計の内訳はSQLのみ、外部HTTPのみ、
+両者が重なる時間、未帰属時間の4区分です。区間の和集合から計算するため、並列呼び出しを
+二重計上せず、4区分の合計は対象HTTPの平均時間になります。呼び出し累計時間は並列実行で
+HTTPの時間を超えることがあります。「未帰属」はCPU時間ではなく、アプリ処理、DB pool待ち、
+未計測・未完了の依存呼び出し等を含みます。SQLのdriver実行時間にはRowsの読み取りや
+DBトランザクションを開いている時間を含みません。
+
+**Outgoing HTTP** は固定ラベル別に回数、エラー、接続再利用、total、接続取得、DNS、
+接続、TLS、応答待ち、ヘッダー、本文の時間を表示します。`httptrace`を既存traceと合成します。
+接続取得はGetConnからGotConn、応答待ちはWroteRequestから最初の応答byteまで。
+ヘッダーはRoundTrip開始から終了まで、totalは開始から本文の最初のEOF・Close・読み取りエラーまでです。
+本文を読むまでのアプリ側の待ちも含みます。空本文`http.NoBody`はヘッダー時点で完了します。
+各redirectは別の呼び出し、Transport内部のretryは同じ呼び出しです。phaseは重複するため
+加算できません。再利用接続やtrace非対応Transportでは0になる場合があります。平均の分母は全callsです。
+エラーはHTTP 400以上または完了時点の通信・本文エラーで、EOF後のCloseエラーは追加計上しません。
+本文を閉じずhandler終了時にも未完了の呼び出し、contextが失われた呼び出し、WS/SSEは対象外です。
+
+新しいデータはHTTP行のoptionalな`work`にJSON保存され、live/保存HTMLに表示されます。
+未計測は`work`がなく画面では`—`、計測した0回とは区別します。計測件数は全依存の捕捉保証ではありません。
+1リクエスト最大256区間を超えると、そのリクエストの壁時計内訳を除外し`truncated_requests`に記録します。
+壁時計平均の分母は`complete_requests`、呼び出し平均は`tracked_requests`で、どちらも画面に明示します。
+固定ラベルは最大64 bytes、request内32種類、run内2,048組のHTTP identity×ラベルを超えると
+明示的なoverflowに集約します。ラベルにURLやID、秘密を含めず、`shipping`などの定数を渡してください。
+URL・query・header・本文・エラーメッセージはこの機能では保存しません。
+
+この機能は原因を断定せず、次に調べる依存先を絞るための計測です。有効時の実ベンチの
+スコア影響は未測定なので、同条件でon/offを比較してください。
+
 ### MySQL / MariaDB
 
 ```bash

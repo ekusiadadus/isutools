@@ -422,11 +422,13 @@ type RunSnapshot struct {
 // Meta identifies when, on which host, and from which revision a snapshot
 // was taken. Generation increments on every reset so runs are comparable.
 type Meta struct {
-	SchemaVersion int    `json:"schema_version"`
-	Time          string `json:"time"`
-	Generation    int64  `json:"generation"`
-	Revision      string `json:"revision"`
-	Dirty         bool   `json:"dirty"`
+	// Capabilities names optional formats supported by the producing library.
+	Capabilities  []string `json:"capabilities,omitempty"`
+	SchemaVersion int      `json:"schema_version"`
+	Time          string   `json:"time"`
+	Generation    int64    `json:"generation"`
+	Revision      string   `json:"revision"`
+	Dirty         bool     `json:"dirty"`
 	// BuildSource says how Revision was obtained (vcs, ldflags, env, unknown).
 	// ProvenanceValid is false for an unknown or dirty build, where a snapshot
 	// cannot be reproduced from Revision alone.
@@ -987,6 +989,7 @@ func (h *handler) snapshotWith(generation int64, db *dbinspect.Schema, entries [
 	snap := Snapshot{
 		Meta: Meta{
 			SchemaVersion:   schemaVersion,
+			Capabilities:    []string{"request-work-v1"},
 			Time:            time.Now().In(reportTZ).Format(time.RFC3339),
 			Generation:      generation,
 			Revision:        bi.Short(),
